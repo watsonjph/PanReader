@@ -1,0 +1,14 @@
+[package]
+name = "pr-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Formats we actually meet in manga archives. Avif/tiff/exr are dead weight in build time.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+# DCT-domain scaled decode for JPEG. image/zune-jpeg has no scaling API; this is the
+# crate that implements hard invariant 3, not a second decoder for a new format.
+jpeg-decoder = "0.3.2"
+thiserror = "2.0.20"
+tracing = "0.1.44"

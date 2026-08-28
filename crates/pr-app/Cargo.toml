@@ -1,0 +1,24 @@
+[package]
+name = "pr-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+lru = "0.18.3"
+parking_lot = "0.12.5"
+pr-archive = { version = "0.1.0", path = "../pr-archive" }
+pr-image = { version = "0.1.0", path = "../pr-image" }
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+tauri = { version = "2.11.5", features = [] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dev-dependencies]
+image = "0.25.10"
+zip = "8.6.0"

@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+pr-archive = { path = "crates/pr-archive" }
+pr-image = { path = "crates/pr-image" }
+
+[profile.dev]
+opt-level = 1
+
+# Decode speed is the whole point of the spike; never measure a debug-built decoder.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
