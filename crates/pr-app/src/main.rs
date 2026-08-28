@@ -9,7 +9,7 @@ use anyhow::Context;
 use parking_lot::Mutex;
 use pr_archive::PageSource;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::{Manager, State};
@@ -26,9 +26,15 @@ fn fixture(kind: &str) -> PathBuf {
         "strip" => ("PANREADER_STRIP", "fixtures/strip"),
         _ => ("PANREADER_CBZ", "fixtures/spike.cbz"),
     };
-    std::env::var_os(var)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default.into())
+    // `cargo tauri dev` runs the binary with the crate directory as its working dir, not
+    // the workspace root, so anything relative resolves somewhere that does not exist.
+    // Anchor both the defaults and any relative override at the workspace instead.
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    match std::env::var_os(var).map(PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        Some(relative) => workspace.join(relative),
+        None => workspace.join(default),
+    }
 }
 
 impl App {
@@ -37,8 +43,14 @@ impl App {
             return Ok(c.clone());
         }
         let path = fixture(kind);
-        let src = PageSource::open(&path)
-            .with_context(|| format!("opening {kind} fixture at {}", path.display()))?;
+        let src = PageSource::open(&path).with_context(|| {
+            format!(
+                "Could not open the {kind} fixture at {}. \
+                 Generate it with `cargo run -p pr-app --example make_fixtures --release`, \
+                 or point PANREADER_CBZ / PANREADER_STRIP at your own files.",
+                path.display()
+            )
+        })?;
         let chapter = Arc::new(Chapter::open(kind, src)?);
         self.chapters
             .lock()
@@ -56,7 +68,14 @@ fn open_chapter(app: State<'_, App>, kind: String, display_w: u32) -> Result<Lay
 
 #[tauri::command]
 fn stats(app: State<'_, App>, kind: String) -> StatsSnapshot {
-    app.chapter(&kind).map(|c| c.snapshot()).unwrap_or_default()
+    // Deliberately does not open the chapter. It used to, which meant the HUD's own
+    // 250ms poll paid the header probe before you ever pressed a key, and first-paint
+    // then measured a warm open while looking like a cold one.
+    app.chapters
+        .lock()
+        .get(&kind)
+        .map(|c| c.snapshot())
+        .unwrap_or_default()
 }
 
 /// Custom-protocol origin differs per platform, so the frontend asks rather than guesses.
@@ -72,7 +91,7 @@ fn tile_base() -> &'static str {
 /// `/t/{kind}/{page}/{tile}/{display_w}` -> JPEG bytes.
 ///
 /// Hard invariant 1: image bytes never cross Tauri IPC. They come through here.
-fn serve(app: &App, req: &Request<Vec<u8>>) -> anyhow::Result<Vec<u8>> {
+fn serve(app: &App, req: &Request<Vec<u8>>) -> anyhow::Result<tiles::Served> {
     let path = req.uri().path();
     let mut seg = path.trim_start_matches('/').split('/');
     anyhow::ensure!(seg.next() == Some("t"), "unknown route {path}");
@@ -84,7 +103,7 @@ fn serve(app: &App, req: &Request<Vec<u8>>) -> anyhow::Result<Vec<u8>> {
         tile: num()?,
         w: num()?,
     };
-    Ok(app.chapter(kind)?.tile(key)?.as_ref().clone())
+    app.chapter(kind)?.tile(key)
 }
 
 fn main() {
@@ -112,11 +131,11 @@ fn main() {
             // flick ever spawns enough threads to show up in the HUD.
             std::thread::spawn(move || {
                 let res = match serve(app.state::<App>().inner(), &req) {
-                    Ok(bytes) => Response::builder()
-                        .header(header::CONTENT_TYPE, "image/jpeg")
+                    Ok(served) => Response::builder()
+                        .header(header::CONTENT_TYPE, served.mime)
                         // Tiles are content-addressed by their URL, so they never change.
                         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                        .body(bytes),
+                        .body(served.data.as_ref().clone()),
                     Err(e) => {
                         tracing::warn!(uri = %req.uri(), "tile failed: {e:#}");
                         Response::builder()
@@ -132,4 +151,35 @@ fn main() {
         .invoke_handler(tauri::generate_handler![open_chapter, stats, tile_base])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the defaults used to be relative, and `cargo tauri dev` runs the
+    /// binary with the crate directory as its working dir. Every chapter then failed to
+    /// open with a bare "cannot find the path specified".
+    #[test]
+    fn default_fixture_paths_do_not_depend_on_the_working_directory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "workspace root is not two levels above the crate"
+        );
+
+        for kind in ["cbz", "strip"] {
+            let path = fixture(kind);
+            assert!(
+                path.is_absolute(),
+                "{kind} fixture path is relative: {}",
+                path.display()
+            );
+            assert!(
+                path.starts_with(&root),
+                "{kind} fixture escapes the workspace: {}",
+                path.display()
+            );
+        }
+    }
 }

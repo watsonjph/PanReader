@@ -34,3 +34,8 @@ fixtures/
 
 # Tauri generated schemas
 crates/pr-app/gen/
+
+# Local test library, not ours to ship
+/data/
+# ...but DESIGN.md puts the generated theme palette here, and that is source.
+!/data/themes.json

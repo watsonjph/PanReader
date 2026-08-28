@@ -22,13 +22,26 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 const EXTS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 
+/// Takes a bare file name, never a path.
+///
+/// It used to take either and split on `/` to find the file name, which is wrong on
+/// Windows twice over: a `\`-separated path yields no split at all (so `.DS_Store`
+/// slipped through), and a path with mixed separators — `pr-app/../..\data\p.jpg`,
+/// which is exactly what `Path::join("../..")` builds — yields a "file name" starting
+/// with `..`, so every page in the directory was discarded as a dotfile.
 fn is_page(name: &str) -> bool {
-    if name.contains("__MACOSX") || name.rsplit('/').next().is_some_and(|f| f.starts_with('.')) {
-        return false;
-    }
-    name.rsplit('.')
-        .next()
-        .is_some_and(|e| EXTS.contains(&e.to_ascii_lowercase().as_str()))
+    !name.starts_with('.')
+        && name
+            .rsplit('.')
+            .next()
+            .is_some_and(|e| EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Zip entry names are `/`-separated by specification, whatever the host OS, so the
+/// file name can be taken directly. `__MACOSX` is a directory component, so it has to
+/// be matched against the whole entry rather than the file name.
+fn is_zip_page(entry: &str) -> bool {
+    !entry.contains("__MACOSX") && entry.rsplit('/').next().is_some_and(is_page)
 }
 
 /// `page10.jpg` must sort after `page2.jpg`. Compares digit runs numerically and
@@ -79,14 +92,17 @@ impl PageSource {
         let src = if path.is_dir() {
             let mut files: Vec<PathBuf> = std::fs::read_dir(path)?
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.is_file() && p.to_str().is_some_and(is_page))
+                .filter(|p| {
+                    // The file name, not the path: see `is_page`.
+                    p.is_file() && p.file_name().and_then(|n| n.to_str()).is_some_and(is_page)
+                })
                 .collect();
             files.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
             PageSource::Dir(files)
         } else {
             let mut names: Vec<String> = zip::ZipArchive::new(File::open(path)?)?
                 .file_names()
-                .filter(|n| is_page(n))
+                .filter(|n| is_zip_page(n))
                 .map(str::to_owned)
                 .collect();
             names.sort_by(|a, b| natural_cmp(a, b));
@@ -202,9 +218,30 @@ mod tests {
 
     #[test]
     fn junk_entries_are_not_pages() {
-        assert!(is_page("x/page1.JPG"));
-        assert!(!is_page("__MACOSX/._page1.jpg"));
-        assert!(!is_page("x/.hidden.jpg"));
+        assert!(is_page("page1.JPG"));
+        assert!(!is_page(".hidden.jpg"));
         assert!(!is_page("ComicInfo.xml"));
+        assert!(!is_page("cover"));
+
+        assert!(is_zip_page("chapter/page1.jpg"));
+        assert!(!is_zip_page("__MACOSX/._page1.jpg"));
+        assert!(!is_zip_page("chapter/.DS_Store"));
+    }
+
+    /// Regression: `Path::join("../..")` builds a mixed-separator path, and the old
+    /// filename split turned every page in the directory into a "dotfile".
+    #[test]
+    fn windows_and_mixed_separator_paths_still_find_their_pages() {
+        for path in [
+            r"C:\lib\vol 1\p001.jpg",
+            r"C:\repo\crates\pr-app/../..\data\vol 1\p001.jpg",
+            "/home/u/lib/vol 1/p001.jpg",
+        ] {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            assert!(is_page(name), "{path} was rejected via file name {name:?}");
+        }
     }
 }

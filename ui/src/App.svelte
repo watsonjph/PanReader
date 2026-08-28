@@ -64,8 +64,9 @@
   }
 
   function mount(p, t) {
-    const top = p.y + t * layout.tile_h;
-    const bottom = Math.min(p.y + p.h, top + layout.tile_h);
+    // Tile height is per page: a passthrough page is one tile as tall as itself.
+    const top = p.y + t * p.tile_h;
+    const bottom = Math.min(p.y + p.h, top + p.tile_h);
     const img = document.createElement("img");
     img.src = `${base}/t/${kind}/${p.index}/${t}/${layout.display_w}`;
     img.decoding = "async";
@@ -90,8 +91,8 @@
     for (let i = pageAt(Math.max(top, 0)); i < layout.pages.length; i++) {
       const p = layout.pages[i];
       if (p.y > bottom) break;
-      const first = Math.max(0, Math.floor((top - p.y) / layout.tile_h));
-      const last = Math.min(p.tiles - 1, Math.floor((bottom - p.y) / layout.tile_h));
+      const first = Math.max(0, Math.floor((top - p.y) / p.tile_h));
+      const last = Math.min(p.tiles - 1, Math.floor((bottom - p.y) / p.tile_h));
       for (let t = first; t <= last; t++) {
         const key = `${p.index}:${t}`;
         want.add(key);
@@ -180,6 +181,7 @@
   <div>decode avg <b>{(rust.decode_ms_avg ?? 0).toFixed(1)}</b> ms</div>
   <div>encode avg <b>{(rust.encode_ms_avg ?? 0).toFixed(1)}</b> ms</div>
   <div>tile hit/miss <b>{rust.hits ?? 0}</b>/<b>{rust.misses ?? 0}</b></div>
+  <div>passthrough <b>{rust.passthrough ?? 0}</b></div>
   <div>cache <b>{(rust.cached_mb ?? 0).toFixed(1)}</b> MB</div>
 </div>
 
