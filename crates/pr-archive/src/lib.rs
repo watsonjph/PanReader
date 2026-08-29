@@ -263,20 +263,30 @@ mod tests {
         assert!(!is_zip_page("chapter/.DS_Store"));
     }
 
-    /// Regression: `Path::join("../..")` builds a mixed-separator path, and the old
-    /// filename split turned every page in the directory into a "dotfile".
+    /// Regression: `Path::join("../..")` builds a path whose separators are mixed on
+    /// Windows, and the old filename split turned every page in the directory into a
+    /// "dotfile".
+    ///
+    /// The path is built the way the app builds it rather than written as a literal.
+    /// A hardcoded `C:\...` string is a Windows path only on Windows: elsewhere `\` is
+    /// an ordinary filename character, `file_name()` keeps the whole thing, and the test
+    /// fails for a reason that says nothing about the code. Joining reproduces whatever
+    /// shape the platform actually produces, which is the shape that broke.
     #[test]
-    fn windows_and_mixed_separator_paths_still_find_their_pages() {
-        for path in [
-            r"C:\lib\vol 1\p001.jpg",
-            r"C:\repo\crates\pr-app/../..\data\vol 1\p001.jpg",
-            "/home/u/lib/vol 1/p001.jpg",
-        ] {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            assert!(is_page(name), "{path} was rejected via file name {name:?}");
-        }
+    fn joined_relative_paths_still_find_their_pages() {
+        let joined = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("library")
+            .join("vol 1")
+            .join("p001.jpg");
+        let name = joined
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(
+            is_page(name),
+            "{} was rejected via file name {name:?}",
+            joined.display()
+        );
     }
 }
