@@ -40,6 +40,7 @@ jobs:
       # Build the frontend first. A broken Svelte build would otherwise only surface at
       # `cargo tauri dev`, and a release build reads ui/dist.
       - run: pnpm --dir ui install --frozen-lockfile
+      - run: pnpm --dir ui test
       - run: pnpm --dir ui build
 
       # Formatting is platform-independent, so checking it twice is noise.

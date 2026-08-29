@@ -1,7 +1,7 @@
 //! Decode, scale, tile, encode. CPU-bound and synchronous by design; callers put it
 //! on rayon. Hard invariant 3 lives here: we never decode a page bigger than we draw.
 
-use image::{codecs::jpeg::JpegEncoder, imageops, ImageReader, RgbImage};
+use image::{ImageReader, RgbImage, codecs::jpeg::JpegEncoder, imageops};
 use std::io::Cursor;
 
 #[derive(Debug, thiserror::Error)]
@@ -108,7 +108,7 @@ fn fit_width(img: RgbImage, target_w: u32) -> RgbImage {
 
 /// Tallest page we hand over whole. Above this, tiling is what stops a 60,000px strip
 /// being decoded in one piece (invariant 2), so passthrough must not apply.
-pub const MAX_PASSTHROUGH_H: u32 = 4096;
+const MAX_PASSTHROUGH_H: u32 = 4096;
 
 /// Display-space geometry for one page, and the bridge back to whatever size the
 /// decoder actually emitted.

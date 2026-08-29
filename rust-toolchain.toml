@@ -4,5 +4,5 @@
 # that only exists in a newer toolchain into a build failure somewhere else.
 # Bump deliberately, run the clippy gate, commit the result.
 [toolchain]
-channel = "1.90.0"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]

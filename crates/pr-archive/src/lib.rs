@@ -16,6 +16,8 @@ pub enum Error {
     Empty(PathBuf),
     #[error("page {0} out of range")]
     OutOfRange(usize),
+    #[error("{0} archives are not supported in this build, see the RAR note in CLAUDE.md")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -46,7 +48,7 @@ fn is_zip_page(entry: &str) -> bool {
 
 /// `page10.jpg` must sort after `page2.jpg`. Compares digit runs numerically and
 /// everything else case-insensitively, without allocating.
-pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (mut x, mut y) = (a.bytes().peekable(), b.bytes().peekable());
     loop {
         match (x.peek().copied(), y.peek().copied()) {
@@ -89,6 +91,15 @@ pub enum PageSource {
 
 impl PageSource {
     pub fn open(path: &Path) -> Result<Self> {
+        // A CBR is a RAR, which the default build cannot read for licence reasons. Say
+        // so by name: opening it as a zip fails with a corrupt-archive error that sends
+        // the reader looking for a damaged download instead.
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && matches!(ext.to_ascii_lowercase().as_str(), "cbr" | "rar")
+        {
+            return Err(Error::Unsupported(ext.to_ascii_uppercase()));
+        }
+
         let src = if path.is_dir() {
             let mut files: Vec<PathBuf> = std::fs::read_dir(path)?
                 .filter_map(|e| e.ok().map(|e| e.path()))
@@ -252,6 +263,23 @@ mod tests {
     }
 
     #[test]
+    fn a_rar_is_refused_by_name_rather_than_as_a_broken_zip() {
+        let err = PageSource::open(Path::new("chapter.cbr")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(f) if f == "CBR"),
+            "expected an unsupported-format error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("CLAUDE.md"),
+            "the error should say where to look"
+        );
+        assert!(matches!(
+            PageSource::open(Path::new("x.RAR")).unwrap_err(),
+            Error::Unsupported(_)
+        ));
+    }
+
+    #[test]
     fn junk_entries_are_not_pages() {
         assert!(is_page("page1.JPG"));
         assert!(!is_page(".hidden.jpg"));
@@ -263,20 +291,30 @@ mod tests {
         assert!(!is_zip_page("chapter/.DS_Store"));
     }
 
-    /// Regression: `Path::join("../..")` builds a mixed-separator path, and the old
-    /// filename split turned every page in the directory into a "dotfile".
+    /// Regression: `Path::join("../..")` builds a path whose separators are mixed on
+    /// Windows, and the old filename split turned every page in the directory into a
+    /// "dotfile".
+    ///
+    /// The path is built the way the app builds it rather than written as a literal.
+    /// A hardcoded `C:\...` string is a Windows path only on Windows: elsewhere `\` is
+    /// an ordinary filename character, `file_name()` keeps the whole thing, and the test
+    /// fails for a reason that says nothing about the code. Joining reproduces whatever
+    /// shape the platform actually produces, which is the shape that broke.
     #[test]
-    fn windows_and_mixed_separator_paths_still_find_their_pages() {
-        for path in [
-            r"C:\lib\vol 1\p001.jpg",
-            r"C:\repo\crates\pr-app/../..\data\vol 1\p001.jpg",
-            "/home/u/lib/vol 1/p001.jpg",
-        ] {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            assert!(is_page(name), "{path} was rejected via file name {name:?}");
-        }
+    fn joined_relative_paths_still_find_their_pages() {
+        let joined = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("library")
+            .join("vol 1")
+            .join("p001.jpg");
+        let name = joined
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(
+            is_page(name),
+            "{} was rejected via file name {name:?}",
+            joined.display()
+        );
     }
 }
