@@ -11,7 +11,7 @@ use pr_archive::PageSource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::http::{header, Request, Response, StatusCode};
+use tauri::http::{Request, Response, StatusCode, header};
 use tauri::{Manager, State};
 use tiles::{Chapter, Layout, StatsSnapshot, TileKey};
 

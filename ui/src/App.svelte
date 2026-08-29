@@ -1,6 +1,16 @@
 <script>
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import {
+    clickStep,
+    fitScale,
+    pageAt,
+    pageStep,
+    pageTops,
+    stripHeight,
+    tileRects,
+    turnFor,
+  } from "./reader.js";
 
   // Kept mounted above and below the viewport in strip mode. Tuned so a 4000px/s flick
   // still has half a second of runway before it outruns the tile filler.
@@ -14,8 +24,6 @@
   /// Gap between pages, in CSS px. Zero is a seamless webtoon; anything above it is
   /// what Mihon calls CONTINUOUS_VERTICAL. One setting beats two modes.
   const PADS = [0, 8, 16, 32];
-  /// A wide page has to fit this much better turned before it is worth turning.
-  const AUTO_ROTATE_GAIN = 1.2;
 
   let kind = $state("cbz");
   let error = $state(null);
@@ -51,6 +59,10 @@
   let tops = []; // CSS-px top of each page, padding included
 
   const paged = $derived(mode !== "webtoon");
+  const unreadable = $derived.by(() => {
+    void epoch;
+    return layout ? layout.pages.filter((p) => !p.readable).length : 0;
+  });
   const rtl = $derived(mode === "rtl");
 
   // Device px -> CSS px, rounded on absolute coordinates so neighbouring tiles share an
@@ -61,35 +73,12 @@
   const tileUrl = (index, t) =>
     `${base}/t/${kind}/${index}/${t}/${layout.display_w}`;
 
-  /// Top of every page in CSS px.
-  ///
-  /// Page tops stay rounded from absolute device coordinates, so with no padding the
-  /// result is byte-identical to having no padding feature at all and pages still butt
-  /// together seamlessly. Padding is added on top as whole CSS pixels.
   function rebuildTops() {
-    tops = layout ? layout.pages.map((p, i) => css(p.y) + i * pad) : [];
+    tops = layout ? pageTops(layout.pages, pad, dpr) : [];
   }
 
-  function stripHeight() {
-    return layout ? css(layout.total_h) + Math.max(layout.pages.length - 1, 0) * pad : 0;
-  }
-
-  /// Tile boundaries within a page, in device px. Mirrors PageGrid::bounds.
-  function tileRects(p) {
-    const out = [];
-    for (let t = 0; t < p.tiles; t++) {
-      const top = Math.min(t * p.tile_h, p.h);
-      const bottom = Math.min((t + 1) * p.tile_h, p.h);
-      out.push({ t, top, bottom });
-    }
-    return out;
-  }
-
-  function fitScale(w, h) {
-    if (fit === "width") return vw / w;
-    if (fit === "height") return vh / h;
-    if (fit === "original") return 1;
-    return Math.min(vw / w, vh / h);
+  function canvasHeight() {
+    return layout ? stripHeight(layout.total_h, layout.pages.length, pad, dpr) : 0;
   }
 
   // The paged view. Rebuilt only when something it depends on changes, which for a page
@@ -103,20 +92,21 @@
     const naturalW = p.w / dpr;
     const naturalH = p.h / dpr;
 
-    // Only a page that is wider than tall is ever a candidate.
-    //
-    // "Does it fit better" on its own is not the question: a portrait page on a
-    // landscape window always fits better turned -- 978x1400 in a 1405x939 window gains
-    // 43% -- and is then completely unreadable. Auto-turning exists for one case, a
-    // spread too wide for a tall window, so ask about that case and nothing else.
-    let turn = rot;
-    if (!rotLock && naturalW > naturalH) {
-      const gain = fitScale(naturalH, naturalW) / fitScale(naturalW, naturalH);
-      if (gain > AUTO_ROTATE_GAIN) turn = (rot + 90) % 360;
-    }
+    const turn = turnFor({
+      rot,
+      rotLock,
+      w: naturalW,
+      h: naturalH,
+      fit,
+      vw,
+      vh,
+    });
     const quarter = turn === 90 || turn === 270;
 
-    const scale = quarter ? fitScale(naturalH, naturalW) : fitScale(naturalW, naturalH);
+    // Turned, the page is measured against the viewport with its axes swapped.
+    const scale = quarter
+      ? fitScale(fit, naturalH, naturalW, vw, vh)
+      : fitScale(fit, naturalW, naturalH, vw, vh);
     const drawW = Math.round(naturalW * scale);
     const tiles = tileRects(p).map(({ t, top, bottom }) => {
       const y0 = Math.round((top / dpr) * scale);
@@ -142,7 +132,7 @@
     const wanted = keepPage ? page : 0;
     // Strip mode keeps its place by page, not by pixel: a reload can change the width
     // we decode at and the padding between pages, so the old offset means nothing.
-    const wantedScroll = keepPage && layout && !paged ? pageAt(scroller.scrollTop) : 0;
+    const wantedScroll = keepPage && layout && !paged ? pageAt(tops, scroller.scrollTop) : 0;
     kind = next;
     error = null;
     hud.firstPaint = null;
@@ -175,7 +165,7 @@
     layout.maxW = layout.pages.reduce((m, p) => Math.max(m, p.w), 1);
     rebuildTops();
     canvas.style.width = css(layout.maxW) + "px";
-    canvas.style.height = stripHeight() + "px";
+    canvas.style.height = canvasHeight() + "px";
     scroller.scrollTop = tops[wantedScroll] ?? 0;
     dirty = true;
     if (paged) prefetch();
@@ -199,18 +189,6 @@
       page = next;
       prefetch();
     }
-  }
-
-  /// Index of the page covering CSS offset `y`, searched over the padded tops.
-  function pageAt(y) {
-    let lo = 0,
-      hi = tops.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (tops[mid] <= y) lo = mid;
-      else hi = mid - 1;
-    }
-    return lo;
   }
 
   function mount(p, t) {
@@ -245,7 +223,7 @@
     const bottom = scroller.scrollTop + scroller.clientHeight + OVERSCAN;
     const want = new Set();
 
-    for (let i = pageAt(Math.max(top, 0)); i < layout.pages.length; i++) {
+    for (let i = pageAt(tops, Math.max(top, 0)); i < layout.pages.length; i++) {
       const p = layout.pages[i];
       if (tops[i] > bottom) break;
       // Pages carry at most a handful of tiles, so testing each for overlap is cheaper
@@ -326,7 +304,7 @@
   function setPad(next) {
     pad = next;
     rebuildTops();
-    if (canvas) canvas.style.height = stripHeight() + "px";
+    if (canvas) canvas.style.height = canvasHeight() + "px";
     dropStripTiles();
     dirty = true;
   }
@@ -345,9 +323,6 @@
   }
 
   function onKey(e) {
-    // In right-to-left the left side advances, which is the whole point of the mode.
-    const forward = () => go(1);
-    const back = () => go(-1);
     const k = e.key;
 
     if (k === "1") load("cbz");
@@ -364,23 +339,15 @@
       overridden = false;
       if (detected) mode = detected.mode;
     } else if (!paged) return;
-    else if (k === "ArrowLeft") (rtl ? forward : back)();
-    else if (k === "ArrowRight") (rtl ? back : forward)();
-    else if (k === "ArrowDown" || k === "PageDown" || k === " ") forward();
-    else if (k === "ArrowUp" || k === "PageUp") back();
     else if (k === "Home") go(-pageCount);
     else if (k === "End") go(pageCount);
+    else if (pageStep(k, rtl)) go(pageStep(k, rtl));
     else return;
     e.preventDefault();
   }
 
-  /// Click zones: the leading third goes back, the trailing third goes forward, and
-  /// which side is which follows the reading direction.
   function onClick(e) {
-    if (!paged) return;
-    const third = window.innerWidth / 3;
-    if (e.clientX < third) go(rtl ? 1 : -1);
-    else if (e.clientX > window.innerWidth - third) go(rtl ? -1 : 1);
+    if (paged) go(clickStep(e.clientX, window.innerWidth, rtl));
   }
 
   function onResize() {
@@ -432,6 +399,9 @@
           />
         {/each}
       </div>
+      {#if !view.p.readable}
+        <p class="broken">Page {page + 1} could not be read.</p>
+      {/if}
     </div>
   </div>
 {/if}
@@ -460,6 +430,9 @@
   </div>
   {#if paged}
     <div>page <b>{page + 1}</b> / {pageCount}</div>
+  {/if}
+  {#if unreadable}
+    <div>unreadable <b>{unreadable}</b> page{unreadable === 1 ? "" : "s"}</div>
   {/if}
   <hr />
   <div>fps p50 <b>{hud.fps}</b></div>
@@ -548,6 +521,17 @@
     background: #55524a;
     color: #e8e6df;
     cursor: default;
+  }
+  .broken {
+    position: absolute;
+    left: 50%;
+    bottom: 12px;
+    transform: translateX(-50%);
+    margin: 0;
+    padding: 6px 10px;
+    background: #b33a2b;
+    color: #fff;
+    white-space: nowrap;
   }
   .error {
     position: fixed;

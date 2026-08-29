@@ -154,11 +154,7 @@ fn report(label: &str, path: &Path) -> anyhow::Result<()> {
     };
     let (widest, ratio) = dims.iter().enumerate().fold((0, 0.0), |acc, (i, &(w, h))| {
         let r = w as f64 / h as f64;
-        if r > acc.1 {
-            (i, r)
-        } else {
-            acc
-        }
+        if r > acc.1 { (i, r) } else { acc }
     });
     println!(
         "  widest page           #{widest} {:.2} vs median {median:.2} ({})",

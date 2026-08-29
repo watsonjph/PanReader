@@ -21,13 +21,6 @@ pub enum ReadingMode {
     Webtoon,
 }
 
-impl ReadingMode {
-    /// Paged modes turn a page at a time; the strip just scrolls.
-    pub fn is_paged(self) -> bool {
-        !matches!(self, ReadingMode::Webtoon)
-    }
-}
-
 /// The `Manga` field of a ComicInfo.xml, which is the only widely-written metadata that
 /// states reading direction. Komga, Kavita and most tagging tools emit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

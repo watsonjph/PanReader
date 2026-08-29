@@ -16,6 +16,8 @@ pub enum Error {
     Empty(PathBuf),
     #[error("page {0} out of range")]
     OutOfRange(usize),
+    #[error("{0} archives are not supported in this build, see the RAR note in CLAUDE.md")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -46,7 +48,7 @@ fn is_zip_page(entry: &str) -> bool {
 
 /// `page10.jpg` must sort after `page2.jpg`. Compares digit runs numerically and
 /// everything else case-insensitively, without allocating.
-pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (mut x, mut y) = (a.bytes().peekable(), b.bytes().peekable());
     loop {
         match (x.peek().copied(), y.peek().copied()) {
@@ -89,6 +91,15 @@ pub enum PageSource {
 
 impl PageSource {
     pub fn open(path: &Path) -> Result<Self> {
+        // A CBR is a RAR, which the default build cannot read for licence reasons. Say
+        // so by name: opening it as a zip fails with a corrupt-archive error that sends
+        // the reader looking for a damaged download instead.
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && matches!(ext.to_ascii_lowercase().as_str(), "cbr" | "rar")
+        {
+            return Err(Error::Unsupported(ext.to_ascii_uppercase()));
+        }
+
         let src = if path.is_dir() {
             let mut files: Vec<PathBuf> = std::fs::read_dir(path)?
                 .filter_map(|e| e.ok().map(|e| e.path()))
@@ -249,6 +260,23 @@ mod tests {
         );
         assert_eq!(natural_cmp("007", "7"), Ordering::Equal);
         assert_eq!(natural_cmp("a", "ab"), Ordering::Less);
+    }
+
+    #[test]
+    fn a_rar_is_refused_by_name_rather_than_as_a_broken_zip() {
+        let err = PageSource::open(Path::new("chapter.cbr")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(f) if f == "CBR"),
+            "expected an unsupported-format error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("CLAUDE.md"),
+            "the error should say where to look"
+        );
+        assert!(matches!(
+            PageSource::open(Path::new("x.RAR")).unwrap_err(),
+            Error::Unsupported(_)
+        ));
     }
 
     #[test]

@@ -7,8 +7,8 @@ use parking_lot::Mutex;
 use pr_archive::PageSource;
 use rayon::prelude::*;
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 /// Display-space tile height. Small enough that a fill is quick, large enough that a
@@ -320,8 +320,9 @@ impl Chapter {
         // monolithic 60k-px image peaks in the hundreds of MB here. If that shows up in
         // the frame-time overlay, the next step is a codec with row-range decode, not a
         // smaller tile.
-        // Probing only reads the header, so a file can pass that and still be truncated
-        // in its pixel data. Fill the page with markers rather than failing the request.
+        //
+        // Probing only reads the header, so a file can pass it and still be truncated in
+        // its pixel data. Fill the page with markers rather than failing the request.
         let img = match pr_image::decode_scaled(&bytes, display_w) {
             Ok(img) => img,
             Err(e) => {
