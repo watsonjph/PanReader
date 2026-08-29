@@ -162,6 +162,41 @@ impl PageSource {
         }
     }
 
+    /// A non-image file sitting alongside the pages, by name, case-insensitively.
+    ///
+    /// Used for ComicInfo.xml, which is the only widely-written source of reading
+    /// direction. Returns None when it is absent, which is the common case.
+    pub fn read_sidecar(&self, file_name: &str) -> Option<Vec<u8>> {
+        match self {
+            PageSource::Dir(files) => {
+                let dir = files.first()?.parent()?;
+                let entry = std::fs::read_dir(dir)
+                    .ok()?
+                    .filter_map(|e| e.ok())
+                    .find(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(file_name))
+                    })?;
+                std::fs::read(entry.path()).ok()
+            }
+            PageSource::Zip { path, .. } => {
+                let mut zip = zip::ZipArchive::new(File::open(path).ok()?).ok()?;
+                let name = zip
+                    .file_names()
+                    .find(|n| {
+                        n.rsplit('/')
+                            .next()
+                            .is_some_and(|f| f.eq_ignore_ascii_case(file_name))
+                    })?
+                    .to_owned();
+                let mut buf = Vec::new();
+                zip.by_name(&name).ok()?.read_to_end(&mut buf).ok()?;
+                Some(buf)
+            }
+        }
+    }
+
     /// Streamed out of the archive, never extracted to disk.
     pub fn read(&self, i: usize) -> Result<Vec<u8>> {
         match self {

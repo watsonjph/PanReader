@@ -124,6 +124,8 @@ pub struct PageLayout {
 
 #[derive(Serialize, Clone)]
 pub struct Layout {
+    /// How this chapter should be read, and why we think so.
+    pub reading: pr_core::Detected,
     pub display_w: u32,
     pub total_h: u32,
     pub pages: Vec<PageLayout>,
@@ -148,6 +150,7 @@ const UNREADABLE_RGB: [u8; 3] = [40, 36, 34];
 pub struct Chapter {
     src: PageSource,
     pages: Vec<Page>,
+    reading: pr_core::Detected,
     cache: Mutex<TileCache>,
     /// ponytail: one global fill lock. Serialises page decodes, which is what we want
     /// on a 60k-px strip anyway; go per-page if two chapters are ever read at once.
@@ -157,7 +160,11 @@ pub struct Chapter {
 
 impl Chapter {
     #[tracing::instrument(skip(src))]
-    pub fn open(kind: &str, src: PageSource) -> anyhow::Result<Self> {
+    pub fn open(
+        kind: &str,
+        src: PageSource,
+        default_mode: pr_core::ReadingMode,
+    ) -> anyhow::Result<Self> {
         let t = Instant::now();
         let prefixes = src.read_prefixes(64 * 1024)?;
         let pages: Vec<Page> = prefixes
@@ -199,9 +206,20 @@ impl Chapter {
             "probed chapter"
         );
 
+        // Direction comes from ComicInfo.xml when the file carries it; page shape
+        // decides layout. See `pr_core::detect` for what is and is not knowable.
+        let meta = src
+            .read_sidecar("ComicInfo.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|x| pr_core::parse_manga_flag(&x));
+        let dims: Vec<(u32, u32)> = pages.iter().map(|p| p.dims).collect();
+        let reading = pr_core::detect(&dims, meta, None, default_mode);
+        tracing::info!(?reading, "reading mode");
+
         Ok(Self {
             src,
             pages,
+            reading,
             cache: Mutex::new(TileCache::new()),
             fill: Mutex::new(()),
             stats: Stats::default(),
@@ -230,6 +248,7 @@ impl Chapter {
             })
             .collect();
         Layout {
+            reading: self.reading,
             display_w,
             total_h: y,
             pages,
@@ -402,8 +421,12 @@ mod tests {
         std::fs::write(dir.join("p2.jpg"), b"not an image at all").unwrap();
         std::fs::write(dir.join("p3.jpg"), &good).unwrap();
 
-        let chapter = Chapter::open("test", PageSource::open(&dir).unwrap())
-            .expect("a corrupt page must not fail the open");
+        let chapter = Chapter::open(
+            "test",
+            PageSource::open(&dir).unwrap(),
+            pr_core::ReadingMode::Rtl,
+        )
+        .expect("a corrupt page must not fail the open");
 
         let layout = chapter.layout(1200);
         assert_eq!(layout.pages.len(), 3, "the bad page keeps its slot");

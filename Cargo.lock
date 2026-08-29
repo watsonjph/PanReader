@@ -2972,6 +2972,7 @@ dependencies = [
  "lru",
  "parking_lot",
  "pr-archive",
+ "pr-core",
  "pr-image",
  "rayon",
  "serde",
@@ -2988,6 +2989,13 @@ version = "0.1.0"
 dependencies = [
  "thiserror 2.0.20",
  "zip",
+]
+
+[[package]]
+name = "pr-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

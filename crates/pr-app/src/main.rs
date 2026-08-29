@@ -51,7 +51,10 @@ impl App {
                 path.display()
             )
         })?;
-        let chapter = Arc::new(Chapter::open(kind, src)?);
+        // ponytail: one hardcoded fallback until Phase 2 has somewhere to persist
+        // settings. The precedence chain above it is already real, so this is the only
+        // line that moves when a config file and per-category defaults arrive.
+        let chapter = Arc::new(Chapter::open(kind, src, pr_core::ReadingMode::Rtl)?);
         self.chapters
             .lock()
             .insert(kind.to_owned(), chapter.clone());
