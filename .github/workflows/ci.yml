@@ -1,0 +1,54 @@
+name: check
+
+# The same three commands CLAUDE.md says to run before committing, run for you, on
+# every platform we intend to ship.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      # Never hide a macOS failure because Windows went red first, or the reverse.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain action needed: rustup reads rust-toolchain.toml and installs the
+      # pinned version, so CI and a developer machine cannot drift apart.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      # Build the frontend first. A broken Svelte build would otherwise only surface at
+      # `cargo tauri dev`, and a release build reads ui/dist.
+      - run: pnpm --dir ui install --frozen-lockfile
+      - run: pnpm --dir ui build
+
+      # Formatting is platform-independent, so checking it twice is noise.
+      - run: cargo fmt --all -- --check
+        if: matrix.os == 'windows-latest'
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+# Not here yet, on purpose: building signed installers. That belongs with Phase 3,
+# when there is something worth shipping. Linux is one `apt install` step away
+# (webkit2gtk, librsvg, patchelf) whenever it earns its place.

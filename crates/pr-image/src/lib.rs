@@ -175,6 +175,16 @@ pub fn tile(img: &RgbImage, y: u32, h: u32) -> RgbImage {
     imageops::crop_imm(img, 0, y, img.width(), h).to_image()
 }
 
+/// A flat JPEG of the given size, used to stand in for a page that cannot be read so
+/// the layout keeps its shape instead of leaving a hole. Encodes in well under a
+/// millisecond: a single colour costs the encoder almost nothing.
+pub fn flat_jpeg(w: u32, h: u32, rgb: [u8; 3]) -> Result<Vec<u8>> {
+    encode_jpeg(
+        &RgbImage::from_pixel(w.max(1), h.max(1), image::Rgb(rgb)),
+        70,
+    )
+}
+
 pub fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(img.len() / 8);
     JpegEncoder::new_with_quality(&mut out, quality).encode_image(img)?;

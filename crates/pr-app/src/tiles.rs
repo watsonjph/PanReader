@@ -93,7 +93,6 @@ pub struct Stats {
     pub page_decodes: AtomicU64,
     pub decode_us: AtomicU64,
     pub encode_us: AtomicU64,
-    pub bytes_out: AtomicU64,
     pub passthrough: AtomicU64,
 }
 
@@ -104,9 +103,7 @@ pub struct StatsSnapshot {
     pub page_decodes: u64,
     pub decode_ms_avg: f64,
     pub encode_ms_avg: f64,
-    pub mb_out: f64,
     pub passthrough: u64,
-    pub cached_tiles: usize,
     pub cached_mb: f64,
 }
 
@@ -121,22 +118,36 @@ pub struct PageLayout {
     pub tiles: u32,
     /// Per page, not global: a passthrough page has one tile as tall as itself.
     pub tile_h: u32,
+    /// False when the source could not be read. The page still occupies its slot.
+    pub readable: bool,
 }
 
 #[derive(Serialize, Clone)]
 pub struct Layout {
-    pub kind: String,
     pub display_w: u32,
-    pub tile_h: u32,
     pub total_h: u32,
     pub pages: Vec<PageLayout>,
 }
 
+/// What we know about one page before anything is decoded.
+struct Page {
+    /// Source dimensions, probed from the header. Never a full decode.
+    dims: (u32, u32),
+    /// False when the page could not be probed at all. It keeps its slot so page
+    /// numbers stay honest, and renders as a marker.
+    readable: bool,
+}
+
+/// Assumed shape of a page we could not read: a plausible portrait manga page, so the
+/// hole it leaves in a scroll is the right sort of size.
+const UNREADABLE_DIMS: (u32, u32) = (1000, 1400);
+/// Near-black, distinct from the reader background so a broken page reads as broken
+/// rather than as a rendering bug.
+const UNREADABLE_RGB: [u8; 3] = [40, 36, 34];
+
 pub struct Chapter {
-    kind: String,
     src: PageSource,
-    /// Source dimensions, probed from headers at open. Never a full decode.
-    dims: Vec<(u32, u32)>,
+    pages: Vec<Page>,
     cache: Mutex<TileCache>,
     /// ponytail: one global fill lock. Serialises page decodes, which is what we want
     /// on a 60k-px strip anyway; go per-page if two chapters are ever read at once.
@@ -149,26 +160,48 @@ impl Chapter {
     pub fn open(kind: &str, src: PageSource) -> anyhow::Result<Self> {
         let t = Instant::now();
         let prefixes = src.read_prefixes(64 * 1024)?;
-        let dims = prefixes
+        let pages: Vec<Page> = prefixes
             .into_par_iter()
             .enumerate()
-            .map(|(i, head)| match pr_image::probe(&head) {
-                Ok(d) => Ok(d),
+            .map(|(i, head)| {
                 // Header past the 64KB window (huge EXIF, progressive scan): pay for
                 // the full read on the few pages that need it.
-                Err(_) => Ok(pr_image::probe(&src.read(i)?)?),
+                let probed = pr_image::probe(&head).or_else(|_| {
+                    src.read(i)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|b| Ok(pr_image::probe(&b)?))
+                });
+                match probed {
+                    Ok(dims) => Page {
+                        dims,
+                        readable: true,
+                    },
+                    // One truncated or mislabelled file must not cost the reader the
+                    // other two hundred pages. Keep the slot, mark it, carry on.
+                    Err(e) => {
+                        tracing::warn!(
+                            page = i,
+                            "page is unreadable, showing a placeholder: {e:#}"
+                        );
+                        Page {
+                            dims: UNREADABLE_DIMS,
+                            readable: false,
+                        }
+                    }
+                }
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect();
+        let broken = pages.iter().filter(|p| !p.readable).count();
         tracing::info!(
-            pages = dims.len(),
+            pages = pages.len(),
+            broken,
             ms = t.elapsed().as_millis(),
             "probed chapter"
         );
 
         Ok(Self {
-            kind: kind.to_owned(),
             src,
-            dims,
+            pages,
             cache: Mutex::new(TileCache::new()),
             fill: Mutex::new(()),
             stats: Stats::default(),
@@ -178,11 +211,11 @@ impl Chapter {
     pub fn layout(&self, display_w: u32) -> Layout {
         let mut y = 0u32;
         let pages = self
-            .dims
+            .pages
             .iter()
             .enumerate()
-            .map(|(index, &dims)| {
-                let grid = pr_image::PageGrid::new(dims, display_w, TILE_H);
+            .map(|(index, page)| {
+                let grid = pr_image::PageGrid::new(page.dims, display_w, TILE_H);
                 let page = PageLayout {
                     index,
                     w: grid.w,
@@ -190,15 +223,14 @@ impl Chapter {
                     y,
                     tiles: grid.tiles,
                     tile_h: grid.tile_h,
+                    readable: page.readable,
                 };
                 y = y.saturating_add(grid.h);
                 page
             })
             .collect();
         Layout {
-            kind: self.kind.clone(),
             display_w,
-            tile_h: TILE_H,
             total_h: y,
             pages,
         }
@@ -210,8 +242,18 @@ impl Chapter {
     /// hand it over. Everything else is a cache hit, or a miss that decodes the page
     /// once and fills all of its tiles, so a scroll pays per page rather than per tile.
     pub fn tile(&self, key: TileKey) -> anyhow::Result<Served> {
-        let dims = *self.dims.get(key.page).context("page out of range")?;
-        if pr_image::PageGrid::new(dims, key.w, TILE_H).is_passthrough() {
+        let page = self.pages.get(key.page).context("page out of range")?;
+        let grid = pr_image::PageGrid::new(page.dims, key.w, TILE_H);
+
+        if !page.readable {
+            let (y0, y1) = grid.bounds(key.tile, grid.h);
+            return Ok(Served {
+                data: Arc::new(pr_image::flat_jpeg(grid.w, y1 - y0, UNREADABLE_RGB)?),
+                mime: "image/jpeg",
+            });
+        }
+
+        if grid.is_passthrough() {
             self.stats.passthrough.fetch_add(1, Relaxed);
             let name = self.src.name(key.page).unwrap_or_default();
             // Deliberately not cached: re-reading costs a fraction of a millisecond and
@@ -259,13 +301,36 @@ impl Chapter {
         // monolithic 60k-px image peaks in the hundreds of MB here. If that shows up in
         // the frame-time overlay, the next step is a codec with row-range decode, not a
         // smaller tile.
-        let img = pr_image::decode_scaled(&bytes, display_w)?;
+        // Probing only reads the header, so a file can pass that and still be truncated
+        // in its pixel data. Fill the page with markers rather than failing the request.
+        let img = match pr_image::decode_scaled(&bytes, display_w) {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::warn!(page, "decode failed, filling with placeholders: {e:#}");
+                let dims = self.pages.get(page).context("page out of range")?.dims;
+                let grid = pr_image::PageGrid::new(dims, display_w, TILE_H);
+                let mut cache = self.cache.lock();
+                for i in 0..grid.tiles {
+                    let (y0, y1) = grid.bounds(i, grid.h);
+                    let flat = pr_image::flat_jpeg(grid.w, y1 - y0, UNREADABLE_RGB)?;
+                    cache.put(
+                        TileKey {
+                            page,
+                            tile: i,
+                            w: display_w,
+                        },
+                        Arc::new(flat),
+                    );
+                }
+                return Ok(());
+            }
+        };
         self.stats
             .decode_us
             .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
         self.stats.page_decodes.fetch_add(1, Relaxed);
 
-        let dims = *self.dims.get(page).context("page out of range")?;
+        let dims = self.pages.get(page).context("page out of range")?.dims;
         let grid = pr_image::PageGrid::new(dims, display_w, TILE_H);
         let decoded_h = img.height();
 
@@ -284,7 +349,6 @@ impl Chapter {
 
         let mut cache = self.cache.lock();
         for (tile, data) in encoded {
-            self.stats.bytes_out.fetch_add(data.len() as u64, Relaxed);
             cache.put(
                 TileKey {
                     page,
@@ -307,9 +371,7 @@ impl Chapter {
             page_decodes: s.page_decodes.load(Relaxed),
             decode_ms_avg: s.decode_us.load(Relaxed) as f64 / 1000.0 / decodes,
             encode_ms_avg: s.encode_us.load(Relaxed) as f64 / 1000.0 / decodes,
-            mb_out: s.bytes_out.load(Relaxed) as f64 / 1_048_576.0,
             passthrough: s.passthrough.load(Relaxed),
-            cached_tiles: cache.lru.len(),
             cached_mb: cache.bytes as f64 / 1_048_576.0,
         }
     }
@@ -325,6 +387,43 @@ mod tests {
             tile,
             w: 1200,
         }
+    }
+
+    /// The bug this guards: one truncated file used to fail the whole chapter open, so
+    /// a 231-page volume was unreadable because of a single bad byte.
+    #[test]
+    fn one_corrupt_page_does_not_take_the_chapter_with_it() {
+        let dir = std::env::temp_dir().join("pr_corrupt_page_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good = pr_image::flat_jpeg(600, 900, [128, 128, 128]).unwrap();
+        std::fs::write(dir.join("p1.jpg"), &good).unwrap();
+        std::fs::write(dir.join("p2.jpg"), b"not an image at all").unwrap();
+        std::fs::write(dir.join("p3.jpg"), &good).unwrap();
+
+        let chapter = Chapter::open("test", PageSource::open(&dir).unwrap())
+            .expect("a corrupt page must not fail the open");
+
+        let layout = chapter.layout(1200);
+        assert_eq!(layout.pages.len(), 3, "the bad page keeps its slot");
+        assert!(layout.pages[0].readable);
+        assert!(!layout.pages[1].readable, "page 2 is unreadable");
+        assert!(layout.pages[2].readable, "page 3 must not shift up");
+
+        // Every page still serves bytes, including the broken one.
+        for i in 0..layout.pages.len() {
+            let served = chapter
+                .tile(TileKey {
+                    page: i,
+                    tile: 0,
+                    w: 1200,
+                })
+                .unwrap_or_else(|e| panic!("page {i} served nothing: {e:#}"));
+            assert!(!served.data.is_empty(), "page {i} served an empty tile");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
