@@ -56,6 +56,7 @@
   let dirty = true;
   let openedAt = 0;
   let resizeTimer = 0;
+  let warmTimer = 0;
   let tops = []; // CSS-px top of each page, padding included
 
   const paged = $derived(mode !== "webtoon");
@@ -182,12 +183,23 @@
     }
   }
 
+  /// Re-aim the background fill at the current page. Debounced: flicking through
+  /// twenty pages should retarget once, not twenty times.
+  function reWarm() {
+    if (!layout) return;
+    clearTimeout(warmTimer);
+    warmTimer = setTimeout(() => {
+      invoke("warm", { kind, page, displayW: layout.display_w }).catch(() => {});
+    }, 400);
+  }
+
   function go(delta) {
     if (!layout) return;
     const next = Math.min(Math.max(page + delta, 0), layout.pages.length - 1);
     if (next !== page) {
       page = next;
       prefetch();
+      reWarm();
     }
   }
 
@@ -446,6 +458,7 @@
   <div>encode avg <b>{(rust.encode_ms_avg ?? 0).toFixed(1)}</b> ms</div>
   <div>tile hit/miss <b>{rust.hits ?? 0}</b>/<b>{rust.misses ?? 0}</b></div>
   <div>passthrough <b>{rust.passthrough ?? 0}</b></div>
+  <div>warmed <b>{rust.warmed ?? 0}</b> pages</div>
   <div>cache <b>{(rust.cached_mb ?? 0).toFixed(1)}</b> MB</div>
 </div>
 

@@ -64,9 +64,20 @@ impl App {
 
 #[tauri::command]
 fn open_chapter(app: State<'_, App>, kind: String, display_w: u32) -> Result<Layout, String> {
-    app.chapter(&kind)
-        .map(|c| c.layout(display_w))
-        .map_err(|e| format!("{e:#}"))
+    let chapter = app.chapter(&kind).map_err(|e| format!("{e:#}"))?;
+    let layout = chapter.layout(display_w);
+    // Start filling the chapter behind the reader straight away. The first page is
+    // already on its way over pan:// by the time this returns.
+    chapter.warm(0, display_w);
+    Ok(layout)
+}
+
+/// Re-aim the background fill at where the reader actually is.
+#[tauri::command]
+fn warm(app: State<'_, App>, kind: String, page: usize, display_w: u32) {
+    if let Some(chapter) = app.chapters.lock().get(&kind) {
+        chapter.warm(page, display_w);
+    }
 }
 
 #[tauri::command]
@@ -151,7 +162,12 @@ fn main() {
                 }
             });
         })
-        .invoke_handler(tauri::generate_handler![open_chapter, stats, tile_base])
+        .invoke_handler(tauri::generate_handler![
+            open_chapter,
+            warm,
+            stats,
+            tile_base
+        ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
 }
