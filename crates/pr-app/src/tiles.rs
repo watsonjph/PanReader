@@ -40,6 +40,12 @@ impl TileCache {
         self.lru.get(key).cloned()
     }
 
+    /// Presence without promoting the entry: warming must not reorder the LRU, or it
+    /// would make its own prefetches look more recently used than the page being read.
+    fn has(&self, key: &TileKey) -> bool {
+        self.lru.contains(key)
+    }
+
     fn put(&mut self, key: TileKey, value: Arc<Vec<u8>>) {
         if let Some(old) = self.lru.put(key, Arc::clone(&value)) {
             self.bytes -= old.len();
@@ -94,6 +100,7 @@ pub struct Stats {
     pub decode_us: AtomicU64,
     pub encode_us: AtomicU64,
     pub passthrough: AtomicU64,
+    pub warmed: AtomicU64,
 }
 
 #[derive(Serialize, Default)]
@@ -104,6 +111,7 @@ pub struct StatsSnapshot {
     pub decode_ms_avg: f64,
     pub encode_ms_avg: f64,
     pub passthrough: u64,
+    pub warmed: u64,
     pub cached_mb: f64,
 }
 
@@ -131,6 +139,26 @@ pub struct Layout {
     pub pages: Vec<PageLayout>,
 }
 
+/// Page indices ordered outward from `from`: the page itself, then one ahead, one
+/// behind, two ahead, and so on.
+///
+/// Forward first, because that is where reading goes. Interleaving backwards costs
+/// almost nothing and saves the reader who turns back a page.
+fn outward(from: usize, len: usize) -> impl Iterator<Item = usize> {
+    let from = from.min(len.saturating_sub(1)) as isize;
+    (0..len as isize)
+        .flat_map(move |d| {
+            if d == 0 {
+                vec![from]
+            } else {
+                vec![from + d, from - d]
+            }
+        })
+        .filter(move |&i| i >= 0 && i < len as isize)
+        .map(|i| i as usize)
+        .take(len)
+}
+
 /// What we know about one page before anything is decoded.
 struct Page {
     /// Source dimensions, probed from the header. Never a full decode.
@@ -155,6 +183,9 @@ pub struct Chapter {
     /// ponytail: one global fill lock. Serialises page decodes, which is what we want
     /// on a 60k-px strip anyway; go per-page if two chapters are ever read at once.
     fill: Mutex<()>,
+    /// Bumped by every `warm` call. A sweep stops as soon as it sees a newer one, so
+    /// navigating re-targets the warm instead of queueing behind a stale sweep.
+    warm_generation: AtomicU64,
     pub stats: Stats,
 }
 
@@ -222,6 +253,7 @@ impl Chapter {
             reading,
             cache: Mutex::new(TileCache::new()),
             fill: Mutex::new(()),
+            warm_generation: AtomicU64::new(0),
             stats: Stats::default(),
         })
     }
@@ -311,6 +343,69 @@ impl Chapter {
             .ok_or_else(|| anyhow::anyhow!("tile {key:?} out of range"))
     }
 
+    /// Fill the rest of the chapter outward from `from`, in the background.
+    ///
+    /// This is the loading strategy in `CLAUDE.md`: the reader should not wait at each
+    /// turn for work that could already be done. Calling it again re-targets the sweep
+    /// rather than queueing a second one.
+    pub fn warm(self: &Arc<Self>, from: usize, display_w: u32) {
+        let generation = self.warm_generation.fetch_add(1, Relaxed) + 1;
+        let chapter = Arc::clone(self);
+        std::thread::spawn(move || chapter.warm_sweep(generation, from, display_w));
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn warm_sweep(&self, generation: u64, from: usize, display_w: u32) {
+        let t = Instant::now();
+        let mut filled = 0u64;
+
+        for page in outward(from, self.pages.len()) {
+            // A newer warm supersedes this one; stop rather than compete with it.
+            if self.warm_generation.load(Relaxed) != generation {
+                return;
+            }
+            // Filling past the ceiling would evict the pages nearest the reader to make
+            // room for ones further away, which is worse than not warming at all.
+            if self.cache.lock().bytes >= CACHE_BYTES {
+                break;
+            }
+
+            let Some(p) = self.pages.get(page) else {
+                continue;
+            };
+            let grid = pr_image::PageGrid::new(p.dims, display_w, TILE_H);
+            // A passthrough page is a file read at serve time and is never cached, so
+            // there is nothing here to warm. Most of a normal manga volume lands here.
+            if !p.readable || grid.is_passthrough() {
+                continue;
+            }
+            if self.cache.lock().has(&TileKey {
+                page,
+                tile: 0,
+                w: display_w,
+            }) {
+                continue;
+            }
+
+            {
+                // Held for one page at a time. An interactive miss can wait behind a
+                // single fill, never behind the whole sweep.
+                let _fill = self.fill.lock();
+                if let Err(e) = self.fill_page(page, display_w) {
+                    tracing::warn!(page, "warm failed: {e:#}");
+                }
+            }
+            filled += 1;
+            self.stats.warmed.fetch_add(1, Relaxed);
+            // Let a waiting request take the lock before the next page.
+            std::thread::yield_now();
+        }
+
+        if filled > 0 {
+            tracing::info!(filled, ms = t.elapsed().as_millis(), "warmed chapter");
+        }
+    }
+
     #[tracing::instrument(skip(self))]
     fn fill_page(&self, page: usize, display_w: u32) -> anyhow::Result<()> {
         let bytes = self.src.read(page)?;
@@ -392,6 +487,7 @@ impl Chapter {
             decode_ms_avg: s.decode_us.load(Relaxed) as f64 / 1000.0 / decodes,
             encode_ms_avg: s.encode_us.load(Relaxed) as f64 / 1000.0 / decodes,
             passthrough: s.passthrough.load(Relaxed),
+            warmed: s.warmed.load(Relaxed),
             cached_mb: cache.bytes as f64 / 1_048_576.0,
         }
     }
@@ -446,6 +542,116 @@ mod tests {
                 .unwrap_or_else(|e| panic!("page {i} served nothing: {e:#}"));
             assert!(!served.data.is_empty(), "page {i} served an empty tile");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweeps_outward_from_the_reader_and_covers_every_page() {
+        assert_eq!(outward(3, 8).collect::<Vec<_>>(), [3, 4, 2, 5, 1, 6, 0, 7]);
+        // Clamped at both ends without repeating or skipping.
+        assert_eq!(outward(0, 4).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(outward(3, 4).collect::<Vec<_>>(), [3, 2, 1, 0]);
+        assert_eq!(outward(9, 3).collect::<Vec<_>>(), [2, 1, 0]);
+        assert_eq!(outward(0, 0).collect::<Vec<_>>(), Vec::<usize>::new());
+
+        for (from, len) in [(0, 50), (25, 50), (49, 50)] {
+            let seen: Vec<usize> = outward(from, len).collect();
+            let mut sorted = seen.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                len,
+                "outward({from}, {len}) missed or repeated a page"
+            );
+        }
+    }
+
+    /// Warming has nothing to do on a passthrough chapter: those pages are a file read
+    /// at serve time and are never cached. Filling them would be pure waste.
+    #[test]
+    fn warming_skips_pages_that_cost_nothing_to_serve() {
+        let dir = std::env::temp_dir().join("pr_warm_passthrough_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 1..=4 {
+            let page = pr_image::flat_jpeg(600, 900, [90, 90, 90]).unwrap();
+            std::fs::write(dir.join(format!("p{i}.jpg")), &page).unwrap();
+        }
+
+        let chapter = Arc::new(
+            Chapter::open(
+                "test",
+                PageSource::open(&dir).unwrap(),
+                pr_core::ReadingMode::Rtl,
+            )
+            .unwrap(),
+        );
+        // 600px pages drawn into a 1200px viewport: every one passes through.
+        assert!(chapter.layout(1200).pages.iter().all(|p| p.tiles == 1));
+
+        chapter.warm(0, 1200);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let snap = chapter.snapshot();
+        assert_eq!(snap.warmed, 0, "warmed a page that needs no work");
+        assert_eq!(
+            snap.cached_mb, 0.0,
+            "passthrough pages must not enter the cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chapter that does need decoding gets filled ahead of the reader.
+    #[test]
+    fn warming_fills_pages_that_do_cost_something() {
+        let dir = std::env::temp_dir().join("pr_warm_decode_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 1..=4 {
+            // Wider than the viewport, so each page is scaled and re-encoded.
+            let page = pr_image::flat_jpeg(2400, 1600, [70, 70, 70]).unwrap();
+            std::fs::write(dir.join(format!("p{i}.jpg")), &page).unwrap();
+        }
+
+        let chapter = Arc::new(
+            Chapter::open(
+                "test",
+                PageSource::open(&dir).unwrap(),
+                pr_core::ReadingMode::Rtl,
+            )
+            .unwrap(),
+        );
+        chapter.warm(0, 1200);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while chapter.snapshot().warmed < 4 && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let snap = chapter.snapshot();
+        assert_eq!(
+            snap.warmed, 4,
+            "expected all four pages warmed, got {}",
+            snap.warmed
+        );
+        assert!(snap.cached_mb > 0.0, "warmed pages should be in the cache");
+
+        // A turn onto a warmed page is a cache hit, not a decode.
+        let before = chapter.snapshot().page_decodes;
+        chapter
+            .tile(TileKey {
+                page: 2,
+                tile: 0,
+                w: 1200,
+            })
+            .unwrap();
+        assert_eq!(
+            chapter.snapshot().page_decodes,
+            before,
+            "a warmed page was decoded again on read"
+        );
+        assert!(chapter.snapshot().hits > 0, "expected a cache hit");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
