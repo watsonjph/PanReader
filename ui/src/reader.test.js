@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   clickStep,
+  groupOf,
+  spreadGroups,
   fitScale,
   pageAt,
   pageStep,
@@ -144,5 +146,54 @@ describe("navigation direction", () => {
     expect(clickStep(10, 1200, false)).toBe(-1);
     expect(clickStep(1190, 1200, false)).toBe(1);
     expect(clickStep(600, 1200, true)).toBe(0);
+  });
+});
+
+describe("spreadGroups", () => {
+  const portrait = { w: 978, h: 1400 };
+  const spread = { w: 2100, h: 1400 };
+  const pages = (n) => Array.from({ length: n }, () => ({ ...portrait }));
+
+  it("gives every page its own group when double-page is off", () => {
+    expect(spreadGroups(pages(4), { enabled: false })).toEqual([[0], [1], [2], [3]]);
+  });
+
+  it("pairs pages after leaving the cover alone", () => {
+    expect(spreadGroups(pages(5), { enabled: true })).toEqual([[0], [1, 2], [3, 4]]);
+  });
+
+  it("pairs from the first page when the cover is not held back", () => {
+    expect(spreadGroups(pages(4), { enabled: true, coverAlone: false })).toEqual([
+      [0, 1],
+      [2, 3],
+    ]);
+  });
+
+  it("shows a printed spread alone and re-pairs cleanly after it", () => {
+    const p = [portrait, portrait, spread, portrait, portrait, portrait];
+    // cover, then 1 would pair with 2 -- but 2 is a spread, so 1 stands alone too.
+    expect(spreadGroups(p, { enabled: true })).toEqual([[0], [1], [2], [3, 4], [5]]);
+  });
+
+  it("never drops or duplicates a page, whatever the mix", () => {
+    const p = [portrait, spread, portrait, portrait, spread, portrait, portrait];
+    for (const coverAlone of [true, false]) {
+      const flat = spreadGroups(p, { enabled: true, coverAlone }).flat();
+      expect(flat).toEqual(p.map((_, i) => i));
+    }
+  });
+
+  it("handles an empty chapter", () => {
+    expect(spreadGroups([], { enabled: true })).toEqual([]);
+  });
+});
+
+describe("groupOf", () => {
+  it("finds the group holding a page", () => {
+    const groups = [[0], [1, 2], [3, 4]];
+    expect(groupOf(groups, 0)).toBe(0);
+    expect(groupOf(groups, 2)).toBe(1);
+    expect(groupOf(groups, 4)).toBe(2);
+    expect(groupOf(groups, 99)).toBe(0);
   });
 });

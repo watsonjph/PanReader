@@ -95,3 +95,45 @@ export function clickStep(x, width, rtl) {
   if (x > width - third) return rtl ? -1 : 1;
   return 0;
 }
+
+/// A page at least this much wider than tall is a printed spread and is shown alone.
+///
+/// Picked from real scans rather than guessed: in Yotsuba vol 1 the widest page is 1.48
+/// against a 0.69 median, so anything past 1.0 separates spreads cleanly from the
+/// portrait pages around them.
+export const SPREAD_RATIO = 1.0;
+
+/// Group pages into what gets shown at once.
+///
+/// Returns a list of page-index groups: one index per group when double-page is off,
+/// otherwise pairs, except where a page must stand alone. Two pages stand alone: a
+/// printed spread, which is already two pages wide, and the cover, because pairing from
+/// page zero puts every later pair on the wrong leaf.
+export function spreadGroups(pages, { enabled = false, coverAlone = true } = {}) {
+  if (!enabled) return pages.map((_, i) => [i]);
+
+  const wide = (i) => pages[i].w / pages[i].h >= SPREAD_RATIO;
+  const groups = [];
+  let i = 0;
+
+  if (coverAlone && pages.length > 0) {
+    groups.push([0]);
+    i = 1;
+  }
+  while (i < pages.length) {
+    if (wide(i) || i + 1 >= pages.length || wide(i + 1)) {
+      groups.push([i]);
+      i += 1;
+    } else {
+      groups.push([i, i + 1]);
+      i += 2;
+    }
+  }
+  return groups;
+}
+
+/// Index of the group holding `page`, or 0 when there is none.
+export function groupOf(groups, page) {
+  const i = groups.findIndex((g) => g.includes(page));
+  return i < 0 ? 0 : i;
+}
