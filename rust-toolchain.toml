@@ -1,0 +1,8 @@
+# Pinned so this machine, CI, and any future contributor compile with one compiler.
+# Clippy gains lints between releases -- `manual_is_multiple_of` and
+# `needless_question_mark` both fired during Phase 0 -- and `-D warnings` turns a lint
+# that only exists in a newer toolchain into a build failure somewhere else.
+# Bump deliberately, run the clippy gate, commit the result.
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
