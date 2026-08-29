@@ -4,6 +4,8 @@
   import {
     clickStep,
     fitScale,
+    groupOf,
+    spreadGroups,
     pageAt,
     pageStep,
     pageTops,
@@ -39,6 +41,10 @@
   let pad = $state(0);
   let rot = $state(0);
   let rotLock = $state(false);
+  let spread = $state(false);
+  let zoom = $state(1);
+  let panX = $state(0);
+  let panY = $state(0);
   let page = $state(0);
   let pageCount = $state(0);
   let epoch = $state(0); // bumped on load so the paged view recomputes
@@ -58,8 +64,17 @@
   let resizeTimer = 0;
   let warmTimer = 0;
   let tops = []; // CSS-px top of each page, padding included
+  let dragging = false;
+  let dragMoved = false;
+  let dragX = 0;
+  let dragY = 0;
+  let padHeld = new Set();
 
   const paged = $derived(mode !== "webtoon");
+  const groups = $derived.by(() => {
+    void epoch, spread;
+    return layout ? spreadGroups(layout.pages, { enabled: spread }) : [];
+  });
   const unreadable = $derived.by(() => {
     void epoch;
     return layout ? layout.pages.filter((p) => !p.readable).length : 0;
@@ -85,47 +100,50 @@
   // The paged view. Rebuilt only when something it depends on changes, which for a page
   // turn is once -- there is no scroll path here to keep off the main thread.
   const view = $derived.by(() => {
-    void epoch, page, fit, vw, vh, mode, rot, rotLock, pad, sample;
+    void epoch, page, fit, vw, vh, mode, rot, rotLock, pad, sample, spread, zoom;
     if (!layout || mode === "webtoon") return null;
-    const p = layout.pages[page];
-    if (!p) return null;
+    const members = (groups[groupOf(groups, page)] ?? [page])
+      .map((i) => layout.pages[i])
+      .filter(Boolean);
+    if (!members.length) return null;
 
-    const naturalW = p.w / dpr;
-    const naturalH = p.h / dpr;
+    // A pair is measured and scaled as one unit, so the two halves stay the same size
+    // and the spread fits the window as a whole rather than page by page.
+    const naturalW = members.reduce((sum, p) => sum + p.w / dpr, 0);
+    const naturalH = Math.max(...members.map((p) => p.h / dpr));
 
-    const turn = turnFor({
-      rot,
-      rotLock,
-      w: naturalW,
-      h: naturalH,
-      fit,
-      vw,
-      vh,
-    });
+    const turn = turnFor({ rot, rotLock, w: naturalW, h: naturalH, fit, vw, vh });
     const quarter = turn === 90 || turn === 270;
-
-    // Turned, the page is measured against the viewport with its axes swapped.
-    const scale = quarter
+    const base = quarter
       ? fitScale(fit, naturalH, naturalW, vw, vh)
       : fitScale(fit, naturalW, naturalH, vw, vh);
-    const drawW = Math.round(naturalW * scale);
-    const tiles = tileRects(p).map(({ t, top, bottom }) => {
-      const y0 = Math.round((top / dpr) * scale);
-      const y1 = Math.round((bottom / dpr) * scale);
-      return { t, url: tileUrl(p.index, t), top: y0, h: y1 - y0 };
-    });
-    const drawH = tiles.length ? tiles[tiles.length - 1].top + tiles[tiles.length - 1].h : 0;
+    const scale = base * zoom;
 
-    // The box is the page's footprint after turning; the page itself is drawn unturned
-    // inside it and rotated about its centre.
+    const pages = members.map((p) => {
+      const drawW = Math.round((p.w / dpr) * scale);
+      const tiles = tileRects(p).map(({ t, top, bottom }) => {
+        const y0 = Math.round((top / dpr) * scale);
+        const y1 = Math.round((bottom / dpr) * scale);
+        return { t, url: tileUrl(p.index, t), top: y0, h: y1 - y0 };
+      });
+      const drawH = tiles.length
+        ? tiles[tiles.length - 1].top + tiles[tiles.length - 1].h
+        : 0;
+      return { p, drawW, drawH, tiles };
+    });
+
+    const totalW = pages.reduce((sum, v) => sum + v.drawW, 0);
+    const totalH = Math.max(...pages.map((v) => v.drawH));
     return {
-      p,
-      drawW,
-      drawH,
-      tiles,
+      pages,
+      // Right to left means the earlier page sits on the right.
+      order: rtl ? [...pages].reverse() : pages,
       turn,
-      boxW: quarter ? drawH : drawW,
-      boxH: quarter ? drawW : drawH,
+      totalW,
+      totalH,
+      boxW: quarter ? totalH : totalW,
+      boxH: quarter ? totalW : totalH,
+      broken: members.filter((p) => !p.readable).map((p) => p.index + 1),
     };
   });
 
@@ -157,6 +175,7 @@
       return;
     }
 
+    resetView();
     detected = layout.reading;
     if (!overridden) mode = layout.reading.mode;
     pageCount = layout.pages.length;
@@ -176,10 +195,13 @@
   /// immutable, so touching the URL is the whole prefetch.
   function prefetch() {
     if (!layout) return;
+    const at = groupOf(groups, page);
     for (const d of [1, 2, 3, -1]) {
-      const p = layout.pages[page + d];
-      if (!p) continue;
-      for (const { t } of tileRects(p)) new Image().src = tileUrl(p.index, t);
+      for (const i of groups[at + d] ?? []) {
+        const p = layout.pages[i];
+        if (!p) continue;
+        for (const { t } of tileRects(p)) new Image().src = tileUrl(p.index, t);
+      }
     }
   }
 
@@ -194,13 +216,36 @@
   }
 
   function go(delta) {
-    if (!layout) return;
-    const next = Math.min(Math.max(page + delta, 0), layout.pages.length - 1);
-    if (next !== page) {
-      page = next;
-      prefetch();
-      reWarm();
-    }
+    if (!layout || !delta) return;
+    // Steps are groups, so a double-page spread advances by two pages and a lone
+    // printed spread by one, without the caller having to know which.
+    const at = groupOf(groups, page);
+    const next = Math.min(Math.max(at + delta, 0), groups.length - 1);
+    const first = groups[next]?.[0];
+    if (first === undefined || first === page) return;
+    page = first;
+    resetView();
+    prefetch();
+    reWarm();
+  }
+
+  /// Zoom and pan belong to the page you were looking at, not the next one.
+  function resetView() {
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+  }
+
+  /// Double-click zooms toward the point under the cursor, so the thing you aimed at
+  /// stays where it is instead of sliding to the middle.
+  function zoomAt(clientX, clientY) {
+    if (zoom > 1) return resetView();
+    const factor = 2;
+    const cx = clientX - vw / 2 - panX;
+    const cy = clientY - vh / 2 - panY;
+    zoom = factor;
+    panX -= cx * (factor - 1);
+    panY -= cy * (factor - 1);
   }
 
   function mount(p, t) {
@@ -278,6 +323,7 @@
           autoscroll = false;
         }
       }
+      pollGamepad(dt);
       if (dirty) {
         dirty = false;
         ensureTiles();
@@ -346,6 +392,9 @@
     else if (k === "[") rot = (rot + 270) % 360;
     else if (k === "]") rot = (rot + 90) % 360;
     else if (k === "l") rotLock = !rotLock;
+    else if (k === "w") spread = !spread;
+    else if (k === "F" || k === "F11") toggleFullscreen();
+    else if (k === "0") resetView();
     else if (k === "m") setMode(MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
     else if (k === "r") {
       overridden = false;
@@ -359,7 +408,103 @@
   }
 
   function onClick(e) {
-    if (paged) go(clickStep(e.clientX, window.innerWidth, rtl));
+    // A drag is not a click. Without this, panning a zoomed page turns it as well.
+    if (!paged || dragMoved) return;
+    go(clickStep(e.clientX, window.innerWidth, rtl));
+  }
+
+  /// Double-click zooms, but only in the middle third.
+  ///
+  /// The sides turn pages on a single click, and a double-click there would fire the
+  /// turn first. Delaying every turn to wait for a possible second click would make the
+  /// reader feel sluggish, so the two gestures get separate zones instead. The middle
+  /// already does nothing on a single click.
+  function onDoubleClick(e) {
+    if (paged && clickStep(e.clientX, window.innerWidth, rtl) === 0) {
+      zoomAt(e.clientX, e.clientY);
+    }
+  }
+
+  function onWheel(e) {
+    if (!paged) return; // the strip scrolls natively
+    e.preventDefault();
+    if (overflows) {
+      panX -= e.deltaX;
+      panY -= e.deltaY;
+    } else {
+      go(e.deltaY > 0 ? 1 : -1);
+    }
+  }
+
+  const overflows = $derived(
+    !!view && (zoom > 1 || view.boxW > vw || view.boxH > vh),
+  );
+
+  function onPointerDown(e) {
+    if (!paged || !overflows) return;
+    dragging = true;
+    dragMoved = false;
+    dragX = e.clientX;
+    dragY = e.clientY;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  }
+
+  function onPointerMove(e) {
+    if (!dragging) return;
+    const dx = e.clientX - dragX;
+    const dy = e.clientY - dragY;
+    if (Math.abs(dx) + Math.abs(dy) > 4) dragMoved = true;
+    panX += dx;
+    panY += dy;
+    dragX = e.clientX;
+    dragY = e.clientY;
+  }
+
+  function onPointerUp() {
+    dragging = false;
+    // Cleared on the next frame so the click that follows this release still sees it.
+    setTimeout(() => (dragMoved = false), 0);
+  }
+
+  /// Standard-layout buttons: d-pad left/right/up/down, then the two shoulders.
+  const PAD_BACK = [14, 12, 4];
+  const PAD_FORWARD = [15, 13, 5];
+  /// Below this the stick is at rest; sticks do not return to exactly zero.
+  const STICK_DEADZONE = 0.15;
+
+  /// Polled from the frame loop, because the Gamepad API has no events for buttons.
+  ///
+  /// Reading on a TV is a real use for this, and a controller that repeats a page turn
+  /// every frame is useless -- so turns fire on the press edge, while the stick scrolls
+  /// continuously because that is what a stick is for.
+  function pollGamepad(dt) {
+    const pads = navigator.getGamepads?.() ?? [];
+    const pressed = new Set();
+
+    for (const gp of pads) {
+      if (!gp) continue;
+      gp.buttons.forEach((b, i) => b.pressed && pressed.add(i));
+
+      if (!paged && scroller) {
+        const y = gp.axes[1] ?? 0;
+        if (Math.abs(y) > STICK_DEADZONE) {
+          scroller.scrollTop += y * 2000 * (dt / 1000);
+          dirty = true;
+        }
+      }
+    }
+
+    if (paged) {
+      const edge = (b) => pressed.has(b) && !padHeld.has(b);
+      if (PAD_FORWARD.some(edge)) go(1);
+      else if (PAD_BACK.some(edge)) go(-1);
+    }
+    padHeld = pressed;
+  }
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else document.documentElement.requestFullscreen?.().catch(() => {});
   }
 
   function onResize() {
@@ -395,24 +540,47 @@
 
 {#if paged && view}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="paged" onclick={onClick}>
-    <div class="page" style="width:{view.boxW}px;height:{view.boxH}px;padding:{pad}px">
+  <div
+    class="paged"
+    class:grabbable={overflows}
+    class:grabbing={dragging}
+    onclick={onClick}
+    ondblclick={onDoubleClick}
+    onwheel={onWheel}
+    onpointerdown={onPointerDown}
+    onpointermove={onPointerMove}
+    onpointerup={onPointerUp}
+    onpointercancel={onPointerUp}
+  >
+    <div
+      class="page"
+      style="width:{view.boxW}px;height:{view.boxH}px;padding:{pad}px;transform:translate({panX}px,{panY}px)"
+    >
       <div
         class="turn"
-        style="width:{view.drawW}px;height:{view.drawH}px;transform:translate(-50%,-50%) rotate({view.turn}deg)"
+        style="width:{view.totalW}px;height:{view.totalH}px;transform:translate(-50%,-50%) rotate({view.turn}deg)"
       >
-        {#each view.tiles as t (t.t)}
-          <img
-            src={t.url}
-            alt=""
-            decoding="async"
-            style="position:absolute;left:0;top:{t.top}px;width:100%;height:{t.h}px"
-            onload={() => (hud.firstPaint ??= Math.round(performance.now() - openedAt))}
-          />
+        {#each view.order as pv (pv.p.index)}
+          <div class="leaf" style="width:{pv.drawW}px;height:{pv.drawH}px">
+            {#each pv.tiles as t (t.t)}
+              <img
+                src={t.url}
+                alt=""
+                decoding="async"
+                draggable="false"
+                style="position:absolute;left:0;top:{t.top}px;width:100%;height:{t.h}px"
+                onload={() =>
+                  (hud.firstPaint ??= Math.round(performance.now() - openedAt))}
+              />
+            {/each}
+          </div>
         {/each}
       </div>
-      {#if !view.p.readable}
-        <p class="broken">Page {page + 1} could not be read.</p>
+      {#if view.broken.length}
+        <p class="broken">
+          Page{view.broken.length === 1 ? "" : "s"}
+          {view.broken.join(", ")} could not be read.
+        </p>
       {/if}
     </div>
   </div>
@@ -434,6 +602,10 @@
   <hr />
   <div>mode <b>{mode}</b> {overridden ? "(manual)" : `via ${detected?.source ?? "-"}`}</div>
   <div>fit <b>{fit}</b> [f] · mode [m] · reset [r]</div>
+  <div>double page <b>{spread ? "on" : "off"}</b> [w] · full [F]</div>
+  {#if zoom !== 1}
+    <div>zoom <b>{zoom}x</b> — drag to pan, [0] resets</div>
+  {/if}
   <div>downsample <b>{sample === 1 ? "full" : sample}</b> [d]</div>
   <div>padding <b>{pad}</b> px [p]</div>
   <div>
@@ -441,7 +613,10 @@
     <b>{rotLock ? "off" : "on"}</b> [l]
   </div>
   {#if paged}
-    <div>page <b>{page + 1}</b> / {pageCount}</div>
+    <div>
+      page <b>{view ? view.pages.map((v) => v.p.index + 1).join("-") : page + 1}</b>
+      / {pageCount}
+    </div>
   {/if}
   {#if unreadable}
     <div>unreadable <b>{unreadable}</b> page{unreadable === 1 ? "" : "s"}</div>
@@ -492,7 +667,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    overflow: auto;
+    /* Panning is a transform, not a scroll, so the container must not scroll too. */
+    overflow: hidden;
+    touch-action: none;
   }
   .page {
     position: relative;
@@ -504,6 +681,17 @@
     left: 50%;
     top: 50%;
     transform-origin: center;
+    display: flex;
+  }
+  .leaf {
+    position: relative;
+    flex: none;
+  }
+  .paged.grabbable {
+    cursor: grab;
+  }
+  .paged.grabbing {
+    cursor: grabbing;
   }
   .hud {
     position: fixed;
