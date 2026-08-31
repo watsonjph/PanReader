@@ -59,6 +59,77 @@
   let seriesCats = $state([]);
   let newCat = $state("");
   let manageCats = $state(false);
+  let listView = $state(false);
+
+  /// The one series the home screen leads with: whatever you are furthest into, or the
+  /// newest thing in the library if you have not started anything.
+  const featuredResume = $derived(resume[0] ?? null);
+  const featured = $derived.by(() => {
+    if (featuredResume) {
+      const match = series.find((r) => r.id === featuredResume.series_id);
+      if (match) return match;
+    }
+    return [...series].sort((a, b) => b.added_at - a.added_at)[0] ?? null;
+  });
+
+  /// Horizontal rows above the grid. Derived from what the shelf already has rather
+  /// than from three more queries: the whole library is in hand, and sorting ten
+  /// thousand rows client-side is cheaper than three round trips.
+  ///
+  /// ponytail: fixed composition. DESIGN.md wants these user-configurable and
+  /// reorderable; that is a config schema and a drag affordance for a screen nobody has
+  /// used yet. Add it when someone wants a different set.
+  const rows = $derived.by(() => {
+    if (query || activeCat !== null) return [];
+    const byId = new Map(series.map((r) => [r.id, r]));
+    const continuing = resume
+      .map((r) => ({ resume: r, series: byId.get(r.series_id) }))
+      .filter((x) => x.series)
+      .map((x) => ({
+        key: `c${x.resume.chapter_id}`,
+        series: x.series,
+        resume: x.resume,
+        coverId: x.resume.chapter_id,
+        note: `${x.resume.page + 1} / ${x.resume.page_count}`,
+      }));
+
+    const plain = (r, note) => ({
+      key: `s${r.id}`,
+      series: r,
+      resume: null,
+      coverId: r.cover_chapter_id,
+      note,
+    });
+
+    return [
+      { name: "Continue reading", items: continuing },
+      {
+        name: "Recently added",
+        items: [...series]
+          .sort((a, b) => b.added_at - a.added_at)
+          .slice(0, 12)
+          .map((r) => plain(r, `${r.chapter_count} chapters`)),
+      },
+      {
+        name: "Unread",
+        items: series
+          .filter((r) => r.chapter_count > 0 && r.unread === r.chapter_count)
+          .slice(0, 12)
+          .map((r) => plain(r, `${r.chapter_count} chapters`)),
+      },
+    ];
+  });
+
+  /// Scroll a rail by most of its width, from a button inside that rail's header.
+  function nudge(event, direction) {
+    const rail = event.currentTarget.closest(".strip")?.querySelector(".rail");
+    if (!rail) return;
+    rail.scrollBy({
+      left: direction * rail.clientWidth * 0.8,
+      behavior: reduceMotion ? "auto" : "smooth",
+    });
+  }
+
   /// Which section of the shell is showing. Nav is a view switch, nothing more.
   let section = $state("library");
   let navIcons = $state(false);
@@ -579,6 +650,7 @@
           theme,
           live_background: liveBg,
           reduce_animations: reduceMotion,
+          list_view: listView,
         },
       }).catch((e) => console.warn("could not save settings:", e));
     }, 500);
@@ -934,6 +1006,7 @@
       theme = saved.theme ?? "ink";
       liveBg = saved.live_background ?? true;
       reduceMotion = saved.reduce_animations ?? false;
+      listView = saved.list_view ?? false;
     } catch (e) {
       console.warn("could not load settings:", e);
     }
@@ -1115,6 +1188,123 @@
           </div>
         {/if}
 
+        <!-- The showcase: one large cover bleeding to the edges of a rounded panel,
+             the title at --text-2xl, one primary action. DESIGN.md, Layout shell. -->
+        {#if featured && !query && activeCat === null}
+          <section class="showcase">
+            {#if base && featured.cover_chapter_id !== null}
+              <img
+                class="art"
+                src={coverUrl(featured.cover_chapter_id)}
+                alt=""
+                decoding="async"
+              />
+            {/if}
+            <div class="veil" aria-hidden="true"></div>
+            <div class="say">
+              <span class="eyebrow">
+                {featuredResume ? "Continue reading" : "In your library"}
+              </span>
+              <h2>{featured.title}</h2>
+              <span class="meta">
+                {#if featuredResume}
+                  {featuredResume.chapter_title} · page {featuredResume.page + 1} of
+                  {featuredResume.page_count}
+                {:else}
+                  {featured.chapter_count} chapter{featured.chapter_count === 1 ? "" : "s"}
+                  {#if featured.unread > 0}· {featured.unread} unread{/if}
+                {/if}
+              </span>
+              <div class="chips">
+                <button
+                  class="chip accent"
+                  onclick={() =>
+                    featuredResume
+                      ? load({
+                          id: featuredResume.chapter_id,
+                          title: featuredResume.chapter_title,
+                          page: featuredResume.page,
+                          page_frac: featuredResume.page_frac,
+                        })
+                      : showSeries(featured)}
+                >
+                  {featuredResume ? "Resume" : "Open"}
+                </button>
+                <button class="chip" onclick={() => showSeries(featured)}>Chapters</button>
+              </div>
+            </div>
+          </section>
+        {/if}
+
+        {#each rows as row (row.name)}
+          {#if row.items.length}
+            <section class="strip">
+              <header class="strip-head">
+                <h2 class="section">{row.name}</h2>
+                <div class="chips">
+                  <button class="chip" aria-label="Scroll {row.name} left"
+                    onclick={(e) => nudge(e, -1)}>‹</button>
+                  <button class="chip" aria-label="Scroll {row.name} right"
+                    onclick={(e) => nudge(e, 1)}>›</button>
+                </div>
+              </header>
+              <div class="rail">
+                {#each row.items as row_item (row_item.key)}
+                  <button
+                    class="card"
+                    class:on={openSeries?.id === row_item.series.id}
+                    onclick={() =>
+                      row_item.resume
+                        ? load({
+                            id: row_item.resume.chapter_id,
+                            title: row_item.resume.chapter_title,
+                            page: row_item.resume.page,
+                            page_frac: row_item.resume.page_frac,
+                          })
+                        : showSeries(row_item.series)}
+                  >
+                    <div class="cover">
+                      {#if base && row_item.coverId !== null}
+                        <img
+                          src={coverUrl(row_item.coverId)}
+                          alt=""
+                          loading="lazy"
+                          decoding="async"
+                        />
+                      {/if}
+                      {#if row_item.resume}
+                        <div
+                          class="progress"
+                          style="width:{((row_item.resume.page + 1) /
+                            row_item.resume.page_count) * 100}%"
+                        ></div>
+                      {:else if row_item.series.unread > 0 && row_item.series.unread < row_item.series.chapter_count}
+                        <span class="badge">{row_item.series.unread}</span>
+                      {/if}
+                    </div>
+                    <b>{row_item.series.title}</b>
+                    <span class="meta">{row_item.note}</span>
+                  </button>
+                {/each}
+              </div>
+            </section>
+          {/if}
+        {/each}
+
+        <header class="strip-head">
+          <h2 class="section">
+            {query || activeCat !== null ? "Results" : "All series"}
+          </h2>
+          <button
+            class="chip"
+            aria-pressed={listView}
+            onclick={() => {
+              listView = !listView;
+              persist();
+            }}>{listView ? "Grid" : "List"}</button
+          >
+        </header>
+
         {#if series.length === 0 && !busy}
           <p class="empty">
             {query
@@ -1123,7 +1313,7 @@
           </p>
         {/if}
 
-        <div class="shelf">
+        <div class="shelf" class:list={listView}>
           {#each series as row (row.id)}
             <button
               class="card"
@@ -1448,6 +1638,116 @@
   /* Signature 1. Fixed behind everything, cross-fading on --dur-base when the
      selection changes. It never animates its gradients -- only its opacity -- so the
      transition is a compositor job and the shelf above it is not repainted. */
+  /* The showcase. One cover bleeding to the edges of a rounded panel, the title at the
+     largest step, one primary action. DESIGN.md, Layout shell. */
+  .showcase {
+    position: relative;
+    display: flex;
+    align-items: flex-end;
+    min-height: 260px;
+    margin-bottom: var(--s-6);
+    padding: var(--s-5);
+    border-radius: var(--r-3);
+    border: 1px solid var(--hairline);
+    overflow: hidden;
+  }
+  /* The cover itself, bleeding to the panel edges -- not a blurred wash of it. The
+     art is the point; a blur would make this a second live background. */
+  .showcase .art {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    /* Covers are portrait and the panel is wide, so bias to the upper third, which is
+       where cover art puts its subject. */
+    object-position: 50% 25%;
+  }
+  /* Type sits on art, so it gets a scrim rather than hoping the art is dark. Left to
+     right, because the type is on the left and the art should survive on the right. */
+  .showcase .veil {
+    position: absolute;
+    inset: 0;
+    background:
+      linear-gradient(
+        to right,
+        var(--scrim) 0%,
+        color-mix(in srgb, var(--scrim) 85%, transparent) 45%,
+        transparent 100%
+      ),
+      linear-gradient(to top, var(--scrim) 0%, transparent 60%);
+  }
+  .showcase .say {
+    position: relative;
+    max-width: 60ch;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+  }
+  .showcase .eyebrow {
+    font: 600 var(--text-xs) / 1 var(--font-display);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  /* A series title, so --font-body. The mono face has no CJK coverage. */
+  .showcase h2 {
+    margin: 0;
+    font: 600 var(--text-2xl) / var(--leading-tight) var(--font-body);
+  }
+
+  /* Horizontal rows. Hidden scrollbar, paired arrows, snap so a nudge lands on a card
+     edge rather than mid-cover. */
+  .strip {
+    margin-bottom: var(--s-5);
+  }
+  .strip-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s-3);
+  }
+  .rail {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 150px;
+    gap: var(--s-3);
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+    padding-bottom: var(--s-1);
+  }
+  .rail::-webkit-scrollbar {
+    display: none;
+  }
+  .rail > .card {
+    scroll-snap-align: start;
+  }
+
+  /* Grid and list share the card markup exactly, so the toggle flips one class rather
+     than re-rendering every card. DESIGN.md, Quality floor. */
+  .shelf.list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-1);
+  }
+  .shelf.list .card {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--s-3);
+    padding: var(--s-1) var(--s-2);
+    border-radius: var(--r-1);
+  }
+  .shelf.list .cover {
+    width: 32px;
+    flex: none;
+    margin-bottom: 0;
+  }
+  .shelf.list b {
+    margin-top: 0;
+    flex: 1;
+  }
+
   /* Four regions, and only the main area scrolls. DESIGN.md, Layout shell. */
   .shell {
     position: fixed;

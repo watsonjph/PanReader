@@ -42,6 +42,8 @@ const SERIES = [
   chapter_count: 3 + (i % 9),
   unread: i % 4,
   cover_chapter_id: 100 + i,
+  // Descending, so "Recently added" has something to order.
+  added_at: 1_780_000_000 - i * 86_400,
 }));
 
 const FIXTURES = {
@@ -58,6 +60,7 @@ const FIXTURES = {
     theme: "ink",
     live_background: true,
     reduce_animations: false,
+    list_view: false,
   }),
   save_settings: () => null,
   roots: () => ["D:/manga"],

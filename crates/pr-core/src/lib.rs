@@ -63,6 +63,8 @@ pub struct Settings {
     pub live_background: bool,
     /// Cut motion even when the OS is not asking for it. Some machines need it anyway.
     pub reduce_animations: bool,
+    /// Shelf as a list rather than a grid. Same cards either way.
+    pub list_view: bool,
 }
 
 impl Default for Settings {
@@ -82,6 +84,7 @@ impl Default for Settings {
             theme: "ink".to_owned(),
             live_background: true,
             reduce_animations: false,
+            list_view: false,
         }
     }
 }

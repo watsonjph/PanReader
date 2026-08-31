@@ -192,6 +192,9 @@ pub struct SeriesRow {
     pub unread: i64,
     /// First chapter in reading order. Its first page is the cover.
     pub cover_chapter_id: Option<i64>,
+    /// Unix seconds. The home screen's "Recently added" row sorts on it, which is why
+    /// it is here rather than being a second query.
+    pub added_at: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -474,7 +477,8 @@ impl Db {
             "SELECT s.id, s.title, s.source_id, count(c.id),
                     coalesce(sum(CASE WHEN p.completed = 1 THEN 0 ELSE 1 END), 0),
                     (SELECT id FROM chapters WHERE series_id = s.id
-                     ORDER BY number, title LIMIT 1)
+                     ORDER BY number, title LIMIT 1),
+                    s.added_at
              FROM series s
              LEFT JOIN chapters c ON c.series_id = s.id
              LEFT JOIN positions p ON p.chapter_id = c.id
@@ -498,6 +502,7 @@ impl Db {
                 chapter_count: r.get(3)?,
                 unread: r.get(4)?,
                 cover_chapter_id: r.get(5)?,
+                added_at: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
