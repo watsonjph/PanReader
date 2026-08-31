@@ -1,0 +1,90 @@
+/* Everything in DESIGN.md that does not change with the theme.
+ *
+ * Colours live in data/themes.json and are generated into themes.css. Type, space,
+ * shape and motion are the same in every theme, so they are written once, here. */
+
+:root {
+  /* Type. Two families, three jobs.
+   *
+   * The hard rule from DESIGN.md: any string that can contain CJK uses --font-body,
+   * never --font-display. Series titles, chapter titles, author names, filenames. The
+   * mono face has no CJK coverage and the browser falls back mid-string. */
+  --font-display: "JetBrains Mono", ui-monospace, monospace;
+  --font-body:
+    "IBM Plex Sans", "IBM Plex Sans JP", "IBM Plex Sans KR", system-ui, sans-serif;
+  --font-data: "JetBrains Mono", ui-monospace, monospace;
+
+  --text-xs: 11px;
+  --text-sm: 13px;
+  --text-base: 15px;
+  --text-lg: 19px;
+  --text-xl: 26px;
+  --text-2xl: 40px;
+
+  --leading-tight: 1.1;
+  --leading-body: 1.5;
+
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+
+  --r-1: 8px;
+  --r-2: 12px;
+  --r-3: 20px;
+  --r-full: 999px;
+
+  --dur-fast: 90ms;
+  --dur-base: 140ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* People read for hours in this app. Both the OS preference and the in-app setting
+ * land on the same class, so there is one rule rather than two that drift. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur-base: 0ms;
+  }
+}
+
+:root.reduce-motion {
+  --dur-fast: 0ms;
+  --dur-base: 0ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+:root.reduce-motion *,
+:root.reduce-motion *::before,
+:root.reduce-motion *::after {
+  transition-duration: 0ms !important;
+  animation-duration: 0ms !important;
+  scroll-behavior: auto !important;
+}
+
+/* Numerals line up wherever they can change: page counts, sizes, timings. */
+.tabular,
+[class*="meta"],
+.count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Quality floor: visible keyboard focus everywhere, one rule, no exceptions.
+ * :focus-visible rather than :focus so a mouse click does not draw a ring. */
+:focus-visible {
+  outline: 2px solid var(--highlight);
+  outline-offset: 2px;
+  border-radius: var(--r-1);
+}

@@ -1,5 +1,5 @@
-//! Tile cache. The whole Phase 0 question is whether tiles can be produced faster
-//! than a fast flick consumes them, so every step here is timed.
+//! Tile cache. Tiles have to be produced faster than a fast flick consumes them, so
+//! every step here is timed and the numbers surface in the reader's overlay.
 
 use anyhow::Context;
 use lru::LruCache;
@@ -190,10 +190,14 @@ pub struct Chapter {
 }
 
 impl Chapter {
+    /// `series_override` and `default_mode` are the library's opinion: an override the
+    /// reader set on this series, and the fallback its category or the global setting
+    /// supplies. `pr_core::detect` decides what to do with both.
     #[tracing::instrument(skip(src))]
     pub fn open(
-        kind: &str,
+        title: &str,
         src: PageSource,
+        series_override: Option<pr_core::ReadingMode>,
         default_mode: pr_core::ReadingMode,
     ) -> anyhow::Result<Self> {
         let t = Instant::now();
@@ -242,9 +246,9 @@ impl Chapter {
         let meta = src
             .read_sidecar("ComicInfo.xml")
             .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|x| pr_core::parse_manga_flag(&x));
+            .and_then(|x| pr_core::parse_comic_info(&x).manga);
         let dims: Vec<(u32, u32)> = pages.iter().map(|p| p.dims).collect();
-        let reading = pr_core::detect(&dims, meta, None, default_mode);
+        let reading = pr_core::detect(&dims, meta, series_override, default_mode);
         tracing::info!(?reading, "reading mode");
 
         Ok(Self {
@@ -521,6 +525,7 @@ mod tests {
         let chapter = Chapter::open(
             "test",
             PageSource::open(&dir).unwrap(),
+            None,
             pr_core::ReadingMode::Rtl,
         )
         .expect("a corrupt page must not fail the open");
@@ -584,6 +589,7 @@ mod tests {
             Chapter::open(
                 "test",
                 PageSource::open(&dir).unwrap(),
+                None,
                 pr_core::ReadingMode::Rtl,
             )
             .unwrap(),
@@ -619,6 +625,7 @@ mod tests {
             Chapter::open(
                 "test",
                 PageSource::open(&dir).unwrap(),
+                None,
                 pr_core::ReadingMode::Rtl,
             )
             .unwrap(),

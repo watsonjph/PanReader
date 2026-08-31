@@ -20,7 +20,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "PanReader, Phase 0 spike",
+        "title": "PanReader",
         "width": 1400,
         "height": 900,
         "resizable": true

@@ -35,7 +35,11 @@ fixtures/
 # Tauri generated schemas
 crates/pr-app/gen/
 
-# Local test library, not ours to ship
-/data/
-# ...but DESIGN.md puts the generated theme palette here, and that is source.
+# Local test library, not ours to ship. Excluding the directory itself would make the
+# exception below impossible: git cannot re-include a file whose parent is excluded.
+/data/*
+# ...but DESIGN.md puts the theme palette here, and that is source, not test content.
 !/data/themes.json
+
+# Generated from data/themes.json by ui/gen-themes.mjs
+ui/src/themes.css

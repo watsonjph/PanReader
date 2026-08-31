@@ -4,11 +4,54 @@
 //! anything: a library root is read-only to us (hard invariant 5).
 
 use crate::{Error, PageSource, natural_cmp};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Bytes of the first page mixed into a chapter's identity. Enough to distinguish two
 /// chapters with the same page count, cheap enough to read ten thousand times.
 const IDENTITY_PREFIX: usize = 64 * 1024;
+
+/// What a previous scan learned about a path.
+///
+/// A rescan that finds the same modification time and size reuses this instead of
+/// opening the chapter and hashing it, which is the whole cost of a scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cached {
+    pub mtime: i64,
+    pub size: u64,
+    pub identity: String,
+    pub page_count: usize,
+    /// The conclusions of the last scan, not just its identity. A chapter titled and
+    /// numbered from its ComicInfo.xml must not fall back to its filename on a rescan
+    /// that never opens it.
+    pub title: String,
+    pub number: Option<f64>,
+}
+
+/// Path to what the last scan saw there.
+pub type Known = HashMap<PathBuf, Cached>;
+
+/// Modification time and size, the pair that says "unchanged" cheaply.
+///
+/// Nanoseconds, not seconds. NTFS keeps 100 ns and ext4 keeps nanoseconds, and at
+/// one-second resolution a chapter added in the same second as a scan is invisible
+/// until something else touches the folder — which is exactly when someone drops a new
+/// download in and hits rescan.
+///
+/// ponytail: for a folder chapter this is the directory's own stamp, so adding or
+/// removing a page is caught but overwriting one in place is not. Identity only reads
+/// page zero, so the miss is narrower still: it takes replacing the first page to slip
+/// through. Hash every page when that stops being acceptable, and pay for it everywhere.
+fn stamp(path: &Path) -> Option<(i64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    Some((mtime, meta.len()))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScannedChapter {
@@ -19,6 +62,9 @@ pub struct ScannedChapter {
     pub page_count: usize,
     /// Content-derived, so renaming the file keeps the reader's progress.
     pub identity: String,
+    /// Stored so the next scan can skip this chapter entirely.
+    pub mtime: i64,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +143,30 @@ fn identity(src: &PageSource) -> Result<String, Error> {
     Ok(format!("blake3:{}", &hasher.finalize().to_hex()[..32]))
 }
 
-fn chapter_at(path: &Path) -> Option<ScannedChapter> {
+fn chapter_at(path: &Path, known: &Known) -> Option<ScannedChapter> {
+    let title = if path.is_dir() {
+        file_name(path)
+    } else {
+        stem(path)
+    };
+    let (mtime, size) = stamp(path)?;
+
+    // Unchanged since the last scan: everything below this point is I/O we already did.
+    if let Some(hit) = known.get(path)
+        && hit.mtime == mtime
+        && hit.size == size
+    {
+        return Some(ScannedChapter {
+            number: hit.number,
+            path: path.to_owned(),
+            title: hit.title.clone(),
+            page_count: hit.page_count,
+            identity: hit.identity.clone(),
+            mtime,
+            size,
+        });
+    }
+
     let src = match PageSource::open(path) {
         Ok(src) => src,
         // One unreadable folder must not end the scan. This is the same call as a
@@ -107,26 +176,33 @@ fn chapter_at(path: &Path) -> Option<ScannedChapter> {
             return None;
         }
     };
-    let title = if path.is_dir() {
-        file_name(path)
-    } else {
-        stem(path)
-    };
     let identity = identity(&src)
         .inspect_err(|e| tracing::warn!(path = %path.display(), "no identity: {e}"))
         .ok()?;
 
+    // Real metadata beats guessing at a filename. Deliberately not the series name:
+    // the folder is what the reader organised and what they expect on the shelf, and
+    // chapters of one series routinely disagree about <Series>, leaving no principled
+    // winner. Number and title are per-chapter and have no such conflict.
+    let info = src
+        .read_sidecar("ComicInfo.xml")
+        .and_then(|x| String::from_utf8(x).ok())
+        .map(|x| pr_core::parse_comic_info(&x))
+        .unwrap_or_default();
+
     Some(ScannedChapter {
-        number: chapter_number(&title),
+        number: info.number.or_else(|| chapter_number(&title)),
         path: path.to_owned(),
-        title,
+        title: info.title.unwrap_or(title),
         page_count: src.len(),
         identity,
+        mtime,
+        size,
     })
 }
 
 /// Chapters directly inside a series directory: archives, or subdirectories of images.
-fn chapters_in(dir: &Path) -> Vec<ScannedChapter> {
+fn chapters_in(dir: &Path, known: &Known) -> Vec<ScannedChapter> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -135,7 +211,7 @@ fn chapters_in(dir: &Path) -> Vec<ScannedChapter> {
         .filter(|p| !is_hidden(p) && (p.is_dir() || is_archive(p)))
         .collect();
     paths.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
-    paths.iter().filter_map(|p| chapter_at(p)).collect()
+    paths.iter().filter_map(|p| chapter_at(p, known)).collect()
 }
 
 /// Everything under one library root.
@@ -144,7 +220,7 @@ fn chapters_in(dir: &Path) -> Vec<ScannedChapter> {
 /// a root holds series, and a series holds chapters. The exception worth handling is a
 /// series directory containing images directly, which is one chapter and is exactly how
 /// a single downloaded volume arrives.
-pub fn scan_root(root: &Path) -> Vec<ScannedSeries> {
+pub fn scan_root(root: &Path, known: &Known) -> Vec<ScannedSeries> {
     let Ok(entries) = std::fs::read_dir(root) else {
         tracing::warn!(root = %root.display(), "library root could not be read");
         return Vec::new();
@@ -160,7 +236,7 @@ pub fn scan_root(root: &Path) -> Vec<ScannedSeries> {
     for path in paths {
         if is_archive(&path) {
             // A loose archive in the root is a series of one.
-            if let Some(chapter) = chapter_at(&path) {
+            if let Some(chapter) = chapter_at(&path, known) {
                 out.push(ScannedSeries {
                     title: stem(&path),
                     path: path.clone(),
@@ -174,7 +250,7 @@ pub fn scan_root(root: &Path) -> Vec<ScannedSeries> {
         }
 
         // Images directly inside: the directory is itself a single chapter.
-        if let Some(chapter) = chapter_at(&path) {
+        if let Some(chapter) = chapter_at(&path, known) {
             out.push(ScannedSeries {
                 title: file_name(&path),
                 path: path.clone(),
@@ -183,7 +259,7 @@ pub fn scan_root(root: &Path) -> Vec<ScannedSeries> {
             continue;
         }
 
-        let chapters = chapters_in(&path);
+        let chapters = chapters_in(&path, known);
         if !chapters.is_empty() {
             out.push(ScannedSeries {
                 title: file_name(&path),
@@ -233,7 +309,7 @@ mod tests {
             page(&root.join("My Series").join(ch), "p2.jpg");
         }
 
-        let series = scan_root(&root);
+        let series = scan_root(&root, &Known::new());
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].title, "My Series");
         let titles: Vec<&str> = series[0]
@@ -259,7 +335,7 @@ mod tests {
         page(&root.join("Yotsubato Vol 1"), "p001.jpg");
         page(&root.join("Yotsubato Vol 1"), "p002.jpg");
 
-        let series = scan_root(&root);
+        let series = scan_root(&root, &Known::new());
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].title, "Yotsubato Vol 1");
         assert_eq!(series[0].chapters.len(), 1);
@@ -272,17 +348,29 @@ mod tests {
     fn identity_survives_a_rename_and_changes_with_content() {
         let root = tmp("pr_scan_identity");
         page(&root.join("Before"), "p1.jpg");
-        let before = scan_root(&root).remove(0).chapters.remove(0).identity;
+        let before = scan_root(&root, &Known::new())
+            .remove(0)
+            .chapters
+            .remove(0)
+            .identity;
 
         std::fs::rename(root.join("Before"), root.join("After")).unwrap();
-        let after = scan_root(&root).remove(0).chapters.remove(0).identity;
+        let after = scan_root(&root, &Known::new())
+            .remove(0)
+            .chapters
+            .remove(0)
+            .identity;
         assert_eq!(
             before, after,
             "renaming must not lose the reader's progress"
         );
 
         page(&root.join("After"), "p2.jpg");
-        let grown = scan_root(&root).remove(0).chapters.remove(0).identity;
+        let grown = scan_root(&root, &Known::new())
+            .remove(0)
+            .chapters
+            .remove(0)
+            .identity;
         assert_ne!(
             before, grown,
             "a chapter that gained a page is not the same chapter"
@@ -300,15 +388,90 @@ mod tests {
         page(&root.join(".hidden"), "p1.jpg");
         std::fs::write(root.join("notes.txt"), b"hello").unwrap();
 
-        let series = scan_root(&root);
+        let series = scan_root(&root, &Known::new());
         assert_eq!(series.len(), 1, "only the real series survives");
         assert_eq!(series[0].title, "Real Series");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The point of the cache is that a rescan does no I/O per chapter. Proving that
+    /// directly would need an I/O counter; proving it by consequence is enough — a
+    /// deliberately wrong cache entry is returned verbatim, which can only happen if
+    /// the chapter was never opened.
+    #[test]
+    fn a_rescan_trusts_an_unchanged_stamp_and_re_reads_a_changed_one() {
+        let root = tmp("pr_scan_cache");
+        page(&root.join("S").join("Chapter 1"), "p1.jpg");
+
+        let first = scan_root(&root, &Known::new());
+        let seen = &first[0].chapters[0];
+        assert!(seen.mtime > 0, "a scan stamps what it saw");
+
+        let mut known = Known::new();
+        known.insert(
+            seen.path.clone(),
+            Cached {
+                mtime: seen.mtime,
+                size: seen.size,
+                identity: "blake3:from-the-cache".into(),
+                page_count: 99,
+                title: "From The Cache".into(),
+                number: Some(7.0),
+            },
+        );
+
+        let again = scan_root(&root, &known);
+        assert_eq!(again[0].chapters[0].identity, "blake3:from-the-cache");
+        assert_eq!(
+            again[0].chapters[0].title, "From The Cache",
+            "a rescan keeps what the last scan concluded, not the filename"
+        );
+        assert_eq!(again[0].chapters[0].number, Some(7.0));
+        assert_eq!(
+            again[0].chapters[0].page_count, 99,
+            "an unchanged chapter is never opened"
+        );
+
+        // Adding a page moves the directory's mtime, so the stamp misses and the real
+        // chapter is read again.
+        page(&root.join("S").join("Chapter 1"), "p2.jpg");
+        let fresh = scan_root(&root, &known);
+        assert_eq!(fresh[0].chapters[0].page_count, 2);
+        assert_ne!(fresh[0].chapters[0].identity, "blake3:from-the-cache");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn comicinfo_names_and_numbers_a_chapter_where_the_filename_cannot() {
+        let root = tmp("pr_scan_comicinfo");
+        // The documented failure of filename parsing: the year wins.
+        let dir = root.join("S").join("Yotsuba (2020)");
+        page(&dir, "p1.jpg");
+
+        let bare = scan_root(&root, &Known::new());
+        assert_eq!(bare[0].chapters[0].number, Some(2020.0), "filename only");
+
+        std::fs::write(
+            dir.join("ComicInfo.xml"),
+            "<ComicInfo><Title>Danbo Arrives</Title><Number>4</Number>             <Series>Ignored On Purpose</Series></ComicInfo>",
+        )
+        .unwrap();
+
+        let tagged = scan_root(&root, &Known::new());
+        assert_eq!(tagged[0].chapters[0].number, Some(4.0));
+        assert_eq!(tagged[0].chapters[0].title, "Danbo Arrives");
+        assert_eq!(
+            tagged[0].title, "S",
+            "the series name stays the folder the reader organised"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn an_unreadable_root_yields_nothing_instead_of_panicking() {
-        assert!(scan_root(Path::new("/definitely/not/a/real/path")).is_empty());
+        assert!(scan_root(Path::new("/definitely/not/a/real/path"), &Known::new()).is_empty());
     }
 }

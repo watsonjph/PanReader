@@ -5,8 +5,10 @@ import {
   spreadGroups,
   fitScale,
   pageAt,
+  pageFrac,
   pageStep,
   pageTops,
+  scrollForFrac,
   stripHeight,
   tileRects,
   turnFor,
@@ -195,5 +197,36 @@ describe("groupOf", () => {
     expect(groupOf(groups, 2)).toBe(1);
     expect(groupOf(groups, 4)).toBe(2);
     expect(groupOf(groups, 99)).toBe(0);
+  });
+});
+
+describe("resuming inside a page", () => {
+  // A webtoon: three 8000px pages, no padding.
+  const tops = [0, 8000, 16000];
+  const totalH = 24000;
+
+  it("measures how far into the page the viewport sits", () => {
+    expect(pageFrac(tops, 0, 0, totalH)).toBe(0);
+    expect(pageFrac(tops, 4000, 0, totalH)).toBe(0.5);
+    expect(pageFrac(tops, 20000, 2, totalH)).toBe(0.5);
+  });
+
+  it("round-trips, which is the only property that matters", () => {
+    for (const scrollTop of [0, 137, 4000, 7999, 12345, 23999]) {
+      const index = pageAt(tops, scrollTop);
+      const frac = pageFrac(tops, scrollTop, index, totalH);
+      expect(scrollForFrac(tops, index, frac, totalH)).toBe(scrollTop);
+    }
+  });
+
+  it("clamps rather than scrolling outside the strip", () => {
+    expect(pageFrac(tops, -500, 0, totalH)).toBe(0);
+    expect(pageFrac(tops, 99999, 2, totalH)).toBe(1);
+    expect(scrollForFrac(tops, 0, 2, totalH)).toBe(8000);
+    expect(scrollForFrac(tops, 0, undefined, totalH)).toBe(0);
+  });
+
+  it("treats a zero-height page as the top rather than dividing by zero", () => {
+    expect(pageFrac([0, 0, 100], 0, 0, 100)).toBe(0);
   });
 });

@@ -38,6 +38,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_chapter_path",
         include_str!("../migrations/0003_chapter_path.sql"),
     ),
+    (
+        "0004_chapter_stamp",
+        include_str!("../migrations/0004_chapter_stamp.sql"),
+    ),
+    (
+        "0005_position_millis",
+        include_str!("../migrations/0005_position_millis.sql"),
+    ),
+    (
+        "0006_opds_catalogs",
+        include_str!("../migrations/0006_opds_catalogs.sql"),
+    ),
+    (
+        "0007_position_offset",
+        include_str!("../migrations/0007_position_offset.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -172,8 +188,30 @@ pub struct SeriesRow {
     pub title: String,
     pub path: String,
     pub chapter_count: i64,
+    /// Chapters not finished. A series with none is read to the end.
+    pub unread: i64,
     /// First chapter in reading order. Its first page is the cover.
     pub cover_chapter_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogRow {
+    pub id: i64,
+    pub url: String,
+    pub name: String,
+}
+
+/// Somewhere the reader left off, for the shelf to offer back.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumeRow {
+    pub chapter_id: i64,
+    pub series_id: i64,
+    pub series_title: String,
+    pub chapter_title: String,
+    pub number: Option<f64>,
+    pub page: i64,
+    pub page_frac: f64,
+    pub page_count: i64,
 }
 
 /// A chapter as the library lists it, with wherever the reader got to.
@@ -186,7 +224,36 @@ pub struct ChapterRow {
     /// Where to read it from. Identity matches; path opens.
     pub path: String,
     pub page: i64,
+    /// How far into that page, as a fraction of its height. Resolution-independent on
+    /// purpose: a pixel offset stops meaning anything when the decode width changes.
+    pub page_frac: f64,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CategoryRow {
+    pub id: i64,
+    pub name: String,
+    /// Applies to every series in it that has no override of its own.
+    pub reading_mode: Option<pr_core::ReadingMode>,
+    pub series_count: i64,
+}
+
+fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
+    mode.map(|m| match m {
+        pr_core::ReadingMode::Rtl => "rtl".to_owned(),
+        pr_core::ReadingMode::Ltr => "ltr".to_owned(),
+        pr_core::ReadingMode::Webtoon => "webtoon".to_owned(),
+    })
+}
+
+fn mode_from(text: Option<String>) -> Option<pr_core::ReadingMode> {
+    match text.as_deref() {
+        Some("rtl") => Some(pr_core::ReadingMode::Rtl),
+        Some("ltr") => Some(pr_core::ReadingMode::Ltr),
+        Some("webtoon") => Some(pr_core::ReadingMode::Webtoon),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -210,7 +277,11 @@ impl Db {
             .conn
             .prepare("SELECT path FROM library_roots ORDER BY added_at")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.filter_map(|r| r.ok()).map(PathBuf::from).collect())
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect())
     }
 
     pub fn remove_root(&self, path: &Path) -> Result<()> {
@@ -266,7 +337,7 @@ impl Db {
                         tx.execute(
                             "UPDATE chapters
                              SET series_id = ?2, title = ?3, number = ?4, page_count = ?5,
-                                 path = ?6
+                                 path = ?6, mtime = ?7, size = ?8
                              WHERE id = ?1",
                             params![
                                 id,
@@ -274,7 +345,9 @@ impl Db {
                                 chapter.title,
                                 chapter.number,
                                 count,
-                                chapter.path.to_string_lossy()
+                                chapter.path.to_string_lossy(),
+                                chapter.mtime,
+                                chapter.size as i64
                             ],
                         )?;
                         summary.chapters_kept += 1;
@@ -282,15 +355,18 @@ impl Db {
                     None => {
                         tx.execute(
                             "INSERT INTO chapters
-                                 (series_id, source_id, title, number, page_count, path)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                 (series_id, source_id, title, number, page_count, path,
+                                  mtime, size)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
                                 series_id,
                                 chapter.identity,
                                 chapter.title,
                                 chapter.number,
                                 count,
-                                chapter.path.to_string_lossy()
+                                chapter.path.to_string_lossy(),
+                                chapter.mtime,
+                                chapter.size as i64
                             ],
                         )?;
                         summary.chapters_added += 1;
@@ -303,31 +379,71 @@ impl Db {
         Ok(summary)
     }
 
-    pub fn library(&self) -> Result<Vec<SeriesRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.title, s.source_id, count(c.id),
-                    (SELECT id FROM chapters WHERE series_id = s.id
-                     ORDER BY number, title LIMIT 1)
-             FROM series s LEFT JOIN chapters c ON c.series_id = s.id
-             GROUP BY s.id ORDER BY s.title",
-        )?;
+    pub fn catalogs(&self) -> Result<Vec<CatalogRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, url, name FROM opds_catalogs ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
-            Ok(SeriesRow {
+            Ok(CatalogRow {
                 id: r.get(0)?,
-                title: r.get(1)?,
-                path: r.get(2)?,
-                chapter_count: r.get(3)?,
-                cover_chapter_id: r.get(4)?,
+                url: r.get(1)?,
+                name: r.get(2)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn add_catalog(&self, url: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO opds_catalogs (url, name) VALUES (?1, ?2)
+             ON CONFLICT(url) DO UPDATE SET name = excluded.name",
+            params![url, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_catalog(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM opds_catalogs WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// What the last scan saw, for the next one to skip.
+    ///
+    /// One query for the whole library rather than a lookup per chapter: ten thousand
+    /// rows of four small columns is nothing next to the I/O it saves.
+    pub fn known(&self) -> Result<pr_archive::scan::Known> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, mtime, size, source_id, page_count, title, number FROM chapters",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                PathBuf::from(r.get::<_, String>(0)?),
+                pr_archive::scan::Cached {
+                    mtime: r.get(1)?,
+                    size: r.get::<_, i64>(2)? as u64,
+                    identity: r.get(3)?,
+                    page_count: r.get::<_, i64>(4)? as usize,
+                    title: r.get(5)?,
+                    number: r.get(6)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The whole library. `search` with no query and no category is the same
+    /// statement; a second copy of the SQL only creates a path that forgets the
+    /// category filter.
+    pub fn library(&self) -> Result<Vec<SeriesRow>> {
+        self.search("", None)
     }
 
     /// Chapters of one series, in reading order, each with its saved position.
     pub fn chapters(&self, series_id: i64) -> Result<Vec<ChapterRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.number, c.page_count, c.path,
-                    coalesce(p.page, 0), coalesce(p.completed, 0)
+                    coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0)
              FROM chapters c
              LEFT JOIN positions p ON p.chapter_id = c.id
              WHERE c.series_id = ?1
@@ -341,10 +457,196 @@ impl Db {
                 page_count: r.get(3)?,
                 path: r.get(4)?,
                 page: r.get(5)?,
-                completed: r.get::<_, i64>(6)? != 0,
+                page_frac: r.get(6)?,
+                completed: r.get::<_, i64>(7)? != 0,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Series whose title contains `query`, case-insensitively.
+    ///
+    /// ponytail: a scan, because a leading wildcard cannot use an index anyway and ten
+    /// thousand short titles compare in about a millisecond. FTS5 is the answer when
+    /// chapter *text* becomes searchable for the novel reader, not before.
+    pub fn search(&self, query: &str, category: Option<i64>) -> Result<Vec<SeriesRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.title, s.source_id, count(c.id),
+                    coalesce(sum(CASE WHEN p.completed = 1 THEN 0 ELSE 1 END), 0),
+                    (SELECT id FROM chapters WHERE series_id = s.id
+                     ORDER BY number, title LIMIT 1)
+             FROM series s
+             LEFT JOIN chapters c ON c.series_id = s.id
+             LEFT JOIN positions p ON p.chapter_id = c.id
+             WHERE s.title LIKE ?1 ESCAPE '\\'
+               AND (?2 IS NULL OR EXISTS (
+                   SELECT 1 FROM series_categories sc
+                   WHERE sc.series_id = s.id AND sc.category_id = ?2))
+             GROUP BY s.id ORDER BY s.title",
+        )?;
+        // The wildcards are ours. Anything typed is literal, so a title containing % or
+        // _ searches for that character rather than matching everything.
+        let escaped = query
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_");
+        let rows = stmt.query_map(params![format!("%{escaped}%"), category], |r| {
+            Ok(SeriesRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                path: r.get(2)?,
+                chapter_count: r.get(3)?,
+                unread: r.get(4)?,
+                cover_chapter_id: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Where to pick back up, most recently read first.
+    ///
+    /// Finished chapters are excluded, and so is one still on page zero: opening
+    /// something and closing it immediately is not a thing to offer back. One row per
+    /// series, or six chapters of one title would be the whole list.
+    pub fn continue_reading(&self, limit: i64) -> Result<Vec<ResumeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, s.id, s.title, c.title, c.number, p.page, p.page_frac, c.page_count,
+                    max(p.updated_at)
+             FROM positions p
+             JOIN chapters c ON c.id = p.chapter_id
+             JOIN series s ON s.id = c.series_id
+             WHERE p.completed = 0 AND p.page > 0
+             GROUP BY s.id
+             ORDER BY max(p.updated_at) DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(ResumeRow {
+                chapter_id: r.get(0)?,
+                series_id: r.get(1)?,
+                series_title: r.get(2)?,
+                chapter_title: r.get(3)?,
+                number: r.get(4)?,
+                page: r.get(5)?,
+                page_frac: r.get(6)?,
+                page_count: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn categories(&self) -> Result<Vec<CategoryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.name, c.reading_mode, count(sc.series_id)
+             FROM categories c
+             LEFT JOIN series_categories sc ON sc.category_id = c.id
+             GROUP BY c.id ORDER BY c.sort, c.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CategoryRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                reading_mode: mode_from(r.get(2)?),
+                series_count: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn create_category(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO categories (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_category(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM categories WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_category_mode(&self, id: i64, mode: Option<pr_core::ReadingMode>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE categories SET reading_mode = ?2 WHERE id = ?1",
+            params![id, mode_text(mode)],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_series_category(
+        &self,
+        series_id: i64,
+        category_id: i64,
+        member: bool,
+    ) -> Result<()> {
+        if member {
+            self.conn.execute(
+                "INSERT INTO series_categories (series_id, category_id) VALUES (?1, ?2)
+                 ON CONFLICT DO NOTHING",
+                params![series_id, category_id],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM series_categories WHERE series_id = ?1 AND category_id = ?2",
+                params![series_id, category_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn categories_of(&self, series_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT category_id FROM series_categories WHERE series_id = ?1")?;
+        let rows = stmt.query_map(params![series_id], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_series_mode(
+        &self,
+        series_id: i64,
+        mode: Option<pr_core::ReadingMode>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE series SET reading_mode = ?2 WHERE id = ?1",
+            params![series_id, mode_text(mode)],
+        )?;
+        Ok(())
+    }
+
+    /// How a chapter should be read, as far as the library knows.
+    ///
+    /// Returns the series override and the category default separately, because they sit
+    /// at different precedence levels in `pr_core::detect`: an override beats detection,
+    /// a category default only applies when nothing was detected.
+    ///
+    /// A series in two categories that disagree takes the first by sort order. Picking
+    /// deterministically matters more than picking cleverly.
+    pub fn modes_for_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<(Option<pr_core::ReadingMode>, Option<pr_core::ReadingMode>)> {
+        let found: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT s.reading_mode,
+                        (SELECT cat.reading_mode FROM series_categories sc
+                         JOIN categories cat ON cat.id = sc.category_id
+                         WHERE sc.series_id = s.id AND cat.reading_mode IS NOT NULL
+                         ORDER BY cat.sort, cat.name LIMIT 1)
+                 FROM chapters c JOIN series s ON s.id = c.series_id
+                 WHERE c.id = ?1",
+                params![chapter_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        Ok(match found {
+            Some((series, category)) => (mode_from(series), mode_from(category)),
+            None => (None, None),
+        })
     }
 
     /// One chapter by id, which is what opening it needs.
@@ -353,7 +655,7 @@ impl Db {
             .conn
             .query_row(
                 "SELECT c.id, c.title, c.number, c.page_count, c.path,
-                        coalesce(p.page, 0), coalesce(p.completed, 0)
+                        coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0)
                  FROM chapters c
                  LEFT JOIN positions p ON p.chapter_id = c.id
                  WHERE c.id = ?1",
@@ -366,7 +668,8 @@ impl Db {
                         page_count: r.get(3)?,
                         path: r.get(4)?,
                         page: r.get(5)?,
-                        completed: r.get::<_, i64>(6)? != 0,
+                        page_frac: r.get(6)?,
+                        completed: r.get::<_, i64>(7)? != 0,
                     })
                 },
             )
@@ -375,14 +678,20 @@ impl Db {
 
     /// One row per chapter, rewritten on every page turn. This is precisely why
     /// position is not kept in the settings blob.
-    pub fn save_position(&self, chapter_id: i64, page: i64, completed: bool) -> Result<()> {
+    pub fn save_position(
+        &self,
+        chapter_id: i64,
+        page: i64,
+        frac: f64,
+        completed: bool,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO positions (chapter_id, page, completed, updated_at)
-             VALUES (?1, ?2, ?3, unixepoch())
+            "INSERT INTO positions (chapter_id, page, page_frac, completed, updated_at)
+             VALUES (?1, ?2, ?3, ?4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
              ON CONFLICT(chapter_id) DO UPDATE
-             SET page = excluded.page, completed = excluded.completed,
-                 updated_at = excluded.updated_at",
-            params![chapter_id, page, completed as i64],
+             SET page = excluded.page, page_frac = excluded.page_frac,
+                 completed = excluded.completed, updated_at = excluded.updated_at",
+            params![chapter_id, page, frac.clamp(0.0, 1.0), completed as i64],
         )?;
         Ok(())
     }
@@ -532,6 +841,8 @@ mod tests {
                     path: PathBuf::from(path).join(name),
                     title: (*name).to_owned(),
                     number: pr_archive::scan::chapter_number(name),
+                    mtime: 0,
+                    size: 0,
                     page_count: 20,
                     identity: (*identity).to_owned(),
                 })
@@ -578,7 +889,7 @@ mod tests {
 
         let series = db.library().unwrap().remove(0);
         let chapter = db.chapters(series.id).unwrap().remove(0);
-        db.save_position(chapter.id, 42, false).unwrap();
+        db.save_position(chapter.id, 42, 0.0, false).unwrap();
 
         // Same bytes, different names, different folder.
         let after = db
@@ -624,6 +935,103 @@ mod tests {
     }
 
     #[test]
+    fn search_matches_case_insensitively_and_treats_wildcards_as_literal() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[
+            scanned("Yotsubato", "/lib/a", &[("c1", "blake3:a")]),
+            scanned("Berserk", "/lib/b", &[("c1", "blake3:b")]),
+            scanned("100% Orange", "/lib/c", &[("c1", "blake3:c")]),
+        ])
+        .unwrap();
+
+        let hit = db.search("yotsu", None).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].title, "Yotsubato");
+        assert!(
+            hit[0].cover_chapter_id.is_some(),
+            "search results carry a cover"
+        );
+
+        // A bare % would otherwise match the whole library.
+        let literal = db.search("%", None).unwrap();
+        assert_eq!(literal.len(), 1, "% is a character, not a wildcard");
+        assert_eq!(literal[0].title, "100% Orange");
+
+        assert!(db.search("nothing here", None).unwrap().is_empty());
+        assert_eq!(
+            db.search("", None).unwrap().len(),
+            3,
+            "an empty query is everything"
+        );
+    }
+
+    #[test]
+    fn search_narrows_to_a_category_and_composes_with_the_query() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[
+            scanned("Solo Leveling", "/lib/a", &[("c1", "blake3:a")]),
+            scanned("Tower of God", "/lib/b", &[("c1", "blake3:b")]),
+            scanned("Berserk", "/lib/c", &[("c1", "blake3:c")]),
+        ])
+        .unwrap();
+        let library = db.library().unwrap();
+        db.create_category("Manhwa").unwrap();
+        let manhwa = db.categories().unwrap().remove(0);
+        for row in library.iter().filter(|s| s.title != "Berserk") {
+            db.set_series_category(row.id, manhwa.id, true).unwrap();
+        }
+
+        assert_eq!(db.search("", None).unwrap().len(), 3);
+        assert_eq!(db.search("", Some(manhwa.id)).unwrap().len(), 2);
+
+        // Query and category narrow together rather than replacing one another.
+        let both = db.search("tower", Some(manhwa.id)).unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].title, "Tower of God");
+        assert!(db.search("berserk", Some(manhwa.id)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_category_supplies_a_default_mode_and_a_series_override_outranks_it() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[scanned("Solo Leveling", "/lib/s", &[("c1", "blake3:s")])])
+            .unwrap();
+        let series = db.library().unwrap().remove(0);
+        let chapter = db.chapters(series.id).unwrap().remove(0);
+
+        // Nothing set: the library has no opinion, so detection decides.
+        assert_eq!(db.modes_for_chapter(chapter.id).unwrap(), (None, None));
+
+        db.create_category("Manhwa").unwrap();
+        let category = db.categories().unwrap().remove(0);
+        db.set_category_mode(category.id, Some(pr_core::ReadingMode::Webtoon))
+            .unwrap();
+        db.set_series_category(series.id, category.id, true)
+            .unwrap();
+        assert_eq!(
+            db.modes_for_chapter(chapter.id).unwrap(),
+            (None, Some(pr_core::ReadingMode::Webtoon)),
+            "the category default applies"
+        );
+
+        db.set_series_mode(series.id, Some(pr_core::ReadingMode::Ltr))
+            .unwrap();
+        assert_eq!(
+            db.modes_for_chapter(chapter.id).unwrap(),
+            (
+                Some(pr_core::ReadingMode::Ltr),
+                Some(pr_core::ReadingMode::Webtoon)
+            ),
+            "an override on the series outranks its category"
+        );
+
+        assert_eq!(db.categories_of(series.id).unwrap(), vec![category.id]);
+        db.set_series_category(series.id, category.id, false)
+            .unwrap();
+        assert!(db.categories_of(series.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn roots_are_added_once_and_can_be_removed() {
         let db = Db::open_memory().unwrap();
         let path = Path::new("/lib");
@@ -642,5 +1050,87 @@ mod tests {
             checksum("CREATE TABLE x;\r\nSELECT 1;")
         );
         assert_ne!(checksum("CREATE TABLE x;"), checksum("CREATE TABLE y;"));
+    }
+
+    #[test]
+    fn continue_reading_offers_the_latest_chapter_of_each_series_and_skips_finished() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[
+            scanned("A", "/lib/A", &[("A1", "blake3:a1"), ("A2", "blake3:a2")]),
+            scanned("B", "/lib/B", &[("B1", "blake3:b1")]),
+            scanned("C", "/lib/C", &[("C1", "blake3:c1")]),
+        ])
+        .unwrap();
+
+        let id = |identity: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT id FROM chapters WHERE source_id = ?1",
+                    params![identity],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        db.save_position(id("blake3:a1"), 5, 0.0, false).unwrap();
+        db.save_position(id("blake3:a2"), 9, 0.0, false).unwrap();
+        db.save_position(id("blake3:b1"), 3, 0.0, true).unwrap();
+        // Opened and closed without reading. Not somewhere to be sent back to.
+        db.save_position(id("blake3:c1"), 0, 0.0, false).unwrap();
+
+        // Stamped explicitly. Two saves can land in the same millisecond, and the
+        // ordering rule is what is under test, not the clock.
+        for (identity, at) in [("blake3:a1", 100), ("blake3:a2", 200)] {
+            db.conn
+                .execute(
+                    "UPDATE positions SET updated_at = ?2 WHERE chapter_id = ?1",
+                    params![id(identity), at],
+                )
+                .unwrap();
+        }
+
+        let resume = db.continue_reading(10).unwrap();
+        assert_eq!(
+            resume.len(),
+            1,
+            "one row per series, and only series actually in progress"
+        );
+        assert_eq!(resume[0].series_title, "A");
+        assert_eq!(
+            resume[0].chapter_title, "A2",
+            "the most recently read chapter of the series, not the first"
+        );
+        assert_eq!(resume[0].page, 9);
+
+        let shelf = db.search("", None).unwrap();
+        let unread = |title: &str| shelf.iter().find(|r| r.title == title).unwrap().unread;
+        assert_eq!(unread("A"), 2, "neither chapter is finished");
+        assert_eq!(unread("B"), 0, "its only chapter is read");
+        assert_eq!(unread("C"), 1);
+    }
+
+    /// S1 asks for the exact page *and offset*. A webtoon page can be eight thousand
+    /// pixels tall, so landing at the top of the right page is not landing where you
+    /// left off.
+    #[test]
+    fn a_position_keeps_where_in_the_page_not_only_which_page() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[scanned("S", "/lib/S", &[("C1", "blake3:c1")])])
+            .unwrap();
+        let chapter = db.chapters(db.library().unwrap()[0].id).unwrap().remove(0);
+        assert_eq!(
+            chapter.page_frac, 0.0,
+            "an unread chapter starts at the top"
+        );
+
+        db.save_position(chapter.id, 3, 0.62, false).unwrap();
+        let back = db.chapters(db.library().unwrap()[0].id).unwrap().remove(0);
+        assert_eq!(back.page, 3);
+        assert!((back.page_frac - 0.62).abs() < 1e-9);
+
+        // A fraction outside the page is a bug upstream, not a scroll target.
+        db.save_position(chapter.id, 3, 4.0, false).unwrap();
+        let clamped = db.chapters(db.library().unwrap()[0].id).unwrap().remove(0);
+        assert_eq!(clamped.page_frac, 1.0);
     }
 }

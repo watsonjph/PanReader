@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod opds;
 mod tiles;
 
 use anyhow::Context;
@@ -23,6 +24,9 @@ struct App {
     /// Cached so the tile path never touches SQLite. Settings change rarely and are
     /// read on every chapter open.
     settings: Mutex<pr_core::Settings>,
+    /// Decoded covers, so a cold start paints the shelf without opening every archive
+    /// in the library.
+    covers: PathBuf,
 }
 
 impl App {
@@ -31,11 +35,18 @@ impl App {
         let db = pr_db::Db::open(&path)?;
         let settings = db.settings()?;
         tracing::info!(db = %path.display(), ?settings, "opened library");
+        // Derived data, so it belongs beside the database rather than in the library
+        // (hard invariant 5). Losing it costs one re-decode.
+        let covers = path.with_file_name("covers");
+        if let Err(e) = std::fs::create_dir_all(&covers) {
+            tracing::warn!(dir = %covers.display(), "no cover cache: {e}");
+        }
         Ok(Self {
             chapters: Mutex::new(HashMap::new()),
             scanning: std::sync::atomic::AtomicBool::new(false),
             db: Mutex::new(db),
             settings: Mutex::new(settings),
+            covers,
         })
     }
 }
@@ -56,19 +67,37 @@ impl App {
         let src = PageSource::open(&path)
             .with_context(|| format!("Could not open {}", path.display()))?;
 
-        let default_mode = self.settings.lock().default_reading_mode;
-        let chapter = Arc::new(Chapter::open(&row.title, src, default_mode)?);
+        // Precedence: a series override beats detection, a category default only
+        // applies where detection had nothing to go on, and the global setting is
+        // the last resort. `pr_core::detect` enforces the first half of that.
+        let (series_override, category_mode) = self.db.lock().modes_for_chapter(chapter_id)?;
+        let fallback = category_mode.unwrap_or(self.settings.lock().default_reading_mode);
+        let chapter = Arc::new(Chapter::open(&row.title, src, series_override, fallback)?);
         self.chapters.lock().insert(chapter_id, chapter.clone());
         Ok(chapter)
     }
 
-    /// A series cover: the first page of its first chapter, scaled.
+    /// A series cover: the first page of its first chapter, scaled, decoded once ever.
     ///
     /// Deliberately does not go through `Chapter`, which probes every page's header at
     /// open. A cover needs exactly one page, and a library screen asks for hundreds of
-    /// them at once. Not cached in memory either: the response is immutable and the
-    /// webview keeps it, so a second look costs nothing.
+    /// them at once.
+    ///
+    /// The webview caches these for the session, so the file is about the cold start: a
+    /// five hundred series shelf otherwise opens five hundred archives before it can
+    /// paint. A chapter row is matched by content identity, so an id implies fixed
+    /// bytes and the file never goes stale — changed content lands on a new row.
+    ///
+    /// ponytail: no eviction. One cover per series at ~15 KB is single-digit megabytes
+    /// for a large library. Add an LRU when a real library makes that untrue.
     fn cover(&self, chapter_id: i64, width: u32) -> anyhow::Result<Vec<u8>> {
+        // chapter_id and width are already parsed as numbers, so this cannot escape
+        // the directory.
+        let cached = self.covers.join(format!("{chapter_id}-{width}.jpg"));
+        if let Ok(bytes) = std::fs::read(&cached) {
+            return Ok(bytes);
+        }
+
         let row = self
             .db
             .lock()
@@ -76,7 +105,26 @@ impl App {
             .with_context(|| format!("chapter {chapter_id} is not in the library"))?;
         let src = PageSource::open(Path::new(&row.path))?;
         let img = pr_image::decode_scaled(&src.read(0)?, width)?;
-        Ok(pr_image::encode_jpeg(&img, 78)?)
+        let bytes = pr_image::encode_jpeg(&img, 78)?;
+
+        // Best effort. A cover we cannot write is a slow cover, not a failure.
+        if let Err(e) = std::fs::write(&cached, &bytes) {
+            tracing::debug!(path = %cached.display(), "cover not cached: {e}");
+        }
+        Ok(bytes)
+    }
+
+    /// The live background palette for a chapter's cover.
+    ///
+    /// Reads the cached cover rather than the source page, so this costs one small
+    /// JPEG decode and never reopens an archive. Signature 1 changes the background on
+    /// every selection change, so it has to be cheap enough to run on hover.
+    fn palette(&self, chapter_id: i64) -> anyhow::Result<Vec<String>> {
+        let cover = self.cover(chapter_id, 320)?;
+        Ok(pr_image::palette(&cover)?
+            .iter()
+            .map(|[r, g, b]| format!("{r},{g},{b}"))
+            .collect())
     }
 
     /// Walk every root and fold the result in.
@@ -90,9 +138,12 @@ impl App {
         }
         let result = (|| {
             let roots = self.db.lock().roots()?;
+            // What the last scan saw. A rescan of an unchanged library then costs a
+            // directory walk and nothing else.
+            let known = self.db.lock().known()?;
             let mut total = pr_db::ScanSummary::default();
             for root in roots {
-                let found = pr_archive::scan::scan_root(&root);
+                let found = pr_archive::scan::scan_root(&root, &known);
                 let summary = self.db.lock().sync(&found)?;
                 total.series += summary.series;
                 total.chapters_added += summary.chapters_added;
@@ -107,8 +158,200 @@ impl App {
 }
 
 #[tauri::command]
-fn library(app: State<App>) -> Result<Vec<pr_db::SeriesRow>, String> {
-    app.db.lock().library().map_err(|e| format!("{e:#}"))
+fn catalogs(app: State<App>) -> Result<Vec<pr_db::CatalogRow>, String> {
+    app.db.lock().catalogs().map_err(|e| format!("{e:#}"))
+}
+
+/// Add a catalog, verifying it is one before saving it.
+///
+/// A URL that is not a feed is a typo far more often than it is a server problem, and
+/// finding that out at add time is much clearer than an empty browse later.
+#[tauri::command]
+async fn add_catalog(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let page = opds::browse(url.trim())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let name = if page.feed.title.is_empty() {
+        url.clone()
+    } else {
+        page.feed.title.clone()
+    };
+    app.state::<App>()
+        .db
+        .lock()
+        .add_catalog(url.trim(), &name)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn remove_catalog(app: State<App>, id: i64) -> Result<(), String> {
+    app.db
+        .lock()
+        .remove_catalog(id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn opds_browse(url: String) -> Result<opds::Page, String> {
+    opds::browse(&url).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Download a publication into a library root, then fold it into the library.
+///
+/// The rescan is the whole integration: a downloaded file is an ordinary local chapter
+/// the moment it lands, so nothing else in the app needs to know it came from a server.
+/// It goes in the root flat rather than in a subfolder, because `scan_root` reads a
+/// loose archive as a series of one and a subfolder would instead read as one series
+/// called "downloads" with every unrelated book as its chapters.
+///
+/// The root is the caller's choice when there is more than one; the UI asks, because
+/// silently picking one is the kind of thing someone only notices after downloading
+/// forty books into the wrong folder.
+#[tauri::command]
+async fn opds_download(
+    app: tauri::AppHandle,
+    href: String,
+    title: String,
+    mime: String,
+    root: Option<String>,
+) -> Result<String, String> {
+    let roots = app
+        .state::<App>()
+        .db
+        .lock()
+        .roots()
+        .map_err(|e| format!("{e:#}"))?;
+    let root = match root {
+        // Only a root the reader already added. A path off the wire would let a feed
+        // choose where we write.
+        Some(chosen) => roots
+            .into_iter()
+            .find(|r| r == Path::new(&chosen))
+            .ok_or("that is not one of your library folders")?,
+        None => roots
+            .into_iter()
+            .next()
+            .ok_or("add a library folder first, so there is somewhere to download to")?,
+    };
+
+    let path = opds::download(&href, &title, &mime, &root)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = handle.state::<App>().scan() {
+            tracing::warn!("scan after download failed: {e:#}");
+        }
+    });
+    Ok(path.display().to_string())
+}
+
+/// Eight colours for the live background, as "r,g,b" strings ready for rgb().
+///
+/// Small and fixed, so a command rather than a route.
+#[tauri::command]
+fn palette(app: State<App>, chapter_id: i64) -> Result<Vec<String>, String> {
+    app.palette(chapter_id).map_err(|e| format!("{e:#}"))
+}
+
+/// The shelf's resume row. Small and fixed, so it is a command rather than a route.
+#[tauri::command]
+fn continue_reading(app: State<App>) -> Result<Vec<pr_db::ResumeRow>, String> {
+    app.db
+        .lock()
+        .continue_reading(12)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn search(
+    app: State<App>,
+    query: String,
+    category: Option<i64>,
+) -> Result<Vec<pr_db::SeriesRow>, String> {
+    app.db
+        .lock()
+        .search(query.trim(), category)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn categories(app: State<App>) -> Result<Vec<pr_db::CategoryRow>, String> {
+    app.db.lock().categories().map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn create_category(app: State<App>, name: String) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a category needs a name".into());
+    }
+    app.db
+        .lock()
+        .create_category(name)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn delete_category(app: State<App>, id: i64) -> Result<(), String> {
+    app.db
+        .lock()
+        .delete_category(id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Changing a category's mode changes how its series open, so anything already open is
+/// dropped: the mode is resolved when a chapter is opened, not on every page.
+#[tauri::command]
+fn set_category_mode(
+    app: State<App>,
+    id: i64,
+    mode: Option<pr_core::ReadingMode>,
+) -> Result<(), String> {
+    app.db
+        .lock()
+        .set_category_mode(id, mode)
+        .map_err(|e| format!("{e:#}"))?;
+    app.chapters.lock().clear();
+    Ok(())
+}
+
+#[tauri::command]
+fn set_series_category(
+    app: State<App>,
+    series_id: i64,
+    category_id: i64,
+    member: bool,
+) -> Result<(), String> {
+    app.db
+        .lock()
+        .set_series_category(series_id, category_id, member)
+        .map_err(|e| format!("{e:#}"))?;
+    app.chapters.lock().clear();
+    Ok(())
+}
+
+#[tauri::command]
+fn categories_of(app: State<App>, series_id: i64) -> Result<Vec<i64>, String> {
+    app.db
+        .lock()
+        .categories_of(series_id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn set_series_mode(
+    app: State<App>,
+    series_id: i64,
+    mode: Option<pr_core::ReadingMode>,
+) -> Result<(), String> {
+    app.db
+        .lock()
+        .set_series_mode(series_id, mode)
+        .map_err(|e| format!("{e:#}"))?;
+    app.chapters.lock().clear();
+    Ok(())
 }
 
 #[tauri::command]
@@ -177,11 +420,12 @@ fn save_position(
     app: State<App>,
     chapter_id: i64,
     page: i64,
+    frac: f64,
     completed: bool,
 ) -> Result<(), String> {
     app.db
         .lock()
-        .save_position(chapter_id, page, completed)
+        .save_position(chapter_id, page, frac, completed)
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -331,15 +575,101 @@ fn main() {
             tile_base,
             settings,
             save_settings,
-            library,
             chapters,
             roots,
             add_root,
             remove_root,
             rescan,
             scanning,
-            save_position
+            save_position,
+            search,
+            continue_reading,
+            palette,
+            catalogs,
+            add_catalog,
+            remove_catalog,
+            opds_browse,
+            opds_download,
+            categories,
+            create_category,
+            delete_category,
+            set_category_mode,
+            set_series_category,
+            categories_of,
+            set_series_mode
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A library with one folder chapter holding one real JPEG.
+    fn library(dir: &Path) -> App {
+        let chapter = dir.join("Series").join("Chapter 1");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::write(
+            chapter.join("p1.jpg"),
+            pr_image::flat_jpeg(600, 900, [180, 40, 40]).unwrap(),
+        )
+        .unwrap();
+
+        // App::open reads PANREADER_DB, so the whole thing lands in the temp dir and
+        // the cover cache goes beside it.
+        let db_path = dir.join("library.db");
+        unsafe { std::env::set_var("PANREADER_DB", &db_path) };
+        let app = App::open().unwrap();
+        app.db.lock().add_root(dir).unwrap();
+        app.scan().unwrap();
+        app
+    }
+
+    /// The point of the cache is the cold start: a shelf must not reopen every archive
+    /// in the library to paint. Proving it by consequence -- the source is deleted and
+    /// the cover still comes back -- is stronger than counting decodes.
+    #[test]
+    fn a_cover_is_decoded_once_and_served_from_disk_after() {
+        let dir = tmp("pr_cover_cache");
+        let app = library(&dir);
+
+        let chapter_id = app.db.lock().search("", None).unwrap()[0]
+            .cover_chapter_id
+            .unwrap();
+
+        let first = app.cover(chapter_id, 320).unwrap();
+        assert!(!first.is_empty());
+        // At or above the asked-for width, never below: decode_scaled takes the nearest
+        // DCT scale and only resamples past a 2x overshoot, so 600 stands rather than
+        // paying for a resize the shelf will not notice.
+        assert!(
+            pr_image::probe(&first).unwrap().0 >= 320,
+            "a cover must never come back narrower than the shelf asked for"
+        );
+
+        let cached = dir.join("covers").join(format!("{chapter_id}-320.jpg"));
+        assert!(
+            cached.exists(),
+            "the decode is kept for the next cold start"
+        );
+
+        // Nothing left to decode from. A second call can only succeed off the cache.
+        std::fs::remove_dir_all(dir.join("Series")).unwrap();
+        let second = app.cover(chapter_id, 320).unwrap();
+        assert_eq!(first, second);
+
+        // A different width is a different cover, not a stale hit.
+        assert!(app.cover(chapter_id, 640).is_err());
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

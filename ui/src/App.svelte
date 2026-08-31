@@ -1,5 +1,8 @@
 <script>
   import { onMount } from "svelte";
+  // Names from the same file the colours come from, so adding a theme still touches
+  // data/themes.json and nothing else.
+  import themeData from "../../data/themes.json";
   import { invoke } from "@tauri-apps/api/core";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
@@ -8,8 +11,10 @@
     groupOf,
     spreadGroups,
     pageAt,
+    pageFrac,
     pageStep,
     pageTops,
+    scrollForFrac,
     stripHeight,
     tileRects,
     turnFor,
@@ -31,13 +36,29 @@
   const COVER_W = 320;
 
   let series = $state([]);
+  let resume = $state([]);
   let seriesChapters = $state([]);
   let openSeries = $state(null);
   let chapterId = $state(null);
   let chapterTitle = $state("");
   let libraryRoots = $state([]);
+  let catalogs = $state([]);
+  let catalogUrl = $state("");
+  // The catalog being browsed, and the trail back out of it.
+  let opds = $state(null);
+  let opdsTrail = $state([]);
+  let opdsBusy = $state(false);
+  // Which library folder downloads land in. Only ever one the reader added.
+  let downloadRoot = $state(null);
   let rootInput = $state("");
   let busy = $state(false);
+  let query = $state("");
+  let searchTimer = 0;
+  let cats = $state([]);
+  let activeCat = $state(null);
+  let seriesCats = $state([]);
+  let newCat = $state("");
+  let manageCats = $state(false);
   let error = $state(null);
   let hud = $state({ fps: 0, worst: 0, dropped: 0, mounted: 0, firstPaint: null });
   let rust = $state({});
@@ -162,13 +183,84 @@
     };
   });
 
+  // ---------------------------------------------------------------- DESIGN.md shell
+
+  const THEMES = [
+    { id: "system", name: "System" },
+    ...Object.entries(themeData)
+      .filter(([id]) => id !== "//")
+      .map(([id, t]) => ({ id, name: t.name })),
+  ];
+  let theme = $state("ink");
+  let liveBg = $state(true);
+  let reduceMotion = $state(false);
+  /// Eight "r,g,b" strings from the cover currently on screen, or null for a flat --bg.
+  let palette = $state(null);
+  let paletteFor = 0;
+
+  /// Gradient positions are constant; only the colours move. DESIGN.md, Signature 1:
+  /// the result varies with the art but never with luck.
+  const STOPS = [
+    "0% 0%",
+    "100% 0%",
+    "100% 100%",
+    "0% 100%",
+    "50% 50%",
+    "25% 0%",
+    "75% 100%",
+  ];
+
+  const liveStyle = $derived.by(() => {
+    if (!palette) return "";
+    const layers = STOPS.map(
+      (at, i) =>
+        `radial-gradient(circle at ${at}, rgba(${palette[i + 1]}, 0.8) 0%, transparent 80%)`,
+    );
+    return `background-color: rgb(${palette[0]}); background-image: ${layers.join(", ")};`;
+  });
+
+  /// Apply the theme by class, so the generated CSS does the work and there is no
+  /// second copy of any colour in JS.
+  function applyTheme() {
+    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const id = theme === "system" ? (dark ? "ink" : "day") : theme;
+    document.documentElement.className = `theme-${id}${
+      reduceMotion ? " reduce-motion" : ""
+    }`;
+  }
+
+  /// Pull the palette for whatever is on screen. Guarded by a generation counter: hover
+  /// through a shelf and only the last answer is allowed to land.
+  async function showLive(chapterId) {
+    if (!liveBg || chapterId == null) {
+      palette = null;
+      return;
+    }
+    const mine = ++paletteFor;
+    try {
+      const colours = await invoke("palette", { chapterId });
+      if (mine === paletteFor) palette = colours;
+    } catch {
+      // A cover we cannot read is a flat background, not an error dialog.
+      if (mine === paletteFor) palette = null;
+    }
+  }
+
   async function load(chapter, keepPage = false) {
     const wanted = keepPage ? page : chapter.page ?? 0;
-    // Strip mode keeps its place by page, not by pixel: a reload can change the width
-    // we decode at and the padding between pages, so the old offset means nothing.
-    const wantedScroll = keepPage && layout && !paged ? pageAt(tops, scroller.scrollTop) : 0;
+    // Strip mode keeps its place by page and a fraction of that page, never by pixel: a
+    // reload can change the decode width and the padding, so an old pixel offset means
+    // nothing while a fraction still does.
+    const wantedScroll = keepPage && layout && !paged ? pageAt(tops, scroller.scrollTop) : wanted;
+    const wantedFrac =
+      keepPage && layout && !paged
+        ? pageFrac(tops, scroller.scrollTop, wantedScroll, canvasHeight())
+        : (chapter.page_frac ?? 0);
     chapterId = chapter.id;
     chapterTitle = chapter.title;
+    // The reader canvas is black in every theme, and the live background is dropped
+    // on the way in. DESIGN.md, The image reader view.
+    palette = null;
     error = null;
     hud.firstPaint = null;
     for (const el of live.values()) el.remove();
@@ -202,7 +294,9 @@
     rebuildTops();
     canvas.style.width = css(layout.maxW) + "px";
     canvas.style.height = canvasHeight() + "px";
-    scroller.scrollTop = tops[wantedScroll] ?? 0;
+    scroller.scrollTop = paged
+      ? 0
+      : scrollForFrac(tops, wantedScroll, wantedFrac, canvasHeight());
     dirty = true;
     if (paged) prefetch();
   }
@@ -221,13 +315,77 @@
     }
   }
 
+  /// Debounced because it runs per keystroke. The query itself is a scan of the
+  /// series table, which is about a millisecond for ten thousand titles -- the debounce
+  /// is to avoid a round trip per character, not to spare the database.
+  function onSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      try {
+        series = await invoke("search", { query, category: activeCat });
+      } catch (e) {
+        error = String(e);
+      }
+    }, 120);
+  }
+
+  const MODES_OPT = [null, "rtl", "ltr", "webtoon"];
+  const modeLabel = (m) => m ?? "detect";
+
+  async function refreshCategories() {
+    try {
+      cats = await invoke("categories");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function filterBy(id) {
+    activeCat = activeCat === id ? null : id;
+    await refreshLibrary();
+  }
+
+  async function addCategory() {
+    const name = newCat.trim();
+    if (!name) return;
+    try {
+      await invoke("create_category", { name });
+      newCat = "";
+      await refreshCategories();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Cycles detect -> rtl -> ltr -> webtoon. "detect" is null, meaning the category
+  /// has no opinion and page shape decides.
+  async function cycleCategoryMode(cat) {
+    const next = MODES_OPT[(MODES_OPT.indexOf(cat.reading_mode) + 1) % MODES_OPT.length];
+    await invoke("set_category_mode", { id: cat.id, mode: next });
+    await refreshCategories();
+  }
+
+  async function toggleSeriesCategory(catId) {
+    if (!openSeries) return;
+    const member = !seriesCats.includes(catId);
+    await invoke("set_series_category", {
+      seriesId: openSeries.id,
+      categoryId: catId,
+      member,
+    });
+    seriesCats = await invoke("categories_of", { seriesId: openSeries.id });
+    await refreshCategories();
+  }
+
   async function refreshLibrary() {
     try {
       base ||= await invoke("tile_base");
-      [series, libraryRoots, busy] = await Promise.all([
-        invoke("library"),
+      [series, libraryRoots, busy, resume, catalogs] = await Promise.all([
+        invoke("search", { query, category: activeCat }),
         invoke("roots"),
         invoke("scanning"),
+        invoke("continue_reading"),
+        invoke("catalogs"),
       ]);
     } catch (e) {
       error = String(e);
@@ -247,6 +405,69 @@
       await addRoot();
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  /// Follow a feed. `push` records where we came from so Back works.
+  async function openFeed(url, push = true) {
+    opdsBusy = true;
+    error = null;
+    try {
+      const page = await invoke("opds_browse", { url });
+      if (push && opds) opdsTrail = [...opdsTrail, opds.url];
+      opds = page;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      opdsBusy = false;
+    }
+  }
+
+  async function opdsBack() {
+    const previous = opdsTrail.at(-1);
+    opdsTrail = opdsTrail.slice(0, -1);
+    if (previous) await openFeed(previous, false);
+    else opds = null;
+  }
+
+  async function addCatalog() {
+    const url = catalogUrl.trim();
+    if (!url) return;
+    opdsBusy = true;
+    error = null;
+    try {
+      await invoke("add_catalog", { url });
+      catalogUrl = "";
+      await refreshLibrary();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      opdsBusy = false;
+    }
+  }
+
+  /// Download the first format the image reader can open, falling back to whatever is
+  /// offered. Nothing here needs to know it came from a server: it lands in a library
+  /// root and the rescan treats it as an ordinary local chapter.
+  async function grab(entry) {
+    const downloads = entry.kind.Publication?.downloads ?? [];
+    const pick =
+      downloads.find((d) => /comicbook|zip/.test(d.mime)) ?? downloads[0];
+    if (!pick) return;
+    opdsBusy = true;
+    error = null;
+    try {
+      await invoke("opds_download", {
+        href: pick.href,
+        title: entry.title,
+        mime: pick.mime,
+        root: downloadRoot,
+      });
+      watchScan();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      opdsBusy = false;
     }
   }
 
@@ -276,14 +497,17 @@
 
   async function showSeries(row) {
     openSeries = row;
+    showLive(row.cover_chapter_id);
     try {
       seriesChapters = await invoke("chapters", { seriesId: row.id });
+      seriesCats = await invoke("categories_of", { seriesId: row.id });
     } catch (e) {
       error = String(e);
     }
   }
 
   function toLibrary() {
+    showLive(openSeries?.cover_chapter_id ?? chapterId);
     chapterId = null;
     layout = null;
     for (const el of live.values()) el.remove();
@@ -299,9 +523,15 @@
     clearTimeout(positionTimer);
     const id = chapterId;
     const at = page;
+    // Paged mode has no within-page offset. The strip does, and losing it means
+    // reopening a webtoon at the top of an eight thousand pixel page.
+    const frac =
+      paged || !scroller ? 0 : pageFrac(tops, scroller.scrollTop, at, canvasHeight());
     const done = pageCount > 0 && page >= pageCount - 1;
     positionTimer = setTimeout(() => {
-      invoke("save_position", { chapterId: id, page: at, completed: done }).catch(() => {});
+      invoke("save_position", { chapterId: id, page: at, frac, completed: done }).catch(
+        () => {},
+      );
     }, 400);
   }
 
@@ -323,6 +553,9 @@
           rotation_lock: rotLock,
           double_page: spread,
           cover_alone: true,
+          theme,
+          live_background: liveBg,
+          reduce_animations: reduceMotion,
         },
       }).catch((e) => console.warn("could not save settings:", e));
     }, 500);
@@ -347,6 +580,7 @@
     const first = groups[next]?.[0];
     if (first === undefined || first === page) return;
     page = first;
+    savePosition();
     resetView();
     prefetch();
     reWarm();
@@ -399,6 +633,20 @@
 
   function ensureTiles() {
     if (!layout || paged) return;
+
+    // The strip scrolls natively, so go() never runs and this is the only place that
+    // knows where the reader actually is. Position and the warm target both hang off
+    // it; without this a webtoon warms around page 0 for the whole chapter.
+    const at = pageAt(tops, scroller.scrollTop);
+    if (at !== page) {
+      page = at;
+      reWarm();
+    }
+    // Every scroll, not only a page change: the offset within a page is half the
+    // position in a webtoon. The 400 ms debounce means a continuous scroll writes once,
+    // when it stops.
+    savePosition();
+
     const top = scroller.scrollTop - OVERSCAN;
     const bottom = scroller.scrollTop + scroller.clientHeight + OVERSCAN;
     const want = new Set();
@@ -660,11 +908,23 @@
       rot = saved.rotation;
       rotLock = saved.rotation_lock;
       spread = saved.double_page;
+      theme = saved.theme ?? "ink";
+      liveBg = saved.live_background ?? true;
+      reduceMotion = saved.reduce_animations ?? false;
     } catch (e) {
       console.warn("could not load settings:", e);
     }
+    applyTheme();
+    // Following the system means following it while the app is open, not only at
+    // launch.
+    window
+      .matchMedia("(prefers-color-scheme: dark)")
+      .addEventListener("change", () => theme === "system" && applyTheme());
     frames();
+    await refreshCategories();
     await refreshLibrary();
+    // Something to look at before anything is selected.
+    showLive(resume[0]?.chapter_id ?? series[0]?.cover_chapter_id);
     if (busy) watchScan();
   });
 </script>
@@ -733,8 +993,51 @@
 {/if}
 
 {#if chapterId === null}
+  <!-- Signature 1. Its own layer rather than a background on .library, so the
+       cross-fade is a compositor opacity change and never repaints the shelf. -->
+  <div class="live" style={liveStyle} aria-hidden="true"></div>
+
   <div class="library">
-    <h1>Library</h1>
+    <header class="bar">
+      <h1>Library</h1>
+      <div class="chips">
+        {#each THEMES as t (t.id)}
+          <button
+            class="chip"
+            class:on={theme === t.id}
+            aria-pressed={theme === t.id}
+            onclick={() => {
+              theme = t.id;
+              applyTheme();
+              persist();
+            }}
+          >
+            {t.name}
+          </button>
+        {/each}
+        <button
+          class="chip"
+          class:on={liveBg}
+          aria-pressed={liveBg}
+          onclick={() => {
+            liveBg = !liveBg;
+            if (!liveBg) palette = null;
+            else showLive(openSeries?.cover_chapter_id ?? resume[0]?.chapter_id);
+            persist();
+          }}>Live background</button
+        >
+        <button
+          class="chip"
+          class:on={reduceMotion}
+          aria-pressed={reduceMotion}
+          onclick={() => {
+            reduceMotion = !reduceMotion;
+            applyTheme();
+            persist();
+          }}>Reduce motion</button
+        >
+      </div>
+    </header>
 
     <div class="roots">
       {#each libraryRoots as root (root)}
@@ -760,11 +1063,145 @@
         </button>
         {#if busy}<span class="busy">scanning…</span>{/if}
       </div>
+
+      <div class="root">
+        <input
+          placeholder="OPDS catalog URL (Komga, Kavita, Calibre-Web)"
+          bind:value={catalogUrl}
+          onkeydown={(e) => e.key === "Enter" && addCatalog()}
+        />
+        <button onclick={addCatalog}>Add catalog</button>
+        {#if opdsBusy}<span class="busy">working…</span>{/if}
+      </div>
+
+      {#if catalogs.length}
+        <div class="chips">
+          {#each catalogs as cat (cat.id)}
+            <button class="chip" class:on={opds?.url === cat.url}
+              onclick={() => { opdsTrail = []; openFeed(cat.url, false); }}>
+              {cat.name}
+            </button>
+          {/each}
+          {#if opds}
+            <button class="chip ghost" onclick={() => { opds = null; opdsTrail = []; }}>
+              Close catalog
+            </button>
+          {/if}
+        </div>
+      {/if}
     </div>
 
-    {#if series.length === 0 && !busy}
-      <p class="empty">Add a folder to start your library.</p>
+    {#if opds}
+      <h2 class="section">
+        {#if opdsTrail.length}
+          <button class="chip" onclick={opdsBack}>Back</button>
+        {/if}
+        {opds.feed.title || "Catalog"}
+      </h2>
+
+      {#if libraryRoots.length > 1}
+        <div class="chips">
+          <span class="meta">Download into</span>
+          {#each libraryRoots as root (root)}
+            <button
+              class="chip"
+              class:on={(downloadRoot ?? libraryRoots[0]) === root}
+              onclick={() => (downloadRoot = root)}
+            >
+              {root}
+            </button>
+          {/each}
+        </div>
+      {/if}
+
+      {#if opds.feed.entries.length === 0}
+        <p class="empty">This feed is empty.</p>
+      {/if}
+
+      <div class="shelf">
+        {#each opds.feed.entries as entry (entry.id)}
+          {@const nav = entry.kind.Navigation}
+          <button
+            class="card"
+            onclick={() => (nav ? openFeed(nav.href) : grab(entry))}
+          >
+            <div class="cover">
+              {#if entry.thumbnail}
+                <img src={entry.thumbnail} alt="" loading="lazy" decoding="async" />
+              {/if}
+            </div>
+            <b>{entry.title}</b>
+            <span class="meta">
+              {nav ? "browse" : entry.author ?? "download"}
+            </span>
+          </button>
+        {/each}
+      </div>
+
+      {#if opds.feed.next}
+        <button class="chip" onclick={() => openFeed(opds.feed.next)}>Next page</button>
+      {/if}
     {/if}
+
+    {#if series.length || query || activeCat !== null}
+      <input
+        class="search"
+        placeholder="Search series"
+        bind:value={query}
+        oninput={onSearch}
+      />
+
+      <div class="chips">
+        <button class="chip" class:on={activeCat === null} onclick={() => filterBy(null)}>
+          All
+        </button>
+        {#each cats as cat (cat.id)}
+          <button class="chip" class:on={activeCat === cat.id} onclick={() => filterBy(cat.id)}>
+            {cat.name}
+            <span class="count">{cat.series_count}</span>
+          </button>
+        {/each}
+        <button class="chip ghost" onclick={() => (manageCats = !manageCats)}>
+          {manageCats ? "Done" : "Edit categories"}
+        </button>
+      </div>
+
+      {#if manageCats}
+        <div class="manage">
+          <div class="row">
+            <input placeholder="New category" bind:value={newCat}
+              onkeydown={(e) => e.key === "Enter" && addCategory()} />
+            <button class="chip accent" onclick={addCategory}>Add</button>
+          </div>
+          {#each cats as cat (cat.id)}
+            <div class="row">
+              <span class="name">{cat.name}</span>
+              <!-- A category with no mode leaves detection alone; that is the default
+                   and the common case. -->
+              <button class="chip" onclick={() => cycleCategoryMode(cat)}>
+                reads {modeLabel(cat.reading_mode)}
+              </button>
+              <button
+                class="chip danger"
+                onclick={async () => {
+                  await invoke("delete_category", { id: cat.id });
+                  if (activeCat === cat.id) activeCat = null;
+                  await refreshCategories();
+                  await refreshLibrary();
+                }}>Delete</button
+              >
+            </div>
+          {/each}
+        </div>
+      {/if}
+    {/if}
+
+    {#if series.length === 0 && !busy}
+      <p class="empty">
+        {query ? `Nothing matches “${query}”.` : "Add a folder to start your library."}
+      </p>
+    {/if}
+
 
     <div class="shelf">
       {#each series as row (row.id)}
@@ -772,6 +1209,9 @@
           <div class="cover">
             {#if row.cover_chapter_id !== null && base}
               <img src={coverUrl(row.cover_chapter_id)} alt="" loading="lazy" decoding="async" />
+            {/if}
+            {#if row.unread > 0 && row.unread < row.chapter_count}
+              <span class="badge">{row.unread}</span>
             {/if}
           </div>
           <b>{row.title}</b>
@@ -784,6 +1224,19 @@
 
     {#if openSeries}
       <h2>{openSeries.title}</h2>
+      {#if cats.length}
+        <div class="chips">
+          {#each cats as cat (cat.id)}
+            <button
+              class="chip"
+              class:on={seriesCats.includes(cat.id)}
+              onclick={() => toggleSeriesCategory(cat.id)}
+            >
+              {cat.name}
+            </button>
+          {/each}
+        </div>
+      {/if}
       <div class="chapters">
         {#each seriesChapters as c (c.id)}
           <button class="chapter" onclick={() => load(c)}>
@@ -796,6 +1249,43 @@
         {/each}
       </div>
     {/if}
+  </div>
+  <!-- Signature 2. A floating card, not a docked strip: inset, translucent, and the
+       only element in the app carrying --shadow-float. Present on every library
+       screen, absent inside the reader. -->
+  {#if resume.length}
+    {@const r = resume[0]}
+    <button
+      class="resume-bar"
+      onclick={() =>
+        load({
+          id: r.chapter_id,
+          title: r.chapter_title,
+          page: r.page,
+          page_frac: r.page_frac,
+        })}
+    >
+      {#if base}
+        <img class="thumb" src={coverUrl(r.chapter_id)} alt="" decoding="async" />
+      {/if}
+      <span class="what">
+        <b>{r.series_title}</b>
+        <span class="meta">{r.chapter_title}</span>
+      </span>
+      <span class="count">{r.page + 1} / {r.page_count}</span>
+      <span class="rule" aria-hidden="true">
+        <span style="width:{((r.page + 1) / r.page_count) * 100}%"></span>
+      </span>
+    </button>
+  {/if}
+{/if}
+
+<!-- Signature 3: koma progress. Not a percentage and not a scrubber. -->
+{#if chapterId !== null && pageCount > 0 && pageCount <= 400}
+  <div class="koma" class:left={rtl} class:right={!rtl} aria-hidden="true">
+    {#each { length: pageCount } as _, i (i)}
+      <i class:on={i === page}></i>
+    {/each}
   </div>
 {/if}
 
@@ -846,11 +1336,147 @@
 </div>
 
 <style>
+  /* DESIGN.md's token layer. The full themes-as-data generator is S2; these are the
+     same names, so that work becomes a swap rather than a rewrite. */
+  /* Signature 1. Fixed behind everything, cross-fading on --dur-base when the
+     selection changes. It never animates its gradients -- only its opacity -- so the
+     transition is a compositor job and the shelf above it is not repainted. */
+  .live {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    transition: opacity var(--dur-base) var(--ease);
+  }
+  .bar {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--s-4);
+    flex-wrap: wrap;
+  }
+  .bar h1 {
+    font: 600 var(--text-xl) / var(--leading-tight) var(--font-display);
+    margin: 0 0 var(--s-4);
+  }
+  .bar .chips {
+    margin-bottom: var(--s-4);
+  }
+
+  /* Signature 2. Inset from the window edges, and the only --shadow-float in the app.
+     If everything is floating, nothing is. */
+  .resume-bar {
+    position: fixed;
+    left: var(--s-5);
+    right: var(--s-5);
+    bottom: var(--s-5);
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: var(--s-4);
+    height: 68px;
+    padding: 0 var(--s-4);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-3);
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(var(--blur-chrome));
+    box-shadow: var(--shadow-float);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+  }
+  .resume-bar .thumb {
+    height: 48px;
+    width: 32px;
+    object-fit: cover;
+    border-radius: var(--r-1);
+    flex: none;
+  }
+  .resume-bar .what {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  /* Series and chapter names can hold CJK, so they take --font-body. The page count
+     is ours and Latin, so it takes --font-data and gets tabular figures for free. */
+  .resume-bar b {
+    font: 600 var(--text-base) / var(--leading-tight) var(--font-body);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .resume-bar .count {
+    font: var(--text-sm) / 1 var(--font-data);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    flex: none;
+  }
+  .resume-bar .rule {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    background: var(--glass);
+  }
+  .resume-bar .rule span {
+    display: block;
+    height: 100%;
+    background: var(--progress);
+  }
+
+  /* Signature 3. One thin tick per page on the trailing edge, the current page solid.
+     In right-to-left mode the stack moves to the left, because it follows the
+     direction of reading. */
+  .koma {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--s-2) 6px;
+    border-radius: var(--r-full);
+    background: var(--scrim);
+    backdrop-filter: blur(var(--blur-chrome));
+    max-height: 70vh;
+    pointer-events: none;
+  }
+  .koma.right {
+    right: var(--s-3);
+  }
+  .koma.left {
+    left: var(--s-3);
+  }
+  .koma i {
+    display: block;
+    width: 10px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--glass-hover);
+    transition: background var(--dur-fast) var(--ease);
+  }
+  .koma i.on {
+    background: var(--text);
+  }
+  /* Not colour alone: a done page is also wider, so the state survives a reader who
+     cannot separate the two tints. */
+  .koma i.done {
+    background: var(--progress);
+    width: 14px;
+  }
   :global(body) {
     margin: 0;
-    background: #0e0e10;
-    color: #e8e6df;
-    font: 13px/1.4 "IBM Plex Mono", ui-monospace, monospace;
+    background: var(--bg);
+    color: var(--text);
+    /* Body copy and anything that can hold CJK. Labels we author ourselves opt into
+       --font-display; user content never does. DESIGN.md, Type. */
+    font: var(--text-sm) / var(--leading-body) var(--font-body);
     overflow: hidden;
   }
   .scroller {
@@ -921,7 +1547,7 @@
   button {
     font: inherit;
     background: #e8e6df;
-    color: #16150f;
+    color: var(--ink-on-accent);
     border: 0;
     padding: 3px 7px;
     cursor: pointer;
@@ -946,8 +1572,13 @@
     position: fixed;
     inset: 0;
     overflow-y: auto;
-    padding: 24px;
-    background: #0e0e10;
+    padding: var(--s-5);
+    /* Deliberately no background. Depth in this app is translucency over the live
+       layer, so an opaque fill here would paint Signature 1 out. The flat --bg comes
+       from body, which shows through when there is no palette. */
+    z-index: 1;
+    /* Room for the floating resume bar to sit over rather than on top of content. */
+    padding-bottom: 108px;
   }
   .library h1,
   .library h2 {
@@ -966,41 +1597,166 @@
     gap: 8px;
     align-items: center;
     margin-bottom: 6px;
-    color: #8e8b84;
+    color: var(--text-muted);
   }
   .root input {
     font: inherit;
     flex: 1 1 340px;
     max-width: 460px;
     padding: 4px 8px;
-    background: #1a1a1d;
-    color: #e8e6df;
-    border: 1px solid #ffffff20;
+    background: var(--raised);
+    color: var(--text);
+    border: 1px solid var(--hairline);
   }
   .busy {
-    color: #e0a94e;
+    color: var(--accent);
   }
   .empty {
-    color: #8e8b84;
+    color: var(--text-muted);
   }
   .shelf {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
     gap: 12px;
   }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 16px;
+  }
+  /* kopuz's chip, in our tokens: a pill of glass that fills when selected. */
+  .chip {
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    height: 28px;
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: var(--r-full);
+    background: var(--glass);
+    border: 1px solid var(--hairline);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition:
+      background var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease);
+  }
+  .chip:hover {
+    background: var(--glass-hover);
+    color: var(--text);
+  }
+  .chip.on {
+    background: var(--glass-hover);
+    color: var(--text);
+    border-color: var(--accent);
+  }
+  .chip.ghost {
+    border-style: dashed;
+  }
+  /* Dark ink on amber: white would fail contrast where kopuz's white-on-indigo does
+     not. Same idiom, different accent. */
+  .chip.accent {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--ink-on-accent);
+  }
+  .chip.accent:hover {
+    background: var(--accent-soft);
+    color: var(--ink-on-accent);
+  }
+  .chip.danger:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+  .count {
+    color: var(--text-muted);
+  }
+  .manage {
+    margin-bottom: 20px;
+  }
+  .manage .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .manage .name {
+    min-width: 160px;
+  }
+  .manage input {
+    font: inherit;
+    padding: 4px 8px;
+    background: var(--raised);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-1);
+  }
+  .search {
+    font: inherit;
+    display: block;
+    width: 100%;
+    max-width: 460px;
+    margin-bottom: 16px;
+    padding: 6px 10px;
+    background: #1a1a1d;
+    color: #e8e6df;
+    border: 1px solid #ffffff20;
+  }
   .cover {
     /* Reserve the 2:3 box before the image arrives so the grid does not reflow as
        covers stream in. */
     aspect-ratio: 2 / 3;
-    background: #ffffff0d;
+    background: var(--glass);
     overflow: hidden;
     margin-bottom: 8px;
+    /* Anchors the unread badge and the progress bar. */
+    position: relative;
+  }
+  .section {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin: 0 0 10px;
+  }
+  /* The one place a raw accent bar is right: it is progress, not decoration. */
+  .progress {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 3px;
+    background: var(--progress);
+  }
+  /* Unread count, shown only when some are read -- an untouched series would put the
+     same number on every card, which tells the reader nothing. */
+  .badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: var(--r-full);
+    background: var(--accent);
+    color: var(--ink-on-accent);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
   }
   .cover img {
     width: 100%;
     height: 100%;
     object-fit: cover;
     display: block;
+  }
+  .card {
+    /* Offscreen cards skip layout and paint entirely. The intrinsic size keeps the
+       scrollbar honest, so a ten thousand cover library still scrolls like a list. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 300px;
   }
   .card,
   .chapter {
@@ -1010,17 +1766,19 @@
     flex-direction: column;
     gap: 2px;
     padding: 10px 12px;
-    background: #ffffff0d;
-    color: #e8e6df;
-    border: 1px solid #ffffff1a;
+    background: var(--glass);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-2);
     cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
   }
   .card:hover,
   .chapter:hover {
-    background: #ffffff1a;
+    background: var(--glass-hover);
   }
   .card.on {
-    border-color: #e0a94e;
+    border-color: var(--accent);
   }
   .chapters {
     display: flex;
@@ -1033,7 +1791,7 @@
     justify-content: space-between;
   }
   .meta {
-    color: #8e8b84;
+    color: var(--text-muted);
   }
   /* The instrumentation only belongs on screen while something is being read. */
   .hud:not(.reading) {
