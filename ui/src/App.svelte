@@ -417,6 +417,7 @@
     const first = groups[next]?.[0];
     if (first === undefined || first === page) return;
     page = first;
+    savePosition();
     resetView();
     prefetch();
     reWarm();
@@ -469,6 +470,17 @@
 
   function ensureTiles() {
     if (!layout || paged) return;
+
+    // The strip scrolls natively, so go() never runs and this is the only place that
+    // knows where the reader actually is. Position and the warm target both hang off
+    // it; without this a webtoon warms around page 0 for the whole chapter.
+    const at = pageAt(tops, scroller.scrollTop);
+    if (at !== page) {
+      page = at;
+      savePosition();
+      reWarm();
+    }
+
     const top = scroller.scrollTop - OVERSCAN;
     const bottom = scroller.scrollTop + scroller.clientHeight + OVERSCAN;
     const want = new Set();

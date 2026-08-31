@@ -111,11 +111,6 @@ impl App {
 }
 
 #[tauri::command]
-fn library(app: State<App>) -> Result<Vec<pr_db::SeriesRow>, String> {
-    app.db.lock().library().map_err(|e| format!("{e:#}"))
-}
-
-#[tauri::command]
 fn search(
     app: State<App>,
     query: String,
@@ -425,7 +420,6 @@ fn main() {
             tile_base,
             settings,
             save_settings,
-            library,
             chapters,
             roots,
             add_root,

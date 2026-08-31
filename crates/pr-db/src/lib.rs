@@ -333,24 +333,11 @@ impl Db {
         Ok(summary)
     }
 
+    /// The whole library. `search` with no query and no category is the same
+    /// statement; a second copy of the SQL only creates a path that forgets the
+    /// category filter.
     pub fn library(&self) -> Result<Vec<SeriesRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.title, s.source_id, count(c.id),
-                    (SELECT id FROM chapters WHERE series_id = s.id
-                     ORDER BY number, title LIMIT 1)
-             FROM series s LEFT JOIN chapters c ON c.series_id = s.id
-             GROUP BY s.id ORDER BY s.title",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(SeriesRow {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                path: r.get(2)?,
-                chapter_count: r.get(3)?,
-                cover_chapter_id: r.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.search("", None)
     }
 
     /// Chapters of one series, in reading order, each with its saved position.
