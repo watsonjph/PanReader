@@ -1,6 +1,8 @@
 //! Container -> ordered page bytes. Nothing here decodes an image, and nothing here
 //! writes to the user's library (hard invariant 5: source files are read-only to us).
 
+pub mod scan;
+
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::Read;
@@ -206,6 +208,27 @@ impl PageSource {
                 Some(buf)
             }
         }
+    }
+
+    /// First `max` bytes of one page.
+    ///
+    /// `read_prefixes` reads every page, which is right at chapter-open time and wrong
+    /// during a library scan: inflating 200 entries per chapter across ten thousand
+    /// chapters is the difference between a scan that finishes and one that does not.
+    pub fn read_page_prefix(&self, i: usize, max: usize) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        match self {
+            PageSource::Dir(files) => {
+                let path = files.get(i).ok_or(Error::OutOfRange(i))?;
+                File::open(path)?.take(max as u64).read_to_end(&mut buf)?;
+            }
+            PageSource::Zip { path, names } => {
+                let name = names.get(i).ok_or(Error::OutOfRange(i))?;
+                let mut zip = zip::ZipArchive::new(File::open(path)?)?;
+                zip.by_name(name)?.take(max as u64).read_to_end(&mut buf)?;
+            }
+        }
+        Ok(buf)
     }
 
     /// Streamed out of the archive, never extracted to disk.

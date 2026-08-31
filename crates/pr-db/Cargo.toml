@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 directories = "6.0.0"
+pr-archive = { version = "0.1.0", path = "../pr-archive" }
 pr-core = { version = "0.1.0", path = "../pr-core" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
