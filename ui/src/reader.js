@@ -137,3 +137,23 @@ export function groupOf(groups, page) {
   const i = groups.findIndex((g) => g.includes(page));
   return i < 0 ? 0 : i;
 }
+
+/// How far into page `index` the viewport top sits, as a fraction of that page.
+///
+/// A fraction, never pixels: the decode width, downsampling and page padding all change
+/// what a pixel means between one open and the next. A webtoon page runs to thousands
+/// of pixels, so the top of the right page is not where you left off.
+export function pageFrac(tops, scrollTop, index, totalH) {
+  const top = tops[index] ?? 0;
+  const next = tops[index + 1] ?? totalH;
+  const h = next - top;
+  if (!(h > 0)) return 0;
+  return Math.min(Math.max((scrollTop - top) / h, 0), 1);
+}
+
+/// The inverse: where to scroll to put that fraction of the page at the viewport top.
+export function scrollForFrac(tops, index, frac, totalH) {
+  const top = tops[index] ?? 0;
+  const next = tops[index + 1] ?? totalH;
+  return Math.round(top + (next - top) * Math.min(Math.max(frac || 0, 0), 1));
+}

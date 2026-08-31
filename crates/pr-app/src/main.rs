@@ -191,24 +191,35 @@ async fn opds_browse(url: String) -> Result<opds::Page, String> {
 /// loose archive as a series of one and a subfolder would instead read as one series
 /// called "downloads" with every unrelated book as its chapters.
 ///
-/// ponytail: the first library root. Deterministic, and right whenever there is one.
-/// Give the download button a root picker when someone actually keeps several.
+/// The root is the caller's choice when there is more than one; the UI asks, because
+/// silently picking one is the kind of thing someone only notices after downloading
+/// forty books into the wrong folder.
 #[tauri::command]
 async fn opds_download(
     app: tauri::AppHandle,
     href: String,
     title: String,
     mime: String,
+    root: Option<String>,
 ) -> Result<String, String> {
-    let root = app
+    let roots = app
         .state::<App>()
         .db
         .lock()
         .roots()
-        .map_err(|e| format!("{e:#}"))?
-        .into_iter()
-        .next()
-        .ok_or("add a library folder first, so there is somewhere to download to")?;
+        .map_err(|e| format!("{e:#}"))?;
+    let root = match root {
+        // Only a root the reader already added. A path off the wire would let a feed
+        // choose where we write.
+        Some(chosen) => roots
+            .into_iter()
+            .find(|r| r == Path::new(&chosen))
+            .ok_or("that is not one of your library folders")?,
+        None => roots
+            .into_iter()
+            .next()
+            .ok_or("add a library folder first, so there is somewhere to download to")?,
+    };
 
     let path = opds::download(&href, &title, &mime, &root)
         .await
@@ -388,11 +399,12 @@ fn save_position(
     app: State<App>,
     chapter_id: i64,
     page: i64,
+    frac: f64,
     completed: bool,
 ) -> Result<(), String> {
     app.db
         .lock()
-        .save_position(chapter_id, page, completed)
+        .save_position(chapter_id, page, frac, completed)
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -566,4 +578,76 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A library with one folder chapter holding one real JPEG.
+    fn library(dir: &Path) -> App {
+        let chapter = dir.join("Series").join("Chapter 1");
+        std::fs::create_dir_all(&chapter).unwrap();
+        std::fs::write(
+            chapter.join("p1.jpg"),
+            pr_image::flat_jpeg(600, 900, [180, 40, 40]).unwrap(),
+        )
+        .unwrap();
+
+        // App::open reads PANREADER_DB, so the whole thing lands in the temp dir and
+        // the cover cache goes beside it.
+        let db_path = dir.join("library.db");
+        unsafe { std::env::set_var("PANREADER_DB", &db_path) };
+        let app = App::open().unwrap();
+        app.db.lock().add_root(dir).unwrap();
+        app.scan().unwrap();
+        app
+    }
+
+    /// The point of the cache is the cold start: a shelf must not reopen every archive
+    /// in the library to paint. Proving it by consequence -- the source is deleted and
+    /// the cover still comes back -- is stronger than counting decodes.
+    #[test]
+    fn a_cover_is_decoded_once_and_served_from_disk_after() {
+        let dir = tmp("pr_cover_cache");
+        let app = library(&dir);
+
+        let chapter_id = app.db.lock().search("", None).unwrap()[0]
+            .cover_chapter_id
+            .unwrap();
+
+        let first = app.cover(chapter_id, 320).unwrap();
+        assert!(!first.is_empty());
+        // At or above the asked-for width, never below: decode_scaled takes the nearest
+        // DCT scale and only resamples past a 2x overshoot, so 600 stands rather than
+        // paying for a resize the shelf will not notice.
+        assert!(
+            pr_image::probe(&first).unwrap().0 >= 320,
+            "a cover must never come back narrower than the shelf asked for"
+        );
+
+        let cached = dir.join("covers").join(format!("{chapter_id}-320.jpg"));
+        assert!(
+            cached.exists(),
+            "the decode is kept for the next cold start"
+        );
+
+        // Nothing left to decode from. A second call can only succeed off the cache.
+        std::fs::remove_dir_all(dir.join("Series")).unwrap();
+        let second = app.cover(chapter_id, 320).unwrap();
+        assert_eq!(first, second);
+
+        // A different width is a different cover, not a stale hit.
+        assert!(app.cover(chapter_id, 640).is_err());
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

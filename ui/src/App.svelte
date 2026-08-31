@@ -8,8 +8,10 @@
     groupOf,
     spreadGroups,
     pageAt,
+    pageFrac,
     pageStep,
     pageTops,
+    scrollForFrac,
     stripHeight,
     tileRects,
     turnFor,
@@ -43,6 +45,8 @@
   let opds = $state(null);
   let opdsTrail = $state([]);
   let opdsBusy = $state(false);
+  // Which library folder downloads land in. Only ever one the reader added.
+  let downloadRoot = $state(null);
   let rootInput = $state("");
   let busy = $state(false);
   let query = $state("");
@@ -178,9 +182,14 @@
 
   async function load(chapter, keepPage = false) {
     const wanted = keepPage ? page : chapter.page ?? 0;
-    // Strip mode keeps its place by page, not by pixel: a reload can change the width
-    // we decode at and the padding between pages, so the old offset means nothing.
-    const wantedScroll = keepPage && layout && !paged ? pageAt(tops, scroller.scrollTop) : 0;
+    // Strip mode keeps its place by page and a fraction of that page, never by pixel: a
+    // reload can change the decode width and the padding, so an old pixel offset means
+    // nothing while a fraction still does.
+    const wantedScroll = keepPage && layout && !paged ? pageAt(tops, scroller.scrollTop) : wanted;
+    const wantedFrac =
+      keepPage && layout && !paged
+        ? pageFrac(tops, scroller.scrollTop, wantedScroll, canvasHeight())
+        : (chapter.page_frac ?? 0);
     chapterId = chapter.id;
     chapterTitle = chapter.title;
     error = null;
@@ -216,7 +225,9 @@
     rebuildTops();
     canvas.style.width = css(layout.maxW) + "px";
     canvas.style.height = canvasHeight() + "px";
-    scroller.scrollTop = tops[wantedScroll] ?? 0;
+    scroller.scrollTop = paged
+      ? 0
+      : scrollForFrac(tops, wantedScroll, wantedFrac, canvasHeight());
     dirty = true;
     if (paged) prefetch();
   }
@@ -381,6 +392,7 @@
         href: pick.href,
         title: entry.title,
         mime: pick.mime,
+        root: downloadRoot,
       });
       watchScan();
     } catch (e) {
@@ -440,9 +452,15 @@
     clearTimeout(positionTimer);
     const id = chapterId;
     const at = page;
+    // Paged mode has no within-page offset. The strip does, and losing it means
+    // reopening a webtoon at the top of an eight thousand pixel page.
+    const frac =
+      paged || !scroller ? 0 : pageFrac(tops, scroller.scrollTop, at, canvasHeight());
     const done = pageCount > 0 && page >= pageCount - 1;
     positionTimer = setTimeout(() => {
-      invoke("save_position", { chapterId: id, page: at, completed: done }).catch(() => {});
+      invoke("save_position", { chapterId: id, page: at, frac, completed: done }).catch(
+        () => {},
+      );
     }, 400);
   }
 
@@ -548,9 +566,12 @@
     const at = pageAt(tops, scroller.scrollTop);
     if (at !== page) {
       page = at;
-      savePosition();
       reWarm();
     }
+    // Every scroll, not only a page change: the offset within a page is half the
+    // position in a webtoon. The 400 ms debounce means a continuous scroll writes once,
+    // when it stops.
+    savePosition();
 
     const top = scroller.scrollTop - OVERSCAN;
     const bottom = scroller.scrollTop + scroller.clientHeight + OVERSCAN;
@@ -950,6 +971,21 @@
         {opds.feed.title || "Catalog"}
       </h2>
 
+      {#if libraryRoots.length > 1}
+        <div class="chips">
+          <span class="meta">Download into</span>
+          {#each libraryRoots as root (root)}
+            <button
+              class="chip"
+              class:on={(downloadRoot ?? libraryRoots[0]) === root}
+              onclick={() => (downloadRoot = root)}
+            >
+              {root}
+            </button>
+          {/each}
+        </div>
+      {/if}
+
       {#if opds.feed.entries.length === 0}
         <p class="empty">This feed is empty.</p>
       {/if}
@@ -1047,7 +1083,12 @@
           <button
             class="card"
             onclick={() =>
-              load({ id: r.chapter_id, title: r.chapter_title, page: r.page })}
+              load({
+                id: r.chapter_id,
+                title: r.chapter_title,
+                page: r.page,
+                page_frac: r.page_frac,
+              })}
           >
             <div class="cover">
               {#if base}

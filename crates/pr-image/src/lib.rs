@@ -339,4 +339,81 @@ mod tests {
             "last tile must be clamped"
         );
     }
+
+    /// The monolithic strip: one image tall enough to be a whole webtoon chapter.
+    ///
+    /// Phase 0 tested 8 x 8000 px pages and never this. It matters because `fill_page`
+    /// decodes a page whole before slicing it, so a single 60,000 px image is one
+    /// allocation of `w * h * 3` bytes -- 144 MB at 800 px wide -- rather than the
+    /// bounded working set the tiler is supposed to give us.
+    ///
+    /// Ignored by default: encoding 48 megapixels takes seconds, and this is a
+    /// characterisation, not a check that runs on every commit.
+    ///
+    ///   cargo test -p pr-image --release -- --ignored --nocapture monolithic
+    #[test]
+    #[ignore = "encodes 48 megapixels; run deliberately"]
+    fn monolithic_strip_decodes_and_tiles_but_costs_its_whole_height() {
+        const W: u32 = 800;
+        const H: u32 = 60_000;
+
+        let t = std::time::Instant::now();
+        let src = flat_jpeg(W, H, [90, 110, 130]).unwrap();
+        println!(
+            "encoded {W}x{H} to {:.1} MB in {:.1} s",
+            src.len() as f64 / 1e6,
+            t.elapsed().as_secs_f64()
+        );
+
+        assert_eq!(probe(&src).unwrap(), (W, H));
+
+        // Drawn at its own width, so no scaled decode applies and the full height is
+        // materialised.
+        let grid = PageGrid::new((W, H), W, 1024);
+        assert!(
+            !grid.is_passthrough(),
+            "a 60,000 px page must never be served whole"
+        );
+        assert_eq!(grid.tiles, H.div_ceil(1024));
+
+        let t = std::time::Instant::now();
+        let img = decode_scaled(&src, W).unwrap();
+        let decode = t.elapsed();
+        let resident = img.width() as u64 * img.height() as u64 * 3;
+        println!(
+            "decoded in {:.2} s, {:.0} MB resident for one page",
+            decode.as_secs_f64(),
+            resident as f64 / 1e6
+        );
+        assert_eq!(img.height(), H);
+
+        // Every tile is covered with no gap, which is the property the tiler owes us
+        // however large the page is.
+        let mut covered = 0u64;
+        for t in 0..grid.tiles {
+            let (y0, y1) = grid.bounds(t, img.height());
+            assert_eq!(
+                y0 as u64,
+                covered,
+                "tile {t} does not start where {} ended",
+                t.saturating_sub(1)
+            );
+            covered = y1 as u64;
+        }
+        assert_eq!(covered, H as u64, "the tiles must cover the whole strip");
+
+        // Halving the display width should halve the cost, which is the mitigation a
+        // reader actually has: downsampling.
+        let t = std::time::Instant::now();
+        let small = decode_scaled(&src, W / 2).unwrap();
+        println!(
+            "at half width: {:.2} s, {:.0} MB",
+            t.elapsed().as_secs_f64(),
+            small.width() as u64 * small.height() as u64 * 3 / 1_000_000
+        );
+        assert!(
+            small.height() < H,
+            "the DCT path must shrink the height too"
+        );
+    }
 }

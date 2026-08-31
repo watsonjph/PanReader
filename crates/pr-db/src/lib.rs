@@ -50,6 +50,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0006_opds_catalogs",
         include_str!("../migrations/0006_opds_catalogs.sql"),
     ),
+    (
+        "0007_position_offset",
+        include_str!("../migrations/0007_position_offset.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -206,6 +210,7 @@ pub struct ResumeRow {
     pub chapter_title: String,
     pub number: Option<f64>,
     pub page: i64,
+    pub page_frac: f64,
     pub page_count: i64,
 }
 
@@ -219,6 +224,9 @@ pub struct ChapterRow {
     /// Where to read it from. Identity matches; path opens.
     pub path: String,
     pub page: i64,
+    /// How far into that page, as a fraction of its height. Resolution-independent on
+    /// purpose: a pixel offset stops meaning anything when the decode width changes.
+    pub page_frac: f64,
     pub completed: bool,
 }
 
@@ -435,7 +443,7 @@ impl Db {
     pub fn chapters(&self, series_id: i64) -> Result<Vec<ChapterRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.number, c.page_count, c.path,
-                    coalesce(p.page, 0), coalesce(p.completed, 0)
+                    coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0)
              FROM chapters c
              LEFT JOIN positions p ON p.chapter_id = c.id
              WHERE c.series_id = ?1
@@ -449,7 +457,8 @@ impl Db {
                 page_count: r.get(3)?,
                 path: r.get(4)?,
                 page: r.get(5)?,
-                completed: r.get::<_, i64>(6)? != 0,
+                page_frac: r.get(6)?,
+                completed: r.get::<_, i64>(7)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -501,7 +510,7 @@ impl Db {
     /// series, or six chapters of one title would be the whole list.
     pub fn continue_reading(&self, limit: i64) -> Result<Vec<ResumeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, s.id, s.title, c.title, c.number, p.page, c.page_count,
+            "SELECT c.id, s.id, s.title, c.title, c.number, p.page, p.page_frac, c.page_count,
                     max(p.updated_at)
              FROM positions p
              JOIN chapters c ON c.id = p.chapter_id
@@ -519,7 +528,8 @@ impl Db {
                 chapter_title: r.get(3)?,
                 number: r.get(4)?,
                 page: r.get(5)?,
-                page_count: r.get(6)?,
+                page_frac: r.get(6)?,
+                page_count: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -645,7 +655,7 @@ impl Db {
             .conn
             .query_row(
                 "SELECT c.id, c.title, c.number, c.page_count, c.path,
-                        coalesce(p.page, 0), coalesce(p.completed, 0)
+                        coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0)
                  FROM chapters c
                  LEFT JOIN positions p ON p.chapter_id = c.id
                  WHERE c.id = ?1",
@@ -658,7 +668,8 @@ impl Db {
                         page_count: r.get(3)?,
                         path: r.get(4)?,
                         page: r.get(5)?,
-                        completed: r.get::<_, i64>(6)? != 0,
+                        page_frac: r.get(6)?,
+                        completed: r.get::<_, i64>(7)? != 0,
                     })
                 },
             )
@@ -667,14 +678,20 @@ impl Db {
 
     /// One row per chapter, rewritten on every page turn. This is precisely why
     /// position is not kept in the settings blob.
-    pub fn save_position(&self, chapter_id: i64, page: i64, completed: bool) -> Result<()> {
+    pub fn save_position(
+        &self,
+        chapter_id: i64,
+        page: i64,
+        frac: f64,
+        completed: bool,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO positions (chapter_id, page, completed, updated_at)
-             VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+            "INSERT INTO positions (chapter_id, page, page_frac, completed, updated_at)
+             VALUES (?1, ?2, ?3, ?4, CAST(unixepoch('subsec') * 1000 AS INTEGER))
              ON CONFLICT(chapter_id) DO UPDATE
-             SET page = excluded.page, completed = excluded.completed,
-                 updated_at = excluded.updated_at",
-            params![chapter_id, page, completed as i64],
+             SET page = excluded.page, page_frac = excluded.page_frac,
+                 completed = excluded.completed, updated_at = excluded.updated_at",
+            params![chapter_id, page, frac.clamp(0.0, 1.0), completed as i64],
         )?;
         Ok(())
     }
@@ -872,7 +889,7 @@ mod tests {
 
         let series = db.library().unwrap().remove(0);
         let chapter = db.chapters(series.id).unwrap().remove(0);
-        db.save_position(chapter.id, 42, false).unwrap();
+        db.save_position(chapter.id, 42, 0.0, false).unwrap();
 
         // Same bytes, different names, different folder.
         let after = db
@@ -1055,11 +1072,11 @@ mod tests {
                 .unwrap()
         };
 
-        db.save_position(id("blake3:a1"), 5, false).unwrap();
-        db.save_position(id("blake3:a2"), 9, false).unwrap();
-        db.save_position(id("blake3:b1"), 3, true).unwrap();
+        db.save_position(id("blake3:a1"), 5, 0.0, false).unwrap();
+        db.save_position(id("blake3:a2"), 9, 0.0, false).unwrap();
+        db.save_position(id("blake3:b1"), 3, 0.0, true).unwrap();
         // Opened and closed without reading. Not somewhere to be sent back to.
-        db.save_position(id("blake3:c1"), 0, false).unwrap();
+        db.save_position(id("blake3:c1"), 0, 0.0, false).unwrap();
 
         // Stamped explicitly. Two saves can land in the same millisecond, and the
         // ordering rule is what is under test, not the clock.
@@ -1090,5 +1107,30 @@ mod tests {
         assert_eq!(unread("A"), 2, "neither chapter is finished");
         assert_eq!(unread("B"), 0, "its only chapter is read");
         assert_eq!(unread("C"), 1);
+    }
+
+    /// S1 asks for the exact page *and offset*. A webtoon page can be eight thousand
+    /// pixels tall, so landing at the top of the right page is not landing where you
+    /// left off.
+    #[test]
+    fn a_position_keeps_where_in_the_page_not_only_which_page() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[scanned("S", "/lib/S", &[("C1", "blake3:c1")])])
+            .unwrap();
+        let chapter = db.chapters(db.library().unwrap()[0].id).unwrap().remove(0);
+        assert_eq!(
+            chapter.page_frac, 0.0,
+            "an unread chapter starts at the top"
+        );
+
+        db.save_position(chapter.id, 3, 0.62, false).unwrap();
+        let back = db.chapters(db.library().unwrap()[0].id).unwrap().remove(0);
+        assert_eq!(back.page, 3);
+        assert!((back.page_frac - 0.62).abs() < 1e-9);
+
+        // A fraction outside the page is a bug upstream, not a scroll target.
+        db.save_position(chapter.id, 3, 4.0, false).unwrap();
+        let clamped = db.chapters(db.library().unwrap()[0].id).unwrap().remove(0);
+        assert_eq!(clamped.page_frac, 1.0);
     }
 }

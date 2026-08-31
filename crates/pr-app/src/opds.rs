@@ -162,29 +162,32 @@ pub async fn download(href: &str, title: &str, mime: &str, root: &Path) -> anyho
             request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
         }
 
-        let result = async {
-            let response = request.send().await?.error_for_status()?;
+        // Streamed to disk as it arrives, not buffered and then written. Buffering
+        // whole loses everything on a dropped connection, which would leave nothing to
+        // resume from and make the range request above dead code.
+        let outcome: anyhow::Result<()> = async {
+            use std::io::Write;
+            let mut response = request.send().await?.error_for_status()?;
             // A server that ignores the range restarts the body at zero, so the partial
-            // file has to go rather than be appended to.
-            let resuming = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-            let body = response.bytes().await?;
-            Ok::<_, reqwest::Error>((resuming, body))
+            // has to go rather than be appended to.
+            let appending = response.status() == reqwest::StatusCode::PARTIAL_CONTENT && have > 0;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(appending)
+                .write(!appending)
+                .truncate(!appending)
+                .open(&part)?;
+
+            while let Some(chunk) = response.chunk().await? {
+                file.write_all(&chunk)?;
+            }
+            file.sync_all()?;
+            Ok(())
         }
         .await;
 
-        match result {
-            Ok((resuming, body)) => {
-                use std::io::Write;
-                let appending = resuming && have > 0;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(appending)
-                    .write(!appending)
-                    .truncate(!appending)
-                    .open(&part)?;
-                file.write_all(&body)?;
-                file.sync_all()?;
-                drop(file);
+        match outcome {
+            Ok(()) => {
                 std::fs::rename(&part, &final_path)?;
                 tracing::info!(path = %final_path.display(), "downloaded");
                 return Ok(final_path);
@@ -197,7 +200,7 @@ pub async fn download(href: &str, title: &str, mime: &str, root: &Path) -> anyho
             }
             Err(e) => {
                 // The partial stays behind on purpose: the next attempt resumes from it.
-                return Err(anyhow::Error::new(e).context(format!("could not download {url}")));
+                return Err(e.context(format!("could not download {url}")));
             }
         }
     }
@@ -206,6 +209,210 @@ pub async fn download(href: &str, title: &str, mime: &str, root: &Path) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// What a scripted connection sends back.
+    enum Reply {
+        Full(&'static str),
+        /// Headers claiming the whole length, then only the first `sent` bytes before
+        /// the connection drops. What a real interrupted download looks like.
+        Truncated(&'static str, usize),
+        Status(u16),
+    }
+
+    /// A throwaway HTTP server on a loopback port.
+    ///
+    /// ponytail: stdlib TcpListener and a hand-written response, not a test-server
+    /// dependency. What is under test is our client -- ranges, retries, the .part
+    /// rename -- and that needs a server that misbehaves on cue, which a well-behaved
+    /// one would not do.
+    fn serve(script: Vec<Reply>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+
+        std::thread::spawn(move || {
+            for (reply, stream) in script.into_iter().zip(listener.incoming()) {
+                let Ok(mut stream) = stream else { continue };
+
+                // Read the request head. Every request here is a GET, so there is no
+                // body to worry about.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head_text = String::from_utf8_lossy(&head).into_owned();
+                recorded.lock().unwrap().push(head_text.clone());
+
+                let _ = match reply {
+                    Reply::Status(code) => stream.write_all(
+                        format!("HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                    ),
+                    Reply::Full(body) => {
+                        // Honour a Range the way a real server does, so a resume gets
+                        // the missing half rather than the whole file again.
+                        let from = head_text.lines().find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("range: bytes=")
+                                .and_then(|v| v.split('-').next()?.trim().parse::<usize>().ok())
+                        });
+                        match from {
+                            Some(at) if at < body.len() => {
+                                let rest = &body[at..];
+                                stream
+                                    .write_all(
+                                        format!(
+                                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\r\n",
+                                            rest.len()
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .and_then(|()| stream.write_all(rest.as_bytes()))
+                            }
+                            _ => stream
+                                .write_all(
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                        body.len()
+                                    )
+                                    .as_bytes(),
+                                )
+                                .and_then(|()| stream.write_all(body.as_bytes())),
+                        }
+                    }
+                    Reply::Truncated(body, sent) => stream
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                                .as_bytes(),
+                        )
+                        .and_then(|()| stream.write_all(&body.as_bytes()[..sent])),
+                };
+                let _ = stream.flush();
+            }
+        });
+
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const FEED: &str = r##"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Local</title>
+  <entry>
+    <title>Book</title><id>1</id>
+    <link rel="http://opds-spec.org/image/thumbnail" href="/cover/1"/>
+    <link rel="http://opds-spec.org/acquisition" href="/dl/1"
+          type="application/vnd.comicbook+zip"/>
+  </entry>
+</feed>"##;
+
+    #[test]
+    fn browsing_a_real_server_resolves_relative_hrefs_against_the_feed() {
+        let (base, _) = serve(vec![Reply::Full(FEED)]);
+        let page = block_on(browse(&format!("{base}/opds"))).unwrap();
+
+        assert_eq!(page.feed.title, "Local");
+        let entry = &page.feed.entries[0];
+        assert_eq!(
+            entry.thumbnail.as_deref(),
+            Some(format!("{base}/cover/1").as_str()),
+            "a relative href is useless once it has left the response it arrived in"
+        );
+        match &entry.kind {
+            pr_opds::EntryKind::Publication { downloads } => {
+                assert_eq!(downloads[0].href, format!("{base}/dl/1"));
+            }
+            other => panic!("expected a publication, got {other:?}"),
+        }
+    }
+
+    /// Invariant 13: a server that wants credentials is reported, never negotiated with.
+    #[test]
+    fn a_catalog_that_demands_a_login_says_so_plainly() {
+        let (base, _) = serve(vec![Reply::Status(401)]);
+        let err = block_on(browse(&format!("{base}/opds"))).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("requires a login"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_download_is_renamed_into_place_only_once_it_is_complete() {
+        let root = tmp("pr_opds_download");
+        let (base, _) = serve(vec![Reply::Full("CBZBODY")]);
+
+        let path = block_on(download(
+            &format!("{base}/dl/1"),
+            "Book One",
+            "application/vnd.comicbook+zip",
+            &root,
+        ))
+        .unwrap();
+
+        assert_eq!(path, root.join("Book One.cbz"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "CBZBODY");
+        assert!(
+            !root.join("Book One.part").exists(),
+            "the partial must not be left behind on success"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The property that matters: a scan must never find a truncated archive and record
+    /// it as a chapter.
+    #[test]
+    fn an_interrupted_download_resumes_with_a_range_and_never_lands_truncated() {
+        let root = tmp("pr_opds_resume");
+        // The first connection dies after three bytes; the retry asks for the rest.
+        let (base, seen) = serve(vec![Reply::Truncated("CBZBODY", 3), Reply::Full("CBZBODY")]);
+
+        let path = block_on(download(
+            &format!("{base}/dl/1"),
+            "Book Two",
+            "application/vnd.comicbook+zip",
+            &root,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "CBZBODY",
+            "the resumed half must join the first, not replace or double it"
+        );
+
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one failure, one resume");
+        assert!(
+            !requests[0].to_ascii_lowercase().contains("range:"),
+            "the first attempt has nothing to resume from"
+        );
+        assert!(
+            requests[1].to_ascii_lowercase().contains("range: bytes=3-"),
+            "the retry must ask only for what is missing: {}",
+            requests[1]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_download_name_cannot_escape_the_library_root() {
