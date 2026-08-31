@@ -1,5 +1,8 @@
 <script>
   import { onMount } from "svelte";
+  // Names from the same file the colours come from, so adding a theme still touches
+  // data/themes.json and nothing else.
+  import themeData from "../../data/themes.json";
   import { invoke } from "@tauri-apps/api/core";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
@@ -180,6 +183,69 @@
     };
   });
 
+  // ---------------------------------------------------------------- DESIGN.md shell
+
+  const THEMES = [
+    { id: "system", name: "System" },
+    ...Object.entries(themeData)
+      .filter(([id]) => id !== "//")
+      .map(([id, t]) => ({ id, name: t.name })),
+  ];
+  let theme = $state("ink");
+  let liveBg = $state(true);
+  let reduceMotion = $state(false);
+  /// Eight "r,g,b" strings from the cover currently on screen, or null for a flat --bg.
+  let palette = $state(null);
+  let paletteFor = 0;
+
+  /// Gradient positions are constant; only the colours move. DESIGN.md, Signature 1:
+  /// the result varies with the art but never with luck.
+  const STOPS = [
+    "0% 0%",
+    "100% 0%",
+    "100% 100%",
+    "0% 100%",
+    "50% 50%",
+    "25% 0%",
+    "75% 100%",
+  ];
+
+  const liveStyle = $derived.by(() => {
+    if (!palette) return "";
+    const layers = STOPS.map(
+      (at, i) =>
+        `radial-gradient(circle at ${at}, rgba(${palette[i + 1]}, 0.8) 0%, transparent 80%)`,
+    );
+    return `background-color: rgb(${palette[0]}); background-image: ${layers.join(", ")};`;
+  });
+
+  /// Apply the theme by class, so the generated CSS does the work and there is no
+  /// second copy of any colour in JS.
+  function applyTheme() {
+    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const id = theme === "system" ? (dark ? "ink" : "day") : theme;
+    document.documentElement.className = `theme-${id}${
+      reduceMotion ? " reduce-motion" : ""
+    }`;
+  }
+
+  /// Pull the palette for whatever is on screen. Guarded by a generation counter: hover
+  /// through a shelf and only the last answer is allowed to land.
+  async function showLive(chapterId) {
+    if (!liveBg || chapterId == null) {
+      palette = null;
+      return;
+    }
+    const mine = ++paletteFor;
+    try {
+      const colours = await invoke("palette", { chapterId });
+      if (mine === paletteFor) palette = colours;
+    } catch {
+      // A cover we cannot read is a flat background, not an error dialog.
+      if (mine === paletteFor) palette = null;
+    }
+  }
+
   async function load(chapter, keepPage = false) {
     const wanted = keepPage ? page : chapter.page ?? 0;
     // Strip mode keeps its place by page and a fraction of that page, never by pixel: a
@@ -192,6 +258,9 @@
         : (chapter.page_frac ?? 0);
     chapterId = chapter.id;
     chapterTitle = chapter.title;
+    // The reader canvas is black in every theme, and the live background is dropped
+    // on the way in. DESIGN.md, The image reader view.
+    palette = null;
     error = null;
     hud.firstPaint = null;
     for (const el of live.values()) el.remove();
@@ -428,6 +497,7 @@
 
   async function showSeries(row) {
     openSeries = row;
+    showLive(row.cover_chapter_id);
     try {
       seriesChapters = await invoke("chapters", { seriesId: row.id });
       seriesCats = await invoke("categories_of", { seriesId: row.id });
@@ -437,6 +507,7 @@
   }
 
   function toLibrary() {
+    showLive(openSeries?.cover_chapter_id ?? chapterId);
     chapterId = null;
     layout = null;
     for (const el of live.values()) el.remove();
@@ -482,6 +553,9 @@
           rotation_lock: rotLock,
           double_page: spread,
           cover_alone: true,
+          theme,
+          live_background: liveBg,
+          reduce_animations: reduceMotion,
         },
       }).catch((e) => console.warn("could not save settings:", e));
     }, 500);
@@ -834,12 +908,23 @@
       rot = saved.rotation;
       rotLock = saved.rotation_lock;
       spread = saved.double_page;
+      theme = saved.theme ?? "ink";
+      liveBg = saved.live_background ?? true;
+      reduceMotion = saved.reduce_animations ?? false;
     } catch (e) {
       console.warn("could not load settings:", e);
     }
+    applyTheme();
+    // Following the system means following it while the app is open, not only at
+    // launch.
+    window
+      .matchMedia("(prefers-color-scheme: dark)")
+      .addEventListener("change", () => theme === "system" && applyTheme());
     frames();
     await refreshCategories();
     await refreshLibrary();
+    // Something to look at before anything is selected.
+    showLive(resume[0]?.chapter_id ?? series[0]?.cover_chapter_id);
     if (busy) watchScan();
   });
 </script>
@@ -908,8 +993,51 @@
 {/if}
 
 {#if chapterId === null}
+  <!-- Signature 1. Its own layer rather than a background on .library, so the
+       cross-fade is a compositor opacity change and never repaints the shelf. -->
+  <div class="live" style={liveStyle} aria-hidden="true"></div>
+
   <div class="library">
-    <h1>Library</h1>
+    <header class="bar">
+      <h1>Library</h1>
+      <div class="chips">
+        {#each THEMES as t (t.id)}
+          <button
+            class="chip"
+            class:on={theme === t.id}
+            aria-pressed={theme === t.id}
+            onclick={() => {
+              theme = t.id;
+              applyTheme();
+              persist();
+            }}
+          >
+            {t.name}
+          </button>
+        {/each}
+        <button
+          class="chip"
+          class:on={liveBg}
+          aria-pressed={liveBg}
+          onclick={() => {
+            liveBg = !liveBg;
+            if (!liveBg) palette = null;
+            else showLive(openSeries?.cover_chapter_id ?? resume[0]?.chapter_id);
+            persist();
+          }}>Live background</button
+        >
+        <button
+          class="chip"
+          class:on={reduceMotion}
+          aria-pressed={reduceMotion}
+          onclick={() => {
+            reduceMotion = !reduceMotion;
+            applyTheme();
+            persist();
+          }}>Reduce motion</button
+        >
+      </div>
+    </header>
 
     <div class="roots">
       {#each libraryRoots as root (root)}
@@ -1074,37 +1202,6 @@
       </p>
     {/if}
 
-    <!-- Where you were, before what you own. A reader who opens the app is far more
-         often resuming than browsing. -->
-    {#if resume.length && !query && activeCat === null}
-      <h2 class="section">Continue reading</h2>
-      <div class="shelf resume">
-        {#each resume as r (r.chapter_id)}
-          <button
-            class="card"
-            onclick={() =>
-              load({
-                id: r.chapter_id,
-                title: r.chapter_title,
-                page: r.page,
-                page_frac: r.page_frac,
-              })}
-          >
-            <div class="cover">
-              {#if base}
-                <img src={coverUrl(r.chapter_id)} alt="" loading="lazy" decoding="async" />
-              {/if}
-              <div class="progress" style="width:{((r.page + 1) / r.page_count) * 100}%"></div>
-            </div>
-            <b>{r.series_title}</b>
-            <span class="meta">
-              {r.chapter_title} · {r.page + 1}/{r.page_count}
-            </span>
-          </button>
-        {/each}
-      </div>
-      <h2 class="section">Library</h2>
-    {/if}
 
     <div class="shelf">
       {#each series as row (row.id)}
@@ -1152,6 +1249,43 @@
         {/each}
       </div>
     {/if}
+  </div>
+  <!-- Signature 2. A floating card, not a docked strip: inset, translucent, and the
+       only element in the app carrying --shadow-float. Present on every library
+       screen, absent inside the reader. -->
+  {#if resume.length}
+    {@const r = resume[0]}
+    <button
+      class="resume-bar"
+      onclick={() =>
+        load({
+          id: r.chapter_id,
+          title: r.chapter_title,
+          page: r.page,
+          page_frac: r.page_frac,
+        })}
+    >
+      {#if base}
+        <img class="thumb" src={coverUrl(r.chapter_id)} alt="" decoding="async" />
+      {/if}
+      <span class="what">
+        <b>{r.series_title}</b>
+        <span class="meta">{r.chapter_title}</span>
+      </span>
+      <span class="count">{r.page + 1} / {r.page_count}</span>
+      <span class="rule" aria-hidden="true">
+        <span style="width:{((r.page + 1) / r.page_count) * 100}%"></span>
+      </span>
+    </button>
+  {/if}
+{/if}
+
+<!-- Signature 3: koma progress. Not a percentage and not a scrubber. -->
+{#if chapterId !== null && pageCount > 0 && pageCount <= 400}
+  <div class="koma" class:left={rtl} class:right={!rtl} aria-hidden="true">
+    {#each { length: pageCount } as _, i (i)}
+      <i class:on={i === page}></i>
+    {/each}
   </div>
 {/if}
 
@@ -1204,40 +1338,146 @@
 <style>
   /* DESIGN.md's token layer. The full themes-as-data generator is S2; these are the
      same names, so that work becomes a swap rather than a rewrite. */
-  :global(:root) {
-    --bg: #0b0b0d;
-    --raised: #141416;
-    --text: #f2f0ea;
-    --text-muted: #8e8b84;
-    --progress: #6f9c7e;
-    --accent: #e0a94e;
-    --accent-soft: #f0c982;
-    --highlight: #6fa8c7;
-    --danger: #e5544a;
+  /* Signature 1. Fixed behind everything, cross-fading on --dur-base when the
+     selection changes. It never animates its gradients -- only its opacity -- so the
+     transition is a compositor job and the shelf above it is not repainted. */
+  .live {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    transition: opacity var(--dur-base) var(--ease);
+  }
+  .bar {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--s-4);
+    flex-wrap: wrap;
+  }
+  .bar h1 {
+    font: 600 var(--text-xl) / var(--leading-tight) var(--font-display);
+    margin: 0 0 var(--s-4);
+  }
+  .bar .chips {
+    margin-bottom: var(--s-4);
+  }
 
-    --glass: rgba(255, 255, 255, 0.05);
-    --glass-hover: rgba(255, 255, 255, 0.1);
-    --hairline: rgba(255, 255, 255, 0.1);
+  /* Signature 2. Inset from the window edges, and the only --shadow-float in the app.
+     If everything is floating, nothing is. */
+  .resume-bar {
+    position: fixed;
+    left: var(--s-5);
+    right: var(--s-5);
+    bottom: var(--s-5);
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: var(--s-4);
+    height: 68px;
+    padding: 0 var(--s-4);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-3);
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(var(--blur-chrome));
+    box-shadow: var(--shadow-float);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+  }
+  .resume-bar .thumb {
+    height: 48px;
+    width: 32px;
+    object-fit: cover;
+    border-radius: var(--r-1);
+    flex: none;
+  }
+  .resume-bar .what {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  /* Series and chapter names can hold CJK, so they take --font-body. The page count
+     is ours and Latin, so it takes --font-data and gets tabular figures for free. */
+  .resume-bar b {
+    font: 600 var(--text-base) / var(--leading-tight) var(--font-body);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .resume-bar .count {
+    font: var(--text-sm) / 1 var(--font-data);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    flex: none;
+  }
+  .resume-bar .rule {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    background: var(--glass);
+  }
+  .resume-bar .rule span {
+    display: block;
+    height: 100%;
+    background: var(--progress);
+  }
 
-    --r-1: 8px;
-    --r-2: 12px;
-    --r-full: 999px;
-
-    --dur-fast: 90ms;
-    --ease: cubic-bezier(0.2, 0, 0, 1);
+  /* Signature 3. One thin tick per page on the trailing edge, the current page solid.
+     In right-to-left mode the stack moves to the left, because it follows the
+     direction of reading. */
+  .koma {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--s-2) 6px;
+    border-radius: var(--r-full);
+    background: var(--scrim);
+    backdrop-filter: blur(var(--blur-chrome));
+    max-height: 70vh;
+    pointer-events: none;
+  }
+  .koma.right {
+    right: var(--s-3);
+  }
+  .koma.left {
+    left: var(--s-3);
+  }
+  .koma i {
+    display: block;
+    width: 10px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--glass-hover);
+    transition: background var(--dur-fast) var(--ease);
+  }
+  .koma i.on {
+    background: var(--text);
+  }
+  /* Not colour alone: a done page is also wider, so the state survives a reader who
+     cannot separate the two tints. */
+  .koma i.done {
+    background: var(--progress);
+    width: 14px;
   }
   :global(body) {
     margin: 0;
     background: var(--bg);
     color: var(--text);
-    font: 13px/1.4 "IBM Plex Mono", ui-monospace, monospace;
+    /* Body copy and anything that can hold CJK. Labels we author ourselves opt into
+       --font-display; user content never does. DESIGN.md, Type. */
+    font: var(--text-sm) / var(--leading-body) var(--font-body);
     overflow: hidden;
-  }
-  /* People read for hours. DESIGN.md, Motion. */
-  @media (prefers-reduced-motion: reduce) {
-    :global(*) {
-      transition: none !important;
-    }
   }
   .scroller {
     position: fixed;
@@ -1307,7 +1547,7 @@
   button {
     font: inherit;
     background: #e8e6df;
-    color: #16150f;
+    color: var(--ink-on-accent);
     border: 0;
     padding: 3px 7px;
     cursor: pointer;
@@ -1332,8 +1572,13 @@
     position: fixed;
     inset: 0;
     overflow-y: auto;
-    padding: 24px;
-    background: var(--bg);
+    padding: var(--s-5);
+    /* Deliberately no background. Depth in this app is translucency over the live
+       layer, so an opaque fill here would paint Signature 1 out. The flat --bg comes
+       from body, which shows through when there is no palette. */
+    z-index: 1;
+    /* Room for the floating resume bar to sit over rather than on top of content. */
+    padding-bottom: 108px;
   }
   .library h1,
   .library h2 {
@@ -1416,11 +1661,11 @@
   .chip.accent {
     background: var(--accent);
     border-color: var(--accent);
-    color: #16150f;
+    color: var(--ink-on-accent);
   }
   .chip.accent:hover {
     background: var(--accent-soft);
-    color: #16150f;
+    color: var(--ink-on-accent);
   }
   .chip.danger:hover {
     color: var(--danger);
@@ -1495,7 +1740,7 @@
     padding: 0 5px;
     border-radius: var(--r-full);
     background: var(--accent);
-    color: #16150f;
+    color: var(--ink-on-accent);
     font-size: 10px;
     font-weight: 700;
     line-height: 18px;

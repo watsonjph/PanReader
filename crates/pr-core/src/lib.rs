@@ -54,6 +54,15 @@ pub struct Settings {
     pub double_page: bool,
     /// Hold the cover back so later pairs land on the right leaf.
     pub cover_alone: bool,
+
+    /// A key in data/themes.json, or "system" to follow the OS. Not an enum: adding a
+    /// theme is meant to touch that file and nothing else, and an enum here would make
+    /// it touch Rust too.
+    pub theme: String,
+    /// Paint the live cover-derived background. DESIGN.md, Signature 1.
+    pub live_background: bool,
+    /// Cut motion even when the OS is not asking for it. Some machines need it anyway.
+    pub reduce_animations: bool,
 }
 
 impl Default for Settings {
@@ -70,6 +79,9 @@ impl Default for Settings {
             rotation_lock: false,
             double_page: false,
             cover_alone: true,
+            theme: "ink".to_owned(),
+            live_background: true,
+            reduce_animations: false,
         }
     }
 }

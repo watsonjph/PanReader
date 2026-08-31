@@ -168,6 +168,112 @@ impl PageGrid {
     }
 }
 
+/// Luminance ceiling for any colour taken from cover art.
+///
+/// DESIGN.md is blunt about why: without it a pale cover produces a background that
+/// white type cannot survive, and that is the difference between the feature working
+/// and the feature shipping an unreadable library page.
+const MAX_LUMA: f32 = 90.0;
+
+/// How many colours the live background needs: one base plus seven gradient stops.
+pub const PALETTE_LEN: usize = 8;
+
+/// Rec. 709 relative luminance, the same weights the cap is specified in.
+fn luma([r, g, b]: [u8; 3]) -> f32 {
+    0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
+}
+
+/// Scale a colour down until it is dark enough to put light type over, keeping its hue.
+///
+/// Scaling all three channels by the same factor is what preserves hue; clamping each
+/// channel independently would shift it.
+fn cap(rgb: [u8; 3]) -> [u8; 3] {
+    let l = luma(rgb);
+    if l <= MAX_LUMA {
+        return rgb;
+    }
+    let k = MAX_LUMA / l;
+    rgb.map(|c| (c as f32 * k).round().clamp(0.0, 255.0) as u8)
+}
+
+/// Squared distance in RGB, only ever compared against itself.
+fn apart(a: [u8; 3], b: [u8; 3]) -> i32 {
+    let d = |i: usize| (a[i] as i32 - b[i] as i32).pow(2);
+    d(0) + d(1) + d(2)
+}
+
+/// Eight colours from a cover, ordered most common first, every one luminance-capped.
+///
+/// Colour 0 becomes the background; 1 through 7 become the fixed radial gradients. The
+/// positions never move, so the result varies with the art but never with luck.
+///
+/// ponytail: a coarse 3D histogram, not k-means or median cut. Thirty two levels per
+/// channel, most populous bins first, skipping any bin too close to one already taken.
+/// The output is seven blurred radial gradients -- a more faithful quantiser would not
+/// produce a visibly different field, and this one has no dependency and no iteration
+/// count to tune.
+#[tracing::instrument(skip(bytes), fields(bytes = bytes.len()))]
+pub fn palette(bytes: &[u8]) -> Result<[[u8; 3]; PALETTE_LEN]> {
+    // 400px first, as DESIGN.md specifies: extraction is then cheap enough to do on
+    // every selection change.
+    let img = decode_scaled(bytes, 400)?;
+
+    // 5 bits per channel. Fine enough to keep two similar reds apart, coarse enough
+    // that a photographic cover still piles up in a few bins.
+    const BITS: u32 = 5;
+    const LEVELS: usize = 1 << BITS;
+    let mut bins = vec![(0u32, [0u64; 3]); LEVELS * LEVELS * LEVELS];
+
+    for px in img.pixels() {
+        let [r, g, b] = px.0;
+        // Near-black and near-white pixels are page edges and gutters far more often
+        // than they are the art, and both make a lifeless background.
+        let l = luma([r, g, b]);
+        if !(12.0..=245.0).contains(&l) {
+            continue;
+        }
+        let idx = ((r as usize >> (8 - BITS)) << (2 * BITS))
+            | ((g as usize >> (8 - BITS)) << BITS)
+            | (b as usize >> (8 - BITS));
+        let bin = &mut bins[idx];
+        bin.0 += 1;
+        bin.1[0] += r as u64;
+        bin.1[1] += g as u64;
+        bin.1[2] += b as u64;
+    }
+
+    let mut ranked: Vec<(u32, [u8; 3])> = bins
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, sum)| (*n, sum.map(|c| (c / *n as u64) as u8)))
+        .collect();
+    ranked.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
+
+    // Far enough apart that seven gradients do not resolve into one wash. Roughly 40
+    // per channel.
+    const MIN_APART: i32 = 40 * 40 * 3;
+    let mut picked: Vec<[u8; 3]> = Vec::with_capacity(PALETTE_LEN);
+    for (_, colour) in &ranked {
+        if picked.len() == PALETTE_LEN {
+            break;
+        }
+        if picked.iter().all(|p| apart(*p, *colour) >= MIN_APART) {
+            picked.push(*colour);
+        }
+    }
+    // A cover with almost no colour in it -- a monochrome page, or a scan that is all
+    // paper -- yields fewer than eight. Repeat what there is rather than inventing:
+    // a flatter field is the honest rendering of a flat cover.
+    if picked.is_empty() {
+        picked.push([20, 20, 24]);
+    }
+    let mut out = [[0u8; 3]; PALETTE_LEN];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = cap(picked[i % picked.len()]);
+    }
+    Ok(out)
+}
+
 /// Horizontal slice of a decoded page. Clamped, so the last tile of a page is short.
 pub fn tile(img: &RgbImage, y: u32, h: u32) -> RgbImage {
     let y = y.min(img.height());
@@ -415,5 +521,47 @@ mod tests {
             small.height() < H,
             "the DCT path must shrink the height too"
         );
+    }
+
+    /// The cap is the whole reason the live background is shippable. A pale cover must
+    /// not produce a ground that light type disappears into.
+    #[test]
+    fn every_extracted_colour_is_dark_enough_to_put_light_type_over() {
+        for cover in [
+            flat_jpeg(400, 600, [255, 255, 255]).unwrap(),
+            flat_jpeg(400, 600, [250, 240, 210]).unwrap(),
+            flat_jpeg(400, 600, [200, 220, 255]).unwrap(),
+        ] {
+            for colour in palette(&cover).unwrap() {
+                assert!(
+                    luma(colour) <= MAX_LUMA + 0.5,
+                    "{colour:?} has luminance {} and would swallow --text",
+                    luma(colour)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capping_preserves_hue_rather_than_clamping_channels() {
+        // A pale warm colour stays warm: the ratios between channels survive.
+        let capped = cap([255, 200, 100]);
+        assert!(luma(capped) <= MAX_LUMA + 0.5);
+        let ratio = |c: [u8; 3]| c[0] as f32 / c[2] as f32;
+        assert!(
+            (ratio(capped) - ratio([255, 200, 100])).abs() < 0.05,
+            "hue drifted: {capped:?}"
+        );
+        // Something already dark is left exactly alone.
+        assert_eq!(cap([20, 30, 40]), [20, 30, 40]);
+    }
+
+    #[test]
+    fn a_palette_is_always_eight_long_even_from_a_featureless_cover() {
+        let flat = flat_jpeg(400, 600, [70, 60, 90]).unwrap();
+        let got = palette(&flat).unwrap();
+        assert_eq!(got.len(), PALETTE_LEN);
+        // One colour in, so the field is flat. Honest, rather than invented variety.
+        assert!(got.iter().all(|c| apart(*c, got[0]) < 40 * 40 * 3));
     }
 }

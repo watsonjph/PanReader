@@ -114,6 +114,19 @@ impl App {
         Ok(bytes)
     }
 
+    /// The live background palette for a chapter's cover.
+    ///
+    /// Reads the cached cover rather than the source page, so this costs one small
+    /// JPEG decode and never reopens an archive. Signature 1 changes the background on
+    /// every selection change, so it has to be cheap enough to run on hover.
+    fn palette(&self, chapter_id: i64) -> anyhow::Result<Vec<String>> {
+        let cover = self.cover(chapter_id, 320)?;
+        Ok(pr_image::palette(&cover)?
+            .iter()
+            .map(|[r, g, b]| format!("{r},{g},{b}"))
+            .collect())
+    }
+
     /// Walk every root and fold the result in.
     ///
     /// Runs on the caller's thread; the command that triggers it spawns, because a scan
@@ -232,6 +245,14 @@ async fn opds_download(
         }
     });
     Ok(path.display().to_string())
+}
+
+/// Eight colours for the live background, as "r,g,b" strings ready for rgb().
+///
+/// Small and fixed, so a command rather than a route.
+#[tauri::command]
+fn palette(app: State<App>, chapter_id: i64) -> Result<Vec<String>, String> {
+    app.palette(chapter_id).map_err(|e| format!("{e:#}"))
 }
 
 /// The shelf's resume row. Small and fixed, so it is a command rather than a route.
@@ -563,6 +584,7 @@ fn main() {
             save_position,
             search,
             continue_reading,
+            palette,
             catalogs,
             add_catalog,
             remove_catalog,

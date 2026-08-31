@@ -3,9 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "gen": "node gen-themes.mjs",
+    "predev": "node gen-themes.mjs",
     "dev": "vite",
+    "prebuild": "node gen-themes.mjs",
     "build": "vite build",
     "preview": "vite preview",
+    "pretest": "node gen-themes.mjs",
     "test": "vitest run"
   },
   "devDependencies": {
