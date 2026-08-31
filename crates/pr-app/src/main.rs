@@ -23,6 +23,9 @@ struct App {
     /// Cached so the tile path never touches SQLite. Settings change rarely and are
     /// read on every chapter open.
     settings: Mutex<pr_core::Settings>,
+    /// Decoded covers, so a cold start paints the shelf without opening every archive
+    /// in the library.
+    covers: PathBuf,
 }
 
 impl App {
@@ -31,11 +34,18 @@ impl App {
         let db = pr_db::Db::open(&path)?;
         let settings = db.settings()?;
         tracing::info!(db = %path.display(), ?settings, "opened library");
+        // Derived data, so it belongs beside the database rather than in the library
+        // (hard invariant 5). Losing it costs one re-decode.
+        let covers = path.with_file_name("covers");
+        if let Err(e) = std::fs::create_dir_all(&covers) {
+            tracing::warn!(dir = %covers.display(), "no cover cache: {e}");
+        }
         Ok(Self {
             chapters: Mutex::new(HashMap::new()),
             scanning: std::sync::atomic::AtomicBool::new(false),
             db: Mutex::new(db),
             settings: Mutex::new(settings),
+            covers,
         })
     }
 }
@@ -72,7 +82,23 @@ impl App {
     /// open. A cover needs exactly one page, and a library screen asks for hundreds of
     /// them at once. Not cached in memory either: the response is immutable and the
     /// webview keeps it, so a second look costs nothing.
+    /// A series cover, decoded once ever.
+    ///
+    /// The webview caches these for the session, so this is about the cold start: a
+    /// five hundred series shelf otherwise opens five hundred archives before it can
+    /// paint. A chapter row is matched by content identity, so an id implies fixed
+    /// bytes and the file never goes stale — changed content lands on a new row.
+    ///
+    /// ponytail: no eviction. One cover per series at ~15 KB is single-digit megabytes
+    /// for a large library. Add an LRU when a real library makes that untrue.
     fn cover(&self, chapter_id: i64, width: u32) -> anyhow::Result<Vec<u8>> {
+        // chapter_id and width are already parsed as numbers, so this cannot escape
+        // the directory.
+        let cached = self.covers.join(format!("{chapter_id}-{width}.jpg"));
+        if let Ok(bytes) = std::fs::read(&cached) {
+            return Ok(bytes);
+        }
+
         let row = self
             .db
             .lock()
@@ -80,7 +106,13 @@ impl App {
             .with_context(|| format!("chapter {chapter_id} is not in the library"))?;
         let src = PageSource::open(Path::new(&row.path))?;
         let img = pr_image::decode_scaled(&src.read(0)?, width)?;
-        Ok(pr_image::encode_jpeg(&img, 78)?)
+        let bytes = pr_image::encode_jpeg(&img, 78)?;
+
+        // Best effort. A cover we cannot write is a slow cover, not a failure.
+        if let Err(e) = std::fs::write(&cached, &bytes) {
+            tracing::debug!(path = %cached.display(), "cover not cached: {e}");
+        }
+        Ok(bytes)
     }
 
     /// Walk every root and fold the result in.
@@ -94,9 +126,12 @@ impl App {
         }
         let result = (|| {
             let roots = self.db.lock().roots()?;
+            // What the last scan saw. A rescan of an unchanged library then costs a
+            // directory walk and nothing else.
+            let known = self.db.lock().known()?;
             let mut total = pr_db::ScanSummary::default();
             for root in roots {
-                let found = pr_archive::scan::scan_root(&root);
+                let found = pr_archive::scan::scan_root(&root, &known);
                 let summary = self.db.lock().sync(&found)?;
                 total.series += summary.series;
                 total.chapters_added += summary.chapters_added;

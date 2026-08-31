@@ -38,6 +38,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_chapter_path",
         include_str!("../migrations/0003_chapter_path.sql"),
     ),
+    (
+        "0004_chapter_stamp",
+        include_str!("../migrations/0004_chapter_stamp.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -296,7 +300,7 @@ impl Db {
                         tx.execute(
                             "UPDATE chapters
                              SET series_id = ?2, title = ?3, number = ?4, page_count = ?5,
-                                 path = ?6
+                                 path = ?6, mtime = ?7, size = ?8
                              WHERE id = ?1",
                             params![
                                 id,
@@ -304,7 +308,9 @@ impl Db {
                                 chapter.title,
                                 chapter.number,
                                 count,
-                                chapter.path.to_string_lossy()
+                                chapter.path.to_string_lossy(),
+                                chapter.mtime,
+                                chapter.size as i64
                             ],
                         )?;
                         summary.chapters_kept += 1;
@@ -312,15 +318,18 @@ impl Db {
                     None => {
                         tx.execute(
                             "INSERT INTO chapters
-                                 (series_id, source_id, title, number, page_count, path)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                 (series_id, source_id, title, number, page_count, path,
+                                  mtime, size)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
                                 series_id,
                                 chapter.identity,
                                 chapter.title,
                                 chapter.number,
                                 count,
-                                chapter.path.to_string_lossy()
+                                chapter.path.to_string_lossy(),
+                                chapter.mtime,
+                                chapter.size as i64
                             ],
                         )?;
                         summary.chapters_added += 1;
@@ -331,6 +340,28 @@ impl Db {
 
         tx.commit()?;
         Ok(summary)
+    }
+
+    /// What the last scan saw, for the next one to skip.
+    ///
+    /// One query for the whole library rather than a lookup per chapter: ten thousand
+    /// rows of four small columns is nothing next to the I/O it saves.
+    pub fn known(&self) -> Result<pr_archive::scan::Known> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime, size, source_id, page_count FROM chapters")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                PathBuf::from(r.get::<_, String>(0)?),
+                pr_archive::scan::Cached {
+                    mtime: r.get(1)?,
+                    size: r.get::<_, i64>(2)? as u64,
+                    identity: r.get(3)?,
+                    page_count: r.get::<_, i64>(4)? as usize,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The whole library. `search` with no query and no category is the same
@@ -698,6 +729,8 @@ mod tests {
                     path: PathBuf::from(path).join(name),
                     title: (*name).to_owned(),
                     number: pr_archive::scan::chapter_number(name),
+                    mtime: 0,
+                    size: 0,
                     page_count: 20,
                     identity: (*identity).to_owned(),
                 })
