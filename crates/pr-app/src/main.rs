@@ -15,9 +15,26 @@ use tauri::http::{Request, Response, StatusCode, header};
 use tauri::{Manager, State};
 use tiles::{Chapter, Layout, StatsSnapshot, TileKey};
 
-#[derive(Default)]
 struct App {
     chapters: Mutex<HashMap<String, Arc<Chapter>>>,
+    db: Mutex<pr_db::Db>,
+    /// Cached so the tile path never touches SQLite. Settings change rarely and are
+    /// read on every chapter open.
+    settings: Mutex<pr_core::Settings>,
+}
+
+impl App {
+    fn open() -> anyhow::Result<Self> {
+        let path = pr_db::default_path()?;
+        let db = pr_db::Db::open(&path)?;
+        let settings = db.settings()?;
+        tracing::info!(db = %path.display(), ?settings, "opened library");
+        Ok(Self {
+            chapters: Mutex::new(HashMap::new()),
+            db: Mutex::new(db),
+            settings: Mutex::new(settings),
+        })
+    }
 }
 
 /// Hardcoded fixtures, per Phase 0. Override with PANREADER_CBZ / PANREADER_STRIP.
@@ -51,10 +68,8 @@ impl App {
                 path.display()
             )
         })?;
-        // ponytail: one hardcoded fallback until Phase 2 has somewhere to persist
-        // settings. The precedence chain above it is already real, so this is the only
-        // line that moves when a config file and per-category defaults arrive.
-        let chapter = Arc::new(Chapter::open(kind, src, pr_core::ReadingMode::Rtl)?);
+        let default_mode = self.settings.lock().default_reading_mode;
+        let chapter = Arc::new(Chapter::open(kind, src, default_mode)?);
         self.chapters
             .lock()
             .insert(kind.to_owned(), chapter.clone());
@@ -78,6 +93,23 @@ fn warm(app: State<'_, App>, kind: String, page: usize, display_w: u32) {
     if let Some(chapter) = app.chapters.lock().get(&kind) {
         chapter.warm(page, display_w);
     }
+}
+
+#[tauri::command]
+fn settings(app: State<'_, App>) -> pr_core::Settings {
+    app.settings.lock().clone()
+}
+
+/// Persist and adopt. Written whole, because settings change rarely and a blob rewrite
+/// costs nothing at this rate -- unlike reading position, which gets its own table.
+#[tauri::command]
+fn save_settings(app: State<'_, App>, settings: pr_core::Settings) -> Result<(), String> {
+    app.db
+        .lock()
+        .save_settings(&settings)
+        .map_err(|e| format!("{e:#}"))?;
+    *app.settings.lock() = settings;
+    Ok(())
 }
 
 #[tauri::command]
@@ -132,8 +164,19 @@ fn main() {
         .build_global()
         .expect("rayon global pool is built exactly once, here");
 
+    let app = match App::open() {
+        Ok(app) => app,
+        // A library we cannot open is worth failing loudly for: every setting and every
+        // reading position lives there, and starting without it would silently discard
+        // both.
+        Err(e) => {
+            tracing::error!("could not open the library: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
     tauri::Builder::default()
-        .manage(App::default())
+        .manage(app)
         .register_asynchronous_uri_scheme_protocol("pan", |ctx, req, responder| {
             let app = ctx.app_handle().clone();
             // Invariant 7: no blocking work on the webview's thread.
@@ -166,7 +209,9 @@ fn main() {
             open_chapter,
             warm,
             stats,
-            tile_base
+            tile_base,
+            settings,
+            save_settings
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

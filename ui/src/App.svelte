@@ -63,6 +63,7 @@
   let openedAt = 0;
   let resizeTimer = 0;
   let warmTimer = 0;
+  let saveTimer = 0;
   let tops = []; // CSS-px top of each page, padding included
   let dragging = false;
   let dragMoved = false;
@@ -203,6 +204,29 @@
         for (const { t } of tileRects(p)) new Image().src = tileUrl(p.index, t);
       }
     }
+  }
+
+  /// Persist the view settings.
+  ///
+  /// Debounced, and deliberately not on the page-turn path: settings change rarely,
+  /// so the whole blob is rewritten, whereas reading position gets its own table
+  /// because it is written on every turn.
+  function persist() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      invoke("save_settings", {
+        settings: {
+          default_reading_mode: overridden ? mode : (detected?.mode ?? "rtl"),
+          fit,
+          downsample: sample,
+          page_padding: pad,
+          rotation: rot,
+          rotation_lock: rotLock,
+          double_page: spread,
+          cover_alone: true,
+        },
+      }).catch((e) => console.warn("could not save settings:", e));
+    }, 500);
   }
 
   /// Re-aim the background fill at the current page. Debounced: flicking through
@@ -355,12 +379,14 @@
   /// laid out again. Keeps your place.
   function setSample(next) {
     sample = next;
+    persist();
     if (layout) load(kind, true);
   }
 
   /// Padding only moves pages apart; nothing needs re-decoding.
   function setPad(next) {
     pad = next;
+    persist();
     rebuildTops();
     if (canvas) canvas.style.height = canvasHeight() + "px";
     dropStripTiles();
@@ -370,6 +396,7 @@
   function setMode(next) {
     mode = next;
     overridden = true;
+    persist();
     if (mode === "webtoon") {
       dirty = true;
     } else {
@@ -386,13 +413,13 @@
     if (k === "1") load("cbz");
     else if (k === "2") load("strip");
     else if (k === "s") autoscroll = !autoscroll;
-    else if (k === "f") fit = FITS[(FITS.indexOf(fit) + 1) % FITS.length];
+    else if (k === "f") { fit = FITS[(FITS.indexOf(fit) + 1) % FITS.length]; persist(); }
     else if (k === "d") setSample(SAMPLES[(SAMPLES.indexOf(sample) + 1) % SAMPLES.length]);
     else if (k === "p") setPad(PADS[(PADS.indexOf(pad) + 1) % PADS.length]);
-    else if (k === "[") rot = (rot + 270) % 360;
-    else if (k === "]") rot = (rot + 90) % 360;
-    else if (k === "l") rotLock = !rotLock;
-    else if (k === "w") spread = !spread;
+    else if (k === "[") { rot = (rot + 270) % 360; persist(); }
+    else if (k === "]") { rot = (rot + 90) % 360; persist(); }
+    else if (k === "l") { rotLock = !rotLock; persist(); }
+    else if (k === "w") { spread = !spread; persist(); }
     else if (k === "F" || k === "F11") toggleFullscreen();
     else if (k === "0") resetView();
     else if (k === "m") setMode(MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
@@ -519,9 +546,23 @@
     }, 300);
   }
 
-  onMount(() => {
+  onMount(async () => {
     vw = window.innerWidth;
     vh = window.innerHeight;
+    // Settings first: the chapter open uses the persisted reading-mode default, so
+    // loading them afterwards would detect against the wrong fallback once.
+    try {
+      const saved = await invoke("settings");
+      mode = saved.default_reading_mode;
+      fit = saved.fit;
+      sample = saved.downsample;
+      pad = saved.page_padding;
+      rot = saved.rotation;
+      rotLock = saved.rotation_lock;
+      spread = saved.double_page;
+    } catch (e) {
+      console.warn("could not load settings:", e);
+    }
     frames();
     load("cbz");
   });
