@@ -34,6 +34,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_chapter_identity_index",
         include_str!("../migrations/0002_chapter_identity_index.sql"),
     ),
+    (
+        "0003_chapter_path",
+        include_str!("../migrations/0003_chapter_path.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -177,7 +181,8 @@ pub struct ChapterRow {
     pub title: String,
     pub number: Option<f64>,
     pub page_count: i64,
-    pub series_path: String,
+    /// Where to read it from. Identity matches; path opens.
+    pub path: String,
     pub page: i64,
     pub completed: bool,
 }
@@ -258,22 +263,32 @@ impl Db {
                     Some(id) => {
                         tx.execute(
                             "UPDATE chapters
-                             SET series_id = ?2, title = ?3, number = ?4, page_count = ?5
+                             SET series_id = ?2, title = ?3, number = ?4, page_count = ?5,
+                                 path = ?6
                              WHERE id = ?1",
-                            params![id, series_id, chapter.title, chapter.number, count],
+                            params![
+                                id,
+                                series_id,
+                                chapter.title,
+                                chapter.number,
+                                count,
+                                chapter.path.to_string_lossy()
+                            ],
                         )?;
                         summary.chapters_kept += 1;
                     }
                     None => {
                         tx.execute(
-                            "INSERT INTO chapters (series_id, source_id, title, number, page_count)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            "INSERT INTO chapters
+                                 (series_id, source_id, title, number, page_count, path)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             params![
                                 series_id,
                                 chapter.identity,
                                 chapter.title,
                                 chapter.number,
-                                count
+                                count,
+                                chapter.path.to_string_lossy()
                             ],
                         )?;
                         summary.chapters_added += 1;
@@ -306,10 +321,9 @@ impl Db {
     /// Chapters of one series, in reading order, each with its saved position.
     pub fn chapters(&self, series_id: i64) -> Result<Vec<ChapterRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.title, c.number, c.page_count, s.source_id,
+            "SELECT c.id, c.title, c.number, c.page_count, c.path,
                     coalesce(p.page, 0), coalesce(p.completed, 0)
              FROM chapters c
-             JOIN series s ON s.id = c.series_id
              LEFT JOIN positions p ON p.chapter_id = c.id
              WHERE c.series_id = ?1
              ORDER BY c.number, c.title",
@@ -320,12 +334,38 @@ impl Db {
                 title: r.get(1)?,
                 number: r.get(2)?,
                 page_count: r.get(3)?,
-                series_path: r.get(4)?,
+                path: r.get(4)?,
                 page: r.get(5)?,
                 completed: r.get::<_, i64>(6)? != 0,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// One chapter by id, which is what opening it needs.
+    pub fn chapter(&self, chapter_id: i64) -> Result<Option<ChapterRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT c.id, c.title, c.number, c.page_count, c.path,
+                        coalesce(p.page, 0), coalesce(p.completed, 0)
+                 FROM chapters c
+                 LEFT JOIN positions p ON p.chapter_id = c.id
+                 WHERE c.id = ?1",
+                params![chapter_id],
+                |r| {
+                    Ok(ChapterRow {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        number: r.get(2)?,
+                        page_count: r.get(3)?,
+                        path: r.get(4)?,
+                        page: r.get(5)?,
+                        completed: r.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// One row per chapter, rewritten on every page turn. This is precisely why

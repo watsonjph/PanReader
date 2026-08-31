@@ -27,7 +27,14 @@
   /// what Mihon calls CONTINUOUS_VERTICAL. One setting beats two modes.
   const PADS = [0, 8, 16, 32];
 
-  let kind = $state("cbz");
+  let series = $state([]);
+  let seriesChapters = $state([]);
+  let openSeries = $state(null);
+  let chapterId = $state(null);
+  let chapterTitle = $state("");
+  let libraryRoots = $state([]);
+  let rootInput = $state("");
+  let busy = $state(false);
   let error = $state(null);
   let hud = $state({ fps: 0, worst: 0, dropped: 0, mounted: 0, firstPaint: null });
   let rust = $state({});
@@ -64,13 +71,17 @@
   let resizeTimer = 0;
   let warmTimer = 0;
   let saveTimer = 0;
+  let positionTimer = 0;
   let tops = []; // CSS-px top of each page, padding included
-  let dragging = false;
+  // Reactive because it drives the grab cursor; the rest of the drag state is only
+  // ever read from handlers.
+  let dragging = $state(false);
   let dragMoved = false;
   let dragX = 0;
   let dragY = 0;
   let padHeld = new Set();
 
+  const current = $derived(seriesChapters.find((c) => c.id === chapterId) ?? null);
   const paged = $derived(mode !== "webtoon");
   const groups = $derived.by(() => {
     void epoch, spread;
@@ -88,7 +99,7 @@
   const css = (deviceY) => Math.round(deviceY / dpr);
 
   const tileUrl = (index, t) =>
-    `${base}/t/${kind}/${index}/${t}/${layout.display_w}`;
+    `${base}/t/${chapterId}/${index}/${t}/${layout.display_w}`;
 
   function rebuildTops() {
     tops = layout ? pageTops(layout.pages, pad, dpr) : [];
@@ -148,12 +159,13 @@
     };
   });
 
-  async function load(next, keepPage = false) {
-    const wanted = keepPage ? page : 0;
+  async function load(chapter, keepPage = false) {
+    const wanted = keepPage ? page : chapter.page ?? 0;
     // Strip mode keeps its place by page, not by pixel: a reload can change the width
     // we decode at and the padding between pages, so the old offset means nothing.
     const wantedScroll = keepPage && layout && !paged ? pageAt(tops, scroller.scrollTop) : 0;
-    kind = next;
+    chapterId = chapter.id;
+    chapterTitle = chapter.title;
     error = null;
     hud.firstPaint = null;
     for (const el of live.values()) el.remove();
@@ -169,7 +181,7 @@
     openedAt = performance.now();
     try {
       base ||= await invoke("tile_base");
-      layout = await invoke("open_chapter", { kind, displayW });
+      layout = await invoke("open_chapter", { chapterId: chapter.id, displayW });
     } catch (e) {
       error = String(e);
       layout = null;
@@ -206,6 +218,73 @@
     }
   }
 
+  async function refreshLibrary() {
+    try {
+      [series, libraryRoots, busy] = await Promise.all([
+        invoke("library"),
+        invoke("roots"),
+        invoke("scanning"),
+      ]);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function addRoot() {
+    const path = rootInput.trim();
+    if (!path) return;
+    error = null;
+    try {
+      await invoke("add_root", { path });
+      rootInput = "";
+      await watchScan();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// A scan runs on its own thread, so the library is polled until it settles rather
+  /// than blocking a command on it (invariant 7).
+  async function watchScan() {
+    busy = true;
+    for (let i = 0; i < 600; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      await refreshLibrary();
+      if (!busy) return;
+    }
+  }
+
+  async function showSeries(row) {
+    openSeries = row;
+    try {
+      seriesChapters = await invoke("chapters", { seriesId: row.id });
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function toLibrary() {
+    chapterId = null;
+    layout = null;
+    for (const el of live.values()) el.remove();
+    live.clear();
+    refreshLibrary();
+  }
+
+  /// Debounced: a page turn is cheap but a flick is twenty of them, and this is a disk
+  /// write. The row is a one-row upsert, which is why position is not in the settings
+  /// blob at all.
+  function savePosition() {
+    if (chapterId === null) return;
+    clearTimeout(positionTimer);
+    const id = chapterId;
+    const at = page;
+    const done = pageCount > 0 && page >= pageCount - 1;
+    positionTimer = setTimeout(() => {
+      invoke("save_position", { chapterId: id, page: at, completed: done }).catch(() => {});
+    }, 400);
+  }
+
   /// Persist the view settings.
   ///
   /// Debounced, and deliberately not on the page-turn path: settings change rarely,
@@ -235,7 +314,7 @@
     if (!layout) return;
     clearTimeout(warmTimer);
     warmTimer = setTimeout(() => {
-      invoke("warm", { kind, page, displayW: layout.display_w }).catch(() => {});
+      invoke("warm", { chapterId, page, displayW: layout.display_w }).catch(() => {});
     }, 400);
   }
 
@@ -360,9 +439,11 @@
         hud.worst = Math.round(sorted[Math.floor(sorted.length * 0.99)] * 10) / 10;
         hud.dropped = samples.filter((d) => d > p50 * 1.5).length;
         lastHud = now;
-        invoke("stats", { kind })
-          .then((s) => (rust = s))
-          .catch(() => {});
+        if (chapterId !== null) {
+          invoke("stats", { chapterId })
+            .then((s) => (rust = s))
+            .catch(() => {});
+        }
       }
       requestAnimationFrame(tick);
     };
@@ -380,7 +461,7 @@
   function setSample(next) {
     sample = next;
     persist();
-    if (layout) load(kind, true);
+    if (layout && current) load(current, true);
   }
 
   /// Padding only moves pages apart; nothing needs re-decoding.
@@ -410,8 +491,7 @@
   function onKey(e) {
     const k = e.key;
 
-    if (k === "1") load("cbz");
-    else if (k === "2") load("strip");
+    if (k === "Escape") toLibrary();
     else if (k === "s") autoscroll = !autoscroll;
     else if (k === "f") { fit = FITS[(FITS.indexOf(fit) + 1) % FITS.length]; persist(); }
     else if (k === "d") setSample(SAMPLES[(SAMPLES.indexOf(sample) + 1) % SAMPLES.length]);
@@ -542,7 +622,7 @@
     // resize would otherwise ask for a new chapter layout on every frame.
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
-      if (layout) load(kind, true);
+      if (layout && current) load(current, true);
     }, 300);
   }
 
@@ -564,7 +644,8 @@
       console.warn("could not load settings:", e);
     }
     frames();
-    load("cbz");
+    await refreshLibrary();
+    if (busy) watchScan();
   });
 </script>
 
@@ -631,10 +712,69 @@
   <p class="error">{error}</p>
 {/if}
 
-<div class="hud">
-  <b>{kind}</b>
-  <button onclick={() => load("cbz")} disabled={kind === "cbz"}>cbz [1]</button>
-  <button onclick={() => load("strip")} disabled={kind === "strip"}>strip [2]</button>
+{#if chapterId === null}
+  <div class="library">
+    <h1>Library</h1>
+
+    <div class="roots">
+      {#each libraryRoots as root (root)}
+        <div class="root">
+          <span>{root}</span>
+          <button
+            onclick={async () => {
+              await invoke("remove_root", { path: root });
+              refreshLibrary();
+            }}>remove</button
+          >
+        </div>
+      {/each}
+      <div class="root">
+        <input
+          placeholder="Paste a folder path, then Add"
+          bind:value={rootInput}
+          onkeydown={(e) => e.key === "Enter" && addRoot()}
+        />
+        <button onclick={addRoot}>Add folder</button>
+        <button onclick={async () => { await invoke("rescan"); watchScan(); }}>
+          Rescan
+        </button>
+        {#if busy}<span class="busy">scanning…</span>{/if}
+      </div>
+    </div>
+
+    {#if series.length === 0 && !busy}
+      <p class="empty">Add a folder to start your library.</p>
+    {/if}
+
+    <div class="shelf">
+      {#each series as row (row.id)}
+        <button class="card" class:on={openSeries?.id === row.id} onclick={() => showSeries(row)}>
+          <b>{row.title}</b>
+          <span>{row.chapter_count} chapter{row.chapter_count === 1 ? "" : "s"}</span>
+        </button>
+      {/each}
+    </div>
+
+    {#if openSeries}
+      <h2>{openSeries.title}</h2>
+      <div class="chapters">
+        {#each seriesChapters as c (c.id)}
+          <button class="chapter" onclick={() => load(c)}>
+            <span>{c.title}</span>
+            <span class="meta">
+              {c.page_count} pages
+              {#if c.completed}· read{:else if c.page > 0}· page {c.page + 1}{/if}
+            </span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/if}
+
+<div class="hud" class:reading={chapterId !== null}>
+  <b>{chapterTitle}</b>
+  <button onclick={toLibrary}>library [esc]</button>
   {#if !paged}
     <button onclick={() => (autoscroll = !autoscroll)}>
       {autoscroll ? "stop" : "flick"} [s]
@@ -774,6 +914,89 @@
     background: #b33a2b;
     color: #fff;
     white-space: nowrap;
+  }
+  .library {
+    position: fixed;
+    inset: 0;
+    overflow-y: auto;
+    padding: 24px;
+    background: #0e0e10;
+  }
+  .library h1,
+  .library h2 {
+    font-weight: 600;
+    margin: 0 0 12px;
+  }
+  .library h2 {
+    margin-top: 24px;
+    font-size: 15px;
+  }
+  .roots {
+    margin-bottom: 20px;
+  }
+  .root {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 6px;
+    color: #8e8b84;
+  }
+  .root input {
+    font: inherit;
+    flex: 1 1 340px;
+    max-width: 460px;
+    padding: 4px 8px;
+    background: #1a1a1d;
+    color: #e8e6df;
+    border: 1px solid #ffffff20;
+  }
+  .busy {
+    color: #e0a94e;
+  }
+  .empty {
+    color: #8e8b84;
+  }
+  .shelf {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .card,
+  .chapter {
+    font: inherit;
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    background: #ffffff0d;
+    color: #e8e6df;
+    border: 1px solid #ffffff1a;
+    cursor: pointer;
+  }
+  .card:hover,
+  .chapter:hover {
+    background: #ffffff1a;
+  }
+  .card.on {
+    border-color: #e0a94e;
+  }
+  .chapters {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: 620px;
+  }
+  .chapter {
+    flex-direction: row;
+    justify-content: space-between;
+  }
+  .meta {
+    color: #8e8b84;
+  }
+  /* The instrumentation only belongs on screen while something is being read. */
+  .hud:not(.reading) {
+    display: none;
   }
   .error {
     position: fixed;
