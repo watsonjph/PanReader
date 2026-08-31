@@ -7,10 +7,6 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
-[workspace.dependencies]
-pr-archive = { path = "crates/pr-archive" }
-pr-image = { path = "crates/pr-image" }
-
 [profile.dev]
 opt-level = 1
 

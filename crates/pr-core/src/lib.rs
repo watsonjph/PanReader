@@ -21,6 +21,59 @@ pub enum ReadingMode {
     Webtoon,
 }
 
+/// How a page is scaled into the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Fit {
+    #[default]
+    Page,
+    Width,
+    Height,
+    Original,
+}
+
+/// Everything the reader can change that should outlive the process.
+///
+/// Persisted as one JSON blob (see `pr-db`), so **every field carries a default**.
+/// Adding a field must never stop an older config from loading, and removing one must
+/// never stop a newer config from loading either.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Used when nothing better is known: no override, no metadata, no strip shape.
+    pub default_reading_mode: ReadingMode,
+    pub fit: Fit,
+    /// Fraction of the natural display width to decode. Below 1 this also takes pages
+    /// out of the passthrough path, so it costs CPU to save memory.
+    pub downsample: f32,
+    /// Gap between pages in CSS px. Zero is a seamless webtoon.
+    pub page_padding: u32,
+    pub rotation: u32,
+    /// Suppresses the automatic quarter turn of a wide page.
+    pub rotation_lock: bool,
+    pub double_page: bool,
+    /// Hold the cover back so later pairs land on the right leaf.
+    pub cover_alone: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            // Right to left is the safest default for a manga reader: the reader who
+            // is wrong about it notices immediately, whereas a silently reversed
+            // Japanese volume reads as nonsense for a while first.
+            default_reading_mode: ReadingMode::Rtl,
+            fit: Fit::Page,
+            downsample: 1.0,
+            page_padding: 0,
+            rotation: 0,
+            rotation_lock: false,
+            double_page: false,
+            cover_alone: true,
+        }
+    }
+}
+
 /// The `Manga` field of a ComicInfo.xml, which is the only widely-written metadata that
 /// states reading direction. Komga, Kavita and most tagging tools emit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
