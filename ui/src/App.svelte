@@ -38,6 +38,8 @@
   let libraryRoots = $state([]);
   let rootInput = $state("");
   let busy = $state(false);
+  let query = $state("");
+  let searchTimer = 0;
   let error = $state(null);
   let hud = $state({ fps: 0, worst: 0, dropped: 0, mounted: 0, firstPaint: null });
   let rust = $state({});
@@ -221,11 +223,25 @@
     }
   }
 
+  /// Debounced because it runs per keystroke. The query itself is a scan of the
+  /// series table, which is about a millisecond for ten thousand titles -- the debounce
+  /// is to avoid a round trip per character, not to spare the database.
+  function onSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      try {
+        series = await invoke("search", { query });
+      } catch (e) {
+        error = String(e);
+      }
+    }, 120);
+  }
+
   async function refreshLibrary() {
     try {
       base ||= await invoke("tile_base");
       [series, libraryRoots, busy] = await Promise.all([
-        invoke("library"),
+        invoke("search", { query }),
         invoke("roots"),
         invoke("scanning"),
       ]);
@@ -762,8 +778,19 @@
       </div>
     </div>
 
+    {#if series.length || query}
+      <input
+        class="search"
+        placeholder="Search series"
+        bind:value={query}
+        oninput={onSearch}
+      />
+    {/if}
+
     {#if series.length === 0 && !busy}
-      <p class="empty">Add a folder to start your library.</p>
+      <p class="empty">
+        {query ? `Nothing matches “${query}”.` : "Add a folder to start your library."}
+      </p>
     {/if}
 
     <div class="shelf">
@@ -988,6 +1015,17 @@
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
     gap: 12px;
   }
+  .search {
+    font: inherit;
+    display: block;
+    width: 100%;
+    max-width: 460px;
+    margin-bottom: 16px;
+    padding: 6px 10px;
+    background: #1a1a1d;
+    color: #e8e6df;
+    border: 1px solid #ffffff20;
+  }
   .cover {
     /* Reserve the 2:3 box before the image arrives so the grid does not reflow as
        covers stream in. */
@@ -1001,6 +1039,12 @@
     height: 100%;
     object-fit: cover;
     display: block;
+  }
+  .card {
+    /* Offscreen cards skip layout and paint entirely. The intrinsic size keeps the
+       scrollbar honest, so a ten thousand cover library still scrolls like a list. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 300px;
   }
   .card,
   .chapter {

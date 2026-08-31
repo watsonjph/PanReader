@@ -189,6 +189,32 @@ pub struct ChapterRow {
     pub completed: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CategoryRow {
+    pub id: i64,
+    pub name: String,
+    /// Applies to every series in it that has no override of its own.
+    pub reading_mode: Option<pr_core::ReadingMode>,
+    pub series_count: i64,
+}
+
+fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
+    mode.map(|m| match m {
+        pr_core::ReadingMode::Rtl => "rtl".to_owned(),
+        pr_core::ReadingMode::Ltr => "ltr".to_owned(),
+        pr_core::ReadingMode::Webtoon => "webtoon".to_owned(),
+    })
+}
+
+fn mode_from(text: Option<String>) -> Option<pr_core::ReadingMode> {
+    match text.as_deref() {
+        Some("rtl") => Some(pr_core::ReadingMode::Rtl),
+        Some("ltr") => Some(pr_core::ReadingMode::Ltr),
+        Some("webtoon") => Some(pr_core::ReadingMode::Webtoon),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ScanSummary {
     pub series: usize,
@@ -210,7 +236,11 @@ impl Db {
             .conn
             .prepare("SELECT path FROM library_roots ORDER BY added_at")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.filter_map(|r| r.ok()).map(PathBuf::from).collect())
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect())
     }
 
     pub fn remove_root(&self, path: &Path) -> Result<()> {
@@ -320,7 +350,7 @@ impl Db {
                 cover_chapter_id: r.get(4)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Chapters of one series, in reading order, each with its saved position.
@@ -344,7 +374,153 @@ impl Db {
                 completed: r.get::<_, i64>(6)? != 0,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Series whose title contains `query`, case-insensitively.
+    ///
+    /// ponytail: a scan, because a leading wildcard cannot use an index anyway and ten
+    /// thousand short titles compare in about a millisecond. FTS5 is the answer when
+    /// chapter *text* becomes searchable for the novel reader, not before.
+    pub fn search(&self, query: &str) -> Result<Vec<SeriesRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.title, s.source_id, count(c.id),
+                    (SELECT id FROM chapters WHERE series_id = s.id
+                     ORDER BY number, title LIMIT 1)
+             FROM series s LEFT JOIN chapters c ON c.series_id = s.id
+             WHERE s.title LIKE ?1 ESCAPE '\\'
+             GROUP BY s.id ORDER BY s.title",
+        )?;
+        // The wildcards are ours. Anything typed is literal, so a title containing % or
+        // _ searches for that character rather than matching everything.
+        let escaped = query
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_");
+        let rows = stmt.query_map(params![format!("%{escaped}%")], |r| {
+            Ok(SeriesRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                path: r.get(2)?,
+                chapter_count: r.get(3)?,
+                cover_chapter_id: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn categories(&self) -> Result<Vec<CategoryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.name, c.reading_mode, count(sc.series_id)
+             FROM categories c
+             LEFT JOIN series_categories sc ON sc.category_id = c.id
+             GROUP BY c.id ORDER BY c.sort, c.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CategoryRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                reading_mode: mode_from(r.get(2)?),
+                series_count: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn create_category(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO categories (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_category(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM categories WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_category_mode(&self, id: i64, mode: Option<pr_core::ReadingMode>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE categories SET reading_mode = ?2 WHERE id = ?1",
+            params![id, mode_text(mode)],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_series_category(
+        &self,
+        series_id: i64,
+        category_id: i64,
+        member: bool,
+    ) -> Result<()> {
+        if member {
+            self.conn.execute(
+                "INSERT INTO series_categories (series_id, category_id) VALUES (?1, ?2)
+                 ON CONFLICT DO NOTHING",
+                params![series_id, category_id],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM series_categories WHERE series_id = ?1 AND category_id = ?2",
+                params![series_id, category_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn categories_of(&self, series_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT category_id FROM series_categories WHERE series_id = ?1")?;
+        let rows = stmt.query_map(params![series_id], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_series_mode(
+        &self,
+        series_id: i64,
+        mode: Option<pr_core::ReadingMode>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE series SET reading_mode = ?2 WHERE id = ?1",
+            params![series_id, mode_text(mode)],
+        )?;
+        Ok(())
+    }
+
+    /// How a chapter should be read, as far as the library knows.
+    ///
+    /// Returns the series override and the category default separately, because they sit
+    /// at different precedence levels in `pr_core::detect`: an override beats detection,
+    /// a category default only applies when nothing was detected.
+    ///
+    /// A series in two categories that disagree takes the first by sort order. Picking
+    /// deterministically matters more than picking cleverly.
+    pub fn modes_for_chapter(
+        &self,
+        chapter_id: i64,
+    ) -> Result<(Option<pr_core::ReadingMode>, Option<pr_core::ReadingMode>)> {
+        let found: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT s.reading_mode,
+                        (SELECT cat.reading_mode FROM series_categories sc
+                         JOIN categories cat ON cat.id = sc.category_id
+                         WHERE sc.series_id = s.id AND cat.reading_mode IS NOT NULL
+                         ORDER BY cat.sort, cat.name LIMIT 1)
+                 FROM chapters c JOIN series s ON s.id = c.series_id
+                 WHERE c.id = ?1",
+                params![chapter_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        Ok(match found {
+            Some((series, category)) => (mode_from(series), mode_from(category)),
+            None => (None, None),
+        })
     }
 
     /// One chapter by id, which is what opening it needs.
@@ -621,6 +797,77 @@ mod tests {
 
         let series = db.library().unwrap().remove(0);
         assert_eq!(series.chapter_count, 2, "the absent chapter survived");
+    }
+
+    #[test]
+    fn search_matches_case_insensitively_and_treats_wildcards_as_literal() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[
+            scanned("Yotsubato", "/lib/a", &[("c1", "blake3:a")]),
+            scanned("Berserk", "/lib/b", &[("c1", "blake3:b")]),
+            scanned("100% Orange", "/lib/c", &[("c1", "blake3:c")]),
+        ])
+        .unwrap();
+
+        let hit = db.search("yotsu").unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].title, "Yotsubato");
+        assert!(
+            hit[0].cover_chapter_id.is_some(),
+            "search results carry a cover"
+        );
+
+        // A bare % would otherwise match the whole library.
+        let literal = db.search("%").unwrap();
+        assert_eq!(literal.len(), 1, "% is a character, not a wildcard");
+        assert_eq!(literal[0].title, "100% Orange");
+
+        assert!(db.search("nothing here").unwrap().is_empty());
+        assert_eq!(
+            db.search("").unwrap().len(),
+            3,
+            "an empty query is everything"
+        );
+    }
+
+    #[test]
+    fn a_category_supplies_a_default_mode_and_a_series_override_outranks_it() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[scanned("Solo Leveling", "/lib/s", &[("c1", "blake3:s")])])
+            .unwrap();
+        let series = db.library().unwrap().remove(0);
+        let chapter = db.chapters(series.id).unwrap().remove(0);
+
+        // Nothing set: the library has no opinion, so detection decides.
+        assert_eq!(db.modes_for_chapter(chapter.id).unwrap(), (None, None));
+
+        db.create_category("Manhwa").unwrap();
+        let category = db.categories().unwrap().remove(0);
+        db.set_category_mode(category.id, Some(pr_core::ReadingMode::Webtoon))
+            .unwrap();
+        db.set_series_category(series.id, category.id, true)
+            .unwrap();
+        assert_eq!(
+            db.modes_for_chapter(chapter.id).unwrap(),
+            (None, Some(pr_core::ReadingMode::Webtoon)),
+            "the category default applies"
+        );
+
+        db.set_series_mode(series.id, Some(pr_core::ReadingMode::Ltr))
+            .unwrap();
+        assert_eq!(
+            db.modes_for_chapter(chapter.id).unwrap(),
+            (
+                Some(pr_core::ReadingMode::Ltr),
+                Some(pr_core::ReadingMode::Webtoon)
+            ),
+            "an override on the series outranks its category"
+        );
+
+        assert_eq!(db.categories_of(series.id).unwrap(), vec![category.id]);
+        db.set_series_category(series.id, category.id, false)
+            .unwrap();
+        assert!(db.categories_of(series.id).unwrap().is_empty());
     }
 
     #[test]

@@ -56,8 +56,12 @@ impl App {
         let src = PageSource::open(&path)
             .with_context(|| format!("Could not open {}", path.display()))?;
 
-        let default_mode = self.settings.lock().default_reading_mode;
-        let chapter = Arc::new(Chapter::open(&row.title, src, default_mode)?);
+        // Precedence: a series override beats detection, a category default only
+        // applies where detection had nothing to go on, and the global setting is
+        // the last resort. `pr_core::detect` enforces the first half of that.
+        let (series_override, category_mode) = self.db.lock().modes_for_chapter(chapter_id)?;
+        let fallback = category_mode.unwrap_or(self.settings.lock().default_reading_mode);
+        let chapter = Arc::new(Chapter::open(&row.title, src, series_override, fallback)?);
         self.chapters.lock().insert(chapter_id, chapter.clone());
         Ok(chapter)
     }
@@ -109,6 +113,95 @@ impl App {
 #[tauri::command]
 fn library(app: State<App>) -> Result<Vec<pr_db::SeriesRow>, String> {
     app.db.lock().library().map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn search(app: State<App>, query: String) -> Result<Vec<pr_db::SeriesRow>, String> {
+    let db = app.db.lock();
+    if query.trim().is_empty() {
+        db.library()
+    } else {
+        db.search(query.trim())
+    }
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn categories(app: State<App>) -> Result<Vec<pr_db::CategoryRow>, String> {
+    app.db.lock().categories().map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn create_category(app: State<App>, name: String) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a category needs a name".into());
+    }
+    app.db
+        .lock()
+        .create_category(name)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn delete_category(app: State<App>, id: i64) -> Result<(), String> {
+    app.db
+        .lock()
+        .delete_category(id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Changing a category's mode changes how its series open, so anything already open is
+/// dropped: the mode is resolved when a chapter is opened, not on every page.
+#[tauri::command]
+fn set_category_mode(
+    app: State<App>,
+    id: i64,
+    mode: Option<pr_core::ReadingMode>,
+) -> Result<(), String> {
+    app.db
+        .lock()
+        .set_category_mode(id, mode)
+        .map_err(|e| format!("{e:#}"))?;
+    app.chapters.lock().clear();
+    Ok(())
+}
+
+#[tauri::command]
+fn set_series_category(
+    app: State<App>,
+    series_id: i64,
+    category_id: i64,
+    member: bool,
+) -> Result<(), String> {
+    app.db
+        .lock()
+        .set_series_category(series_id, category_id, member)
+        .map_err(|e| format!("{e:#}"))?;
+    app.chapters.lock().clear();
+    Ok(())
+}
+
+#[tauri::command]
+fn categories_of(app: State<App>, series_id: i64) -> Result<Vec<i64>, String> {
+    app.db
+        .lock()
+        .categories_of(series_id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn set_series_mode(
+    app: State<App>,
+    series_id: i64,
+    mode: Option<pr_core::ReadingMode>,
+) -> Result<(), String> {
+    app.db
+        .lock()
+        .set_series_mode(series_id, mode)
+        .map_err(|e| format!("{e:#}"))?;
+    app.chapters.lock().clear();
+    Ok(())
 }
 
 #[tauri::command]
@@ -338,7 +431,15 @@ fn main() {
             remove_root,
             rescan,
             scanning,
-            save_position
+            save_position,
+            search,
+            categories,
+            create_category,
+            delete_category,
+            set_category_mode,
+            set_series_category,
+            categories_of,
+            set_series_mode
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
