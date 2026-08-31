@@ -382,13 +382,16 @@ impl Db {
     /// ponytail: a scan, because a leading wildcard cannot use an index anyway and ten
     /// thousand short titles compare in about a millisecond. FTS5 is the answer when
     /// chapter *text* becomes searchable for the novel reader, not before.
-    pub fn search(&self, query: &str) -> Result<Vec<SeriesRow>> {
+    pub fn search(&self, query: &str, category: Option<i64>) -> Result<Vec<SeriesRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.title, s.source_id, count(c.id),
                     (SELECT id FROM chapters WHERE series_id = s.id
                      ORDER BY number, title LIMIT 1)
              FROM series s LEFT JOIN chapters c ON c.series_id = s.id
              WHERE s.title LIKE ?1 ESCAPE '\\'
+               AND (?2 IS NULL OR EXISTS (
+                   SELECT 1 FROM series_categories sc
+                   WHERE sc.series_id = s.id AND sc.category_id = ?2))
              GROUP BY s.id ORDER BY s.title",
         )?;
         // The wildcards are ours. Anything typed is literal, so a title containing % or
@@ -397,7 +400,7 @@ impl Db {
             .replace('\\', r"\\")
             .replace('%', r"\%")
             .replace('_', r"\_");
-        let rows = stmt.query_map(params![format!("%{escaped}%")], |r| {
+        let rows = stmt.query_map(params![format!("%{escaped}%"), category], |r| {
             Ok(SeriesRow {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -809,7 +812,7 @@ mod tests {
         ])
         .unwrap();
 
-        let hit = db.search("yotsu").unwrap();
+        let hit = db.search("yotsu", None).unwrap();
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].title, "Yotsubato");
         assert!(
@@ -818,16 +821,42 @@ mod tests {
         );
 
         // A bare % would otherwise match the whole library.
-        let literal = db.search("%").unwrap();
+        let literal = db.search("%", None).unwrap();
         assert_eq!(literal.len(), 1, "% is a character, not a wildcard");
         assert_eq!(literal[0].title, "100% Orange");
 
-        assert!(db.search("nothing here").unwrap().is_empty());
+        assert!(db.search("nothing here", None).unwrap().is_empty());
         assert_eq!(
-            db.search("").unwrap().len(),
+            db.search("", None).unwrap().len(),
             3,
             "an empty query is everything"
         );
+    }
+
+    #[test]
+    fn search_narrows_to_a_category_and_composes_with_the_query() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[
+            scanned("Solo Leveling", "/lib/a", &[("c1", "blake3:a")]),
+            scanned("Tower of God", "/lib/b", &[("c1", "blake3:b")]),
+            scanned("Berserk", "/lib/c", &[("c1", "blake3:c")]),
+        ])
+        .unwrap();
+        let library = db.library().unwrap();
+        db.create_category("Manhwa").unwrap();
+        let manhwa = db.categories().unwrap().remove(0);
+        for row in library.iter().filter(|s| s.title != "Berserk") {
+            db.set_series_category(row.id, manhwa.id, true).unwrap();
+        }
+
+        assert_eq!(db.search("", None).unwrap().len(), 3);
+        assert_eq!(db.search("", Some(manhwa.id)).unwrap().len(), 2);
+
+        // Query and category narrow together rather than replacing one another.
+        let both = db.search("tower", Some(manhwa.id)).unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].title, "Tower of God");
+        assert!(db.search("berserk", Some(manhwa.id)).unwrap().is_empty());
     }
 
     #[test]

@@ -40,6 +40,11 @@
   let busy = $state(false);
   let query = $state("");
   let searchTimer = 0;
+  let cats = $state([]);
+  let activeCat = $state(null);
+  let seriesCats = $state([]);
+  let newCat = $state("");
+  let manageCats = $state(false);
   let error = $state(null);
   let hud = $state({ fps: 0, worst: 0, dropped: 0, mounted: 0, firstPaint: null });
   let rust = $state({});
@@ -230,18 +235,66 @@
     clearTimeout(searchTimer);
     searchTimer = setTimeout(async () => {
       try {
-        series = await invoke("search", { query });
+        series = await invoke("search", { query, category: activeCat });
       } catch (e) {
         error = String(e);
       }
     }, 120);
   }
 
+  const MODES_OPT = [null, "rtl", "ltr", "webtoon"];
+  const modeLabel = (m) => m ?? "detect";
+
+  async function refreshCategories() {
+    try {
+      cats = await invoke("categories");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function filterBy(id) {
+    activeCat = activeCat === id ? null : id;
+    await refreshLibrary();
+  }
+
+  async function addCategory() {
+    const name = newCat.trim();
+    if (!name) return;
+    try {
+      await invoke("create_category", { name });
+      newCat = "";
+      await refreshCategories();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Cycles detect -> rtl -> ltr -> webtoon. "detect" is null, meaning the category
+  /// has no opinion and page shape decides.
+  async function cycleCategoryMode(cat) {
+    const next = MODES_OPT[(MODES_OPT.indexOf(cat.reading_mode) + 1) % MODES_OPT.length];
+    await invoke("set_category_mode", { id: cat.id, mode: next });
+    await refreshCategories();
+  }
+
+  async function toggleSeriesCategory(catId) {
+    if (!openSeries) return;
+    const member = !seriesCats.includes(catId);
+    await invoke("set_series_category", {
+      seriesId: openSeries.id,
+      categoryId: catId,
+      member,
+    });
+    seriesCats = await invoke("categories_of", { seriesId: openSeries.id });
+    await refreshCategories();
+  }
+
   async function refreshLibrary() {
     try {
       base ||= await invoke("tile_base");
       [series, libraryRoots, busy] = await Promise.all([
-        invoke("search", { query }),
+        invoke("search", { query, category: activeCat }),
         invoke("roots"),
         invoke("scanning"),
       ]);
@@ -294,6 +347,7 @@
     openSeries = row;
     try {
       seriesChapters = await invoke("chapters", { seriesId: row.id });
+      seriesCats = await invoke("categories_of", { seriesId: row.id });
     } catch (e) {
       error = String(e);
     }
@@ -680,6 +734,7 @@
       console.warn("could not load settings:", e);
     }
     frames();
+    await refreshCategories();
     await refreshLibrary();
     if (busy) watchScan();
   });
@@ -778,13 +833,57 @@
       </div>
     </div>
 
-    {#if series.length || query}
+    {#if series.length || query || activeCat !== null}
       <input
         class="search"
         placeholder="Search series"
         bind:value={query}
         oninput={onSearch}
       />
+
+      <div class="chips">
+        <button class="chip" class:on={activeCat === null} onclick={() => filterBy(null)}>
+          All
+        </button>
+        {#each cats as cat (cat.id)}
+          <button class="chip" class:on={activeCat === cat.id} onclick={() => filterBy(cat.id)}>
+            {cat.name}
+            <span class="count">{cat.series_count}</span>
+          </button>
+        {/each}
+        <button class="chip ghost" onclick={() => (manageCats = !manageCats)}>
+          {manageCats ? "Done" : "Edit categories"}
+        </button>
+      </div>
+
+      {#if manageCats}
+        <div class="manage">
+          <div class="row">
+            <input placeholder="New category" bind:value={newCat}
+              onkeydown={(e) => e.key === "Enter" && addCategory()} />
+            <button class="chip accent" onclick={addCategory}>Add</button>
+          </div>
+          {#each cats as cat (cat.id)}
+            <div class="row">
+              <span class="name">{cat.name}</span>
+              <!-- A category with no mode leaves detection alone; that is the default
+                   and the common case. -->
+              <button class="chip" onclick={() => cycleCategoryMode(cat)}>
+                reads {modeLabel(cat.reading_mode)}
+              </button>
+              <button
+                class="chip danger"
+                onclick={async () => {
+                  await invoke("delete_category", { id: cat.id });
+                  if (activeCat === cat.id) activeCat = null;
+                  await refreshCategories();
+                  await refreshLibrary();
+                }}>Delete</button
+              >
+            </div>
+          {/each}
+        </div>
+      {/if}
     {/if}
 
     {#if series.length === 0 && !busy}
@@ -811,6 +910,19 @@
 
     {#if openSeries}
       <h2>{openSeries.title}</h2>
+      {#if cats.length}
+        <div class="chips">
+          {#each cats as cat (cat.id)}
+            <button
+              class="chip"
+              class:on={seriesCats.includes(cat.id)}
+              onclick={() => toggleSeriesCategory(cat.id)}
+            >
+              {cat.name}
+            </button>
+          {/each}
+        </div>
+      {/if}
       <div class="chapters">
         {#each seriesChapters as c (c.id)}
           <button class="chapter" onclick={() => load(c)}>
@@ -873,12 +985,42 @@
 </div>
 
 <style>
+  /* DESIGN.md's token layer. The full themes-as-data generator is S2; these are the
+     same names, so that work becomes a swap rather than a rewrite. */
+  :global(:root) {
+    --bg: #0b0b0d;
+    --raised: #141416;
+    --text: #f2f0ea;
+    --text-muted: #8e8b84;
+    --progress: #6f9c7e;
+    --accent: #e0a94e;
+    --accent-soft: #f0c982;
+    --highlight: #6fa8c7;
+    --danger: #e5544a;
+
+    --glass: rgba(255, 255, 255, 0.05);
+    --glass-hover: rgba(255, 255, 255, 0.1);
+    --hairline: rgba(255, 255, 255, 0.1);
+
+    --r-1: 8px;
+    --r-2: 12px;
+    --r-full: 999px;
+
+    --dur-fast: 90ms;
+    --ease: cubic-bezier(0.2, 0, 0, 1);
+  }
   :global(body) {
     margin: 0;
-    background: #0e0e10;
-    color: #e8e6df;
+    background: var(--bg);
+    color: var(--text);
     font: 13px/1.4 "IBM Plex Mono", ui-monospace, monospace;
     overflow: hidden;
+  }
+  /* People read for hours. DESIGN.md, Motion. */
+  @media (prefers-reduced-motion: reduce) {
+    :global(*) {
+      transition: none !important;
+    }
   }
   .scroller {
     position: fixed;
@@ -974,7 +1116,7 @@
     inset: 0;
     overflow-y: auto;
     padding: 24px;
-    background: #0e0e10;
+    background: var(--bg);
   }
   .library h1,
   .library h2 {
@@ -993,27 +1135,102 @@
     gap: 8px;
     align-items: center;
     margin-bottom: 6px;
-    color: #8e8b84;
+    color: var(--text-muted);
   }
   .root input {
     font: inherit;
     flex: 1 1 340px;
     max-width: 460px;
     padding: 4px 8px;
-    background: #1a1a1d;
-    color: #e8e6df;
-    border: 1px solid #ffffff20;
+    background: var(--raised);
+    color: var(--text);
+    border: 1px solid var(--hairline);
   }
   .busy {
-    color: #e0a94e;
+    color: var(--accent);
   }
   .empty {
-    color: #8e8b84;
+    color: var(--text-muted);
   }
   .shelf {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
     gap: 12px;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 16px;
+  }
+  /* kopuz's chip, in our tokens: a pill of glass that fills when selected. */
+  .chip {
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    height: 28px;
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: var(--r-full);
+    background: var(--glass);
+    border: 1px solid var(--hairline);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition:
+      background var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease);
+  }
+  .chip:hover {
+    background: var(--glass-hover);
+    color: var(--text);
+  }
+  .chip.on {
+    background: var(--glass-hover);
+    color: var(--text);
+    border-color: var(--accent);
+  }
+  .chip.ghost {
+    border-style: dashed;
+  }
+  /* Dark ink on amber: white would fail contrast where kopuz's white-on-indigo does
+     not. Same idiom, different accent. */
+  .chip.accent {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #16150f;
+  }
+  .chip.accent:hover {
+    background: var(--accent-soft);
+    color: #16150f;
+  }
+  .chip.danger:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+  .count {
+    color: var(--text-muted);
+  }
+  .manage {
+    margin-bottom: 20px;
+  }
+  .manage .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .manage .name {
+    min-width: 160px;
+  }
+  .manage input {
+    font: inherit;
+    padding: 4px 8px;
+    background: var(--raised);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-1);
   }
   .search {
     font: inherit;
@@ -1030,7 +1247,7 @@
     /* Reserve the 2:3 box before the image arrives so the grid does not reflow as
        covers stream in. */
     aspect-ratio: 2 / 3;
-    background: #ffffff0d;
+    background: var(--glass);
     overflow: hidden;
     margin-bottom: 8px;
   }
@@ -1054,17 +1271,19 @@
     flex-direction: column;
     gap: 2px;
     padding: 10px 12px;
-    background: #ffffff0d;
-    color: #e8e6df;
-    border: 1px solid #ffffff1a;
+    background: var(--glass);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-2);
     cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
   }
   .card:hover,
   .chapter:hover {
-    background: #ffffff1a;
+    background: var(--glass-hover);
   }
   .card.on {
-    border-color: #e0a94e;
+    border-color: var(--accent);
   }
   .chapters {
     display: flex;
@@ -1077,7 +1296,7 @@
     justify-content: space-between;
   }
   .meta {
-    color: #8e8b84;
+    color: var(--text-muted);
   }
   /* The instrumentation only belongs on screen while something is being read. */
   .hud:not(.reading) {

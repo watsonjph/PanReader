@@ -116,14 +116,15 @@ fn library(app: State<App>) -> Result<Vec<pr_db::SeriesRow>, String> {
 }
 
 #[tauri::command]
-fn search(app: State<App>, query: String) -> Result<Vec<pr_db::SeriesRow>, String> {
-    let db = app.db.lock();
-    if query.trim().is_empty() {
-        db.library()
-    } else {
-        db.search(query.trim())
-    }
-    .map_err(|e| format!("{e:#}"))
+fn search(
+    app: State<App>,
+    query: String,
+    category: Option<i64>,
+) -> Result<Vec<pr_db::SeriesRow>, String> {
+    app.db
+        .lock()
+        .search(query.trim(), category)
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
