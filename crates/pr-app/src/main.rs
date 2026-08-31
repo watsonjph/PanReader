@@ -1,5 +1,4 @@
-//! Phase 0 spike. No library, no settings, no design: this exists only to answer
-//! "can a 60,000px strip scroll smoothly through a webview". See ROADMAP.md.
+//! Tauri commands and app state. See ROADMAP.md for where this sits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -16,7 +15,10 @@ use tauri::{Manager, State};
 use tiles::{Chapter, Layout, StatsSnapshot, TileKey};
 
 struct App {
-    chapters: Mutex<HashMap<String, Arc<Chapter>>>,
+    /// Keyed by chapter id, so two chapters of one series are distinct entries and
+    /// reopening one is free.
+    chapters: Mutex<HashMap<i64, Arc<Chapter>>>,
+    scanning: std::sync::atomic::AtomicBool,
     db: Mutex<pr_db::Db>,
     /// Cached so the tile path never touches SQLite. Settings change rarely and are
     /// read on every chapter open.
@@ -31,55 +33,161 @@ impl App {
         tracing::info!(db = %path.display(), ?settings, "opened library");
         Ok(Self {
             chapters: Mutex::new(HashMap::new()),
+            scanning: std::sync::atomic::AtomicBool::new(false),
             db: Mutex::new(db),
             settings: Mutex::new(settings),
         })
     }
 }
 
-/// Hardcoded fixtures, per Phase 0. Override with PANREADER_CBZ / PANREADER_STRIP.
-fn fixture(kind: &str) -> PathBuf {
-    let (var, default) = match kind {
-        "strip" => ("PANREADER_STRIP", "fixtures/strip"),
-        _ => ("PANREADER_CBZ", "fixtures/spike.cbz"),
-    };
-    // `cargo tauri dev` runs the binary with the crate directory as its working dir, not
-    // the workspace root, so anything relative resolves somewhere that does not exist.
-    // Anchor both the defaults and any relative override at the workspace instead.
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    match std::env::var_os(var).map(PathBuf::from) {
-        Some(path) if path.is_absolute() => path,
-        Some(relative) => workspace.join(relative),
-        None => workspace.join(default),
-    }
-}
-
 impl App {
-    fn chapter(&self, kind: &str) -> anyhow::Result<Arc<Chapter>> {
-        if let Some(c) = self.chapters.lock().get(kind) {
-            return Ok(c.clone());
+    /// Open a chapter by id, or hand back the one already open.
+    fn chapter(&self, chapter_id: i64) -> anyhow::Result<Arc<Chapter>> {
+        if let Some(open) = self.chapters.lock().get(&chapter_id) {
+            return Ok(open.clone());
         }
-        let path = fixture(kind);
-        let src = PageSource::open(&path).with_context(|| {
-            format!(
-                "Could not open the {kind} fixture at {}. \
-                 Generate it with `cargo run -p pr-app --example make_fixtures --release`, \
-                 or point PANREADER_CBZ / PANREADER_STRIP at your own files.",
-                path.display()
-            )
-        })?;
-        let default_mode = self.settings.lock().default_reading_mode;
-        let chapter = Arc::new(Chapter::open(kind, src, default_mode)?);
-        self.chapters
+
+        let row = self
+            .db
             .lock()
-            .insert(kind.to_owned(), chapter.clone());
+            .chapter(chapter_id)?
+            .with_context(|| format!("chapter {chapter_id} is not in the library"))?;
+        let path = PathBuf::from(&row.path);
+        let src = PageSource::open(&path)
+            .with_context(|| format!("Could not open {}", path.display()))?;
+
+        let default_mode = self.settings.lock().default_reading_mode;
+        let chapter = Arc::new(Chapter::open(&row.title, src, default_mode)?);
+        self.chapters.lock().insert(chapter_id, chapter.clone());
         Ok(chapter)
+    }
+
+    /// A series cover: the first page of its first chapter, scaled.
+    ///
+    /// Deliberately does not go through `Chapter`, which probes every page's header at
+    /// open. A cover needs exactly one page, and a library screen asks for hundreds of
+    /// them at once. Not cached in memory either: the response is immutable and the
+    /// webview keeps it, so a second look costs nothing.
+    fn cover(&self, chapter_id: i64, width: u32) -> anyhow::Result<Vec<u8>> {
+        let row = self
+            .db
+            .lock()
+            .chapter(chapter_id)?
+            .with_context(|| format!("chapter {chapter_id} is not in the library"))?;
+        let src = PageSource::open(Path::new(&row.path))?;
+        let img = pr_image::decode_scaled(&src.read(0)?, width)?;
+        Ok(pr_image::encode_jpeg(&img, 78)?)
+    }
+
+    /// Walk every root and fold the result in.
+    ///
+    /// Runs on the caller's thread; the command that triggers it spawns, because a scan
+    /// of a real library takes seconds and invariant 7 says a command returns at once.
+    fn scan(&self) -> anyhow::Result<pr_db::ScanSummary> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.scanning.swap(true, SeqCst) {
+            anyhow::bail!("a scan is already running");
+        }
+        let result = (|| {
+            let roots = self.db.lock().roots()?;
+            let mut total = pr_db::ScanSummary::default();
+            for root in roots {
+                let found = pr_archive::scan::scan_root(&root);
+                let summary = self.db.lock().sync(&found)?;
+                total.series += summary.series;
+                total.chapters_added += summary.chapters_added;
+                total.chapters_kept += summary.chapters_kept;
+            }
+            tracing::info!(?total, "scan complete");
+            Ok(total)
+        })();
+        self.scanning.store(false, SeqCst);
+        result
     }
 }
 
 #[tauri::command]
-fn open_chapter(app: State<'_, App>, kind: String, display_w: u32) -> Result<Layout, String> {
-    let chapter = app.chapter(&kind).map_err(|e| format!("{e:#}"))?;
+fn library(app: State<App>) -> Result<Vec<pr_db::SeriesRow>, String> {
+    app.db.lock().library().map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn chapters(app: State<App>, series_id: i64) -> Result<Vec<pr_db::ChapterRow>, String> {
+    app.db
+        .lock()
+        .chapters(series_id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn roots(app: State<App>) -> Result<Vec<String>, String> {
+    app.db
+        .lock()
+        .roots()
+        .map(|rs| {
+            rs.iter()
+                .map(|r| r.to_string_lossy().into_owned())
+                .collect()
+        })
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn add_root(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let dir = PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err(format!("{path} is not a folder"));
+    }
+    app.state::<App>()
+        .db
+        .lock()
+        .add_root(&dir)
+        .map_err(|e| format!("{e:#}"))?;
+    rescan(app)
+}
+
+#[tauri::command]
+fn remove_root(app: State<App>, path: String) -> Result<(), String> {
+    app.db
+        .lock()
+        .remove_root(Path::new(&path))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Returns immediately; the scan runs behind it. The frontend watches `scanning`.
+#[tauri::command]
+fn rescan(app: tauri::AppHandle) -> Result<(), String> {
+    std::thread::spawn(move || {
+        if let Err(e) = app.state::<App>().scan() {
+            tracing::warn!("scan failed: {e:#}");
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn scanning(app: State<App>) -> bool {
+    app.scanning.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Written on every page turn, which is why it is a one-row upsert rather than part of
+/// the settings blob.
+#[tauri::command]
+fn save_position(
+    app: State<App>,
+    chapter_id: i64,
+    page: i64,
+    completed: bool,
+) -> Result<(), String> {
+    app.db
+        .lock()
+        .save_position(chapter_id, page, completed)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn open_chapter(app: State<App>, chapter_id: i64, display_w: u32) -> Result<Layout, String> {
+    let chapter = app.chapter(chapter_id).map_err(|e| format!("{e:#}"))?;
     let layout = chapter.layout(display_w);
     // Start filling the chapter behind the reader straight away. The first page is
     // already on its way over pan:// by the time this returns.
@@ -89,21 +197,21 @@ fn open_chapter(app: State<'_, App>, kind: String, display_w: u32) -> Result<Lay
 
 /// Re-aim the background fill at where the reader actually is.
 #[tauri::command]
-fn warm(app: State<'_, App>, kind: String, page: usize, display_w: u32) {
-    if let Some(chapter) = app.chapters.lock().get(&kind) {
+fn warm(app: State<App>, chapter_id: i64, page: usize, display_w: u32) {
+    if let Some(chapter) = app.chapters.lock().get(&chapter_id) {
         chapter.warm(page, display_w);
     }
 }
 
 #[tauri::command]
-fn settings(app: State<'_, App>) -> pr_core::Settings {
+fn settings(app: State<App>) -> pr_core::Settings {
     app.settings.lock().clone()
 }
 
 /// Persist and adopt. Written whole, because settings change rarely and a blob rewrite
 /// costs nothing at this rate -- unlike reading position, which gets its own table.
 #[tauri::command]
-fn save_settings(app: State<'_, App>, settings: pr_core::Settings) -> Result<(), String> {
+fn save_settings(app: State<App>, settings: pr_core::Settings) -> Result<(), String> {
     app.db
         .lock()
         .save_settings(&settings)
@@ -113,13 +221,13 @@ fn save_settings(app: State<'_, App>, settings: pr_core::Settings) -> Result<(),
 }
 
 #[tauri::command]
-fn stats(app: State<'_, App>, kind: String) -> StatsSnapshot {
+fn stats(app: State<App>, chapter_id: i64) -> StatsSnapshot {
     // Deliberately does not open the chapter. It used to, which meant the HUD's own
     // 250ms poll paid the header probe before you ever pressed a key, and first-paint
     // then measured a warm open while looking like a cold one.
     app.chapters
         .lock()
-        .get(&kind)
+        .get(&chapter_id)
         .map(|c| c.snapshot())
         .unwrap_or_default()
 }
@@ -134,22 +242,32 @@ fn tile_base() -> &'static str {
     }
 }
 
-/// `/t/{kind}/{page}/{tile}/{display_w}` -> JPEG bytes.
+/// `/t/{chapter_id}/{page}/{tile}/{display_w}` -> tile bytes.
+/// `/c/{chapter_id}/{width}` -> a cover.
 ///
 /// Hard invariant 1: image bytes never cross Tauri IPC. They come through here.
 fn serve(app: &App, req: &Request<Vec<u8>>) -> anyhow::Result<tiles::Served> {
     let path = req.uri().path();
     let mut seg = path.trim_start_matches('/').split('/');
-    anyhow::ensure!(seg.next() == Some("t"), "unknown route {path}");
-    let kind = seg.next().context("missing kind")?;
+    let route = seg.next().unwrap_or_default();
     let mut num =
-        || -> anyhow::Result<u32> { Ok(seg.next().context("missing path segment")?.parse()?) };
+        || -> anyhow::Result<i64> { Ok(seg.next().context("missing path segment")?.parse()?) };
+    let chapter_id = num()?;
+
+    if route == "c" {
+        return Ok(tiles::Served {
+            data: Arc::new(app.cover(chapter_id, num()? as u32)?),
+            mime: "image/jpeg",
+        });
+    }
+    anyhow::ensure!(route == "t", "unknown route {path}");
+
     let key = TileKey {
         page: num()? as usize,
-        tile: num()?,
-        w: num()?,
+        tile: num()? as u32,
+        w: num()? as u32,
     };
-    app.chapter(kind)?.tile(key)
+    app.chapter(chapter_id)?.tile(key)
 }
 
 fn main() {
@@ -176,6 +294,7 @@ fn main() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(app)
         .register_asynchronous_uri_scheme_protocol("pan", |ctx, req, responder| {
             let app = ctx.app_handle().clone();
@@ -211,39 +330,16 @@ fn main() {
             stats,
             tile_base,
             settings,
-            save_settings
+            save_settings,
+            library,
+            chapters,
+            roots,
+            add_root,
+            remove_root,
+            rescan,
+            scanning,
+            save_position
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression: the defaults used to be relative, and `cargo tauri dev` runs the
-    /// binary with the crate directory as its working dir. Every chapter then failed to
-    /// open with a bare "cannot find the path specified".
-    #[test]
-    fn default_fixture_paths_do_not_depend_on_the_working_directory() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        assert!(
-            root.join("Cargo.toml").exists(),
-            "workspace root is not two levels above the crate"
-        );
-
-        for kind in ["cbz", "strip"] {
-            let path = fixture(kind);
-            assert!(
-                path.is_absolute(),
-                "{kind} fixture path is relative: {}",
-                path.display()
-            );
-            assert!(
-                path.starts_with(&root),
-                "{kind} fixture escapes the workspace: {}",
-                path.display()
-            );
-        }
-    }
 }
