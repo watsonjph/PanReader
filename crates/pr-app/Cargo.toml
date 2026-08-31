@@ -12,12 +12,16 @@ pr-archive = { version = "0.1.0", path = "../pr-archive" }
 pr-core = { version = "0.1.0", path = "../pr-core" }
 pr-db = { version = "0.1.0", path = "../pr-db" }
 pr-image = { version = "0.1.0", path = "../pr-image" }
+pr-opds = { version = "0.1.0", path = "../pr-opds" }
 rayon = "1.12.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
+tokio = { version = "1.53.1", features = ["rt", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }

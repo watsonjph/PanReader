@@ -46,6 +46,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_position_millis",
         include_str!("../migrations/0005_position_millis.sql"),
     ),
+    (
+        "0006_opds_catalogs",
+        include_str!("../migrations/0006_opds_catalogs.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -184,6 +188,13 @@ pub struct SeriesRow {
     pub unread: i64,
     /// First chapter in reading order. Its first page is the cover.
     pub cover_chapter_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogRow {
+    pub id: i64,
+    pub url: String,
+    pub name: String,
 }
 
 /// Somewhere the reader left off, for the shelf to offer back.
@@ -358,6 +369,35 @@ impl Db {
 
         tx.commit()?;
         Ok(summary)
+    }
+
+    pub fn catalogs(&self) -> Result<Vec<CatalogRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, url, name FROM opds_catalogs ORDER BY name")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CatalogRow {
+                id: r.get(0)?,
+                url: r.get(1)?,
+                name: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn add_catalog(&self, url: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO opds_catalogs (url, name) VALUES (?1, ?2)
+             ON CONFLICT(url) DO UPDATE SET name = excluded.name",
+            params![url, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_catalog(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM opds_catalogs WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     /// What the last scan saw, for the next one to skip.

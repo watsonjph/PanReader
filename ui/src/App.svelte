@@ -37,6 +37,12 @@
   let chapterId = $state(null);
   let chapterTitle = $state("");
   let libraryRoots = $state([]);
+  let catalogs = $state([]);
+  let catalogUrl = $state("");
+  // The catalog being browsed, and the trail back out of it.
+  let opds = $state(null);
+  let opdsTrail = $state([]);
+  let opdsBusy = $state(false);
   let rootInput = $state("");
   let busy = $state(false);
   let query = $state("");
@@ -294,11 +300,12 @@
   async function refreshLibrary() {
     try {
       base ||= await invoke("tile_base");
-      [series, libraryRoots, busy, resume] = await Promise.all([
+      [series, libraryRoots, busy, resume, catalogs] = await Promise.all([
         invoke("search", { query, category: activeCat }),
         invoke("roots"),
         invoke("scanning"),
         invoke("continue_reading"),
+        invoke("catalogs"),
       ]);
     } catch (e) {
       error = String(e);
@@ -318,6 +325,68 @@
       await addRoot();
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  /// Follow a feed. `push` records where we came from so Back works.
+  async function openFeed(url, push = true) {
+    opdsBusy = true;
+    error = null;
+    try {
+      const page = await invoke("opds_browse", { url });
+      if (push && opds) opdsTrail = [...opdsTrail, opds.url];
+      opds = page;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      opdsBusy = false;
+    }
+  }
+
+  async function opdsBack() {
+    const previous = opdsTrail.at(-1);
+    opdsTrail = opdsTrail.slice(0, -1);
+    if (previous) await openFeed(previous, false);
+    else opds = null;
+  }
+
+  async function addCatalog() {
+    const url = catalogUrl.trim();
+    if (!url) return;
+    opdsBusy = true;
+    error = null;
+    try {
+      await invoke("add_catalog", { url });
+      catalogUrl = "";
+      await refreshLibrary();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      opdsBusy = false;
+    }
+  }
+
+  /// Download the first format the image reader can open, falling back to whatever is
+  /// offered. Nothing here needs to know it came from a server: it lands in a library
+  /// root and the rescan treats it as an ordinary local chapter.
+  async function grab(entry) {
+    const downloads = entry.kind.Publication?.downloads ?? [];
+    const pick =
+      downloads.find((d) => /comicbook|zip/.test(d.mime)) ?? downloads[0];
+    if (!pick) return;
+    opdsBusy = true;
+    error = null;
+    try {
+      await invoke("opds_download", {
+        href: pick.href,
+        title: entry.title,
+        mime: pick.mime,
+      });
+      watchScan();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      opdsBusy = false;
     }
   }
 
@@ -845,7 +914,70 @@
         </button>
         {#if busy}<span class="busy">scanning…</span>{/if}
       </div>
+
+      <div class="root">
+        <input
+          placeholder="OPDS catalog URL (Komga, Kavita, Calibre-Web)"
+          bind:value={catalogUrl}
+          onkeydown={(e) => e.key === "Enter" && addCatalog()}
+        />
+        <button onclick={addCatalog}>Add catalog</button>
+        {#if opdsBusy}<span class="busy">working…</span>{/if}
+      </div>
+
+      {#if catalogs.length}
+        <div class="chips">
+          {#each catalogs as cat (cat.id)}
+            <button class="chip" class:on={opds?.url === cat.url}
+              onclick={() => { opdsTrail = []; openFeed(cat.url, false); }}>
+              {cat.name}
+            </button>
+          {/each}
+          {#if opds}
+            <button class="chip ghost" onclick={() => { opds = null; opdsTrail = []; }}>
+              Close catalog
+            </button>
+          {/if}
+        </div>
+      {/if}
     </div>
+
+    {#if opds}
+      <h2 class="section">
+        {#if opdsTrail.length}
+          <button class="chip" onclick={opdsBack}>Back</button>
+        {/if}
+        {opds.feed.title || "Catalog"}
+      </h2>
+
+      {#if opds.feed.entries.length === 0}
+        <p class="empty">This feed is empty.</p>
+      {/if}
+
+      <div class="shelf">
+        {#each opds.feed.entries as entry (entry.id)}
+          {@const nav = entry.kind.Navigation}
+          <button
+            class="card"
+            onclick={() => (nav ? openFeed(nav.href) : grab(entry))}
+          >
+            <div class="cover">
+              {#if entry.thumbnail}
+                <img src={entry.thumbnail} alt="" loading="lazy" decoding="async" />
+              {/if}
+            </div>
+            <b>{entry.title}</b>
+            <span class="meta">
+              {nav ? "browse" : entry.author ?? "download"}
+            </span>
+          </button>
+        {/each}
+      </div>
+
+      {#if opds.feed.next}
+        <button class="chip" onclick={() => openFeed(opds.feed.next)}>Next page</button>
+      {/if}
+    {/if}
 
     {#if series.length || query || activeCat !== null}
       <input

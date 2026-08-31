@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod opds;
 mod tiles;
 
 use anyhow::Context;
@@ -76,15 +77,13 @@ impl App {
         Ok(chapter)
     }
 
-    /// A series cover: the first page of its first chapter, scaled.
+    /// A series cover: the first page of its first chapter, scaled, decoded once ever.
     ///
     /// Deliberately does not go through `Chapter`, which probes every page's header at
     /// open. A cover needs exactly one page, and a library screen asks for hundreds of
-    /// them at once. Not cached in memory either: the response is immutable and the
-    /// webview keeps it, so a second look costs nothing.
-    /// A series cover, decoded once ever.
+    /// them at once.
     ///
-    /// The webview caches these for the session, so this is about the cold start: a
+    /// The webview caches these for the session, so the file is about the cold start: a
     /// five hundred series shelf otherwise opens five hundred archives before it can
     /// paint. A chapter row is matched by content identity, so an id implies fixed
     /// bytes and the file never goes stale — changed content lands on a new row.
@@ -143,6 +142,85 @@ impl App {
         self.scanning.store(false, SeqCst);
         result
     }
+}
+
+#[tauri::command]
+fn catalogs(app: State<App>) -> Result<Vec<pr_db::CatalogRow>, String> {
+    app.db.lock().catalogs().map_err(|e| format!("{e:#}"))
+}
+
+/// Add a catalog, verifying it is one before saving it.
+///
+/// A URL that is not a feed is a typo far more often than it is a server problem, and
+/// finding that out at add time is much clearer than an empty browse later.
+#[tauri::command]
+async fn add_catalog(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let page = opds::browse(url.trim())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let name = if page.feed.title.is_empty() {
+        url.clone()
+    } else {
+        page.feed.title.clone()
+    };
+    app.state::<App>()
+        .db
+        .lock()
+        .add_catalog(url.trim(), &name)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn remove_catalog(app: State<App>, id: i64) -> Result<(), String> {
+    app.db
+        .lock()
+        .remove_catalog(id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn opds_browse(url: String) -> Result<opds::Page, String> {
+    opds::browse(&url).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Download a publication into a library root, then fold it into the library.
+///
+/// The rescan is the whole integration: a downloaded file is an ordinary local chapter
+/// the moment it lands, so nothing else in the app needs to know it came from a server.
+/// It goes in the root flat rather than in a subfolder, because `scan_root` reads a
+/// loose archive as a series of one and a subfolder would instead read as one series
+/// called "downloads" with every unrelated book as its chapters.
+///
+/// ponytail: the first library root. Deterministic, and right whenever there is one.
+/// Give the download button a root picker when someone actually keeps several.
+#[tauri::command]
+async fn opds_download(
+    app: tauri::AppHandle,
+    href: String,
+    title: String,
+    mime: String,
+) -> Result<String, String> {
+    let root = app
+        .state::<App>()
+        .db
+        .lock()
+        .roots()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .next()
+        .ok_or("add a library folder first, so there is somewhere to download to")?;
+
+    let path = opds::download(&href, &title, &mime, &root)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = handle.state::<App>().scan() {
+            tracing::warn!("scan after download failed: {e:#}");
+        }
+    });
+    Ok(path.display().to_string())
 }
 
 /// The shelf's resume row. Small and fixed, so it is a command rather than a route.
@@ -473,6 +551,11 @@ fn main() {
             save_position,
             search,
             continue_reading,
+            catalogs,
+            add_catalog,
+            remove_catalog,
+            opds_browse,
+            opds_download,
             categories,
             create_category,
             delete_category,
