@@ -3,7 +3,7 @@
   // Names from the same file the colours come from, so adding a theme still touches
   // data/themes.json and nothing else.
   import themeData from "../../data/themes.json";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, isMock, mockCover } from "./ipc.js";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     clickStep,
@@ -59,6 +59,85 @@
   let seriesCats = $state([]);
   let newCat = $state("");
   let manageCats = $state(false);
+  let listView = $state(false);
+
+  /// The one series the home screen leads with: whatever you are furthest into, or the
+  /// newest thing in the library if you have not started anything.
+  const featuredResume = $derived(resume[0] ?? null);
+  const featured = $derived.by(() => {
+    if (featuredResume) {
+      const match = series.find((r) => r.id === featuredResume.series_id);
+      if (match) return match;
+    }
+    return [...series].sort((a, b) => b.added_at - a.added_at)[0] ?? null;
+  });
+
+  /// Horizontal rows above the grid. Derived from what the shelf already has rather
+  /// than from three more queries: the whole library is in hand, and sorting ten
+  /// thousand rows client-side is cheaper than three round trips.
+  ///
+  /// ponytail: fixed composition. DESIGN.md wants these user-configurable and
+  /// reorderable; that is a config schema and a drag affordance for a screen nobody has
+  /// used yet. Add it when someone wants a different set.
+  const rows = $derived.by(() => {
+    if (query || activeCat !== null) return [];
+    const byId = new Map(series.map((r) => [r.id, r]));
+    const continuing = resume
+      .map((r) => ({ resume: r, series: byId.get(r.series_id) }))
+      .filter((x) => x.series)
+      .map((x) => ({
+        key: `c${x.resume.chapter_id}`,
+        series: x.series,
+        resume: x.resume,
+        coverId: x.resume.chapter_id,
+        note: `${x.resume.page + 1} / ${x.resume.page_count}`,
+      }));
+
+    const plain = (r, note) => ({
+      key: `s${r.id}`,
+      series: r,
+      resume: null,
+      coverId: r.cover_chapter_id,
+      note,
+    });
+
+    return [
+      { name: "Continue reading", items: continuing },
+      {
+        name: "Recently added",
+        items: [...series]
+          .sort((a, b) => b.added_at - a.added_at)
+          .slice(0, 12)
+          .map((r) => plain(r, `${r.chapter_count} chapters`)),
+      },
+      {
+        name: "Unread",
+        items: series
+          .filter((r) => r.chapter_count > 0 && r.unread === r.chapter_count)
+          .slice(0, 12)
+          .map((r) => plain(r, `${r.chapter_count} chapters`)),
+      },
+    ];
+  });
+
+  /// Scroll a rail by most of its width, from a button inside that rail's header.
+  function nudge(event, direction) {
+    const rail = event.currentTarget.closest(".strip")?.querySelector(".rail");
+    if (!rail) return;
+    rail.scrollBy({
+      left: direction * rail.clientWidth * 0.8,
+      behavior: reduceMotion ? "auto" : "smooth",
+    });
+  }
+
+  /// Which section of the shell is showing. Nav is a view switch, nothing more.
+  let section = $state("library");
+  let navIcons = $state(false);
+  const NAV = [
+    { id: "library", name: "Library", icon: "▤" },
+    { id: "catalogs", name: "Catalogs", icon: "☁" },
+    { id: "settings", name: "Settings", icon: "⚙" },
+  ];
   let error = $state(null);
   let hud = $state({ fps: 0, worst: 0, dropped: 0, mounted: 0, firstPaint: null });
   let rust = $state({});
@@ -192,6 +271,12 @@
       .map(([id, t]) => ({ id, name: t.name })),
   ];
   let theme = $state("ink");
+  let systemDark = $state(true);
+  /// Whether the theme in force paints light type on a dark ground.
+  const themeIsDark = $derived.by(() => {
+    const id = theme === "system" ? (systemDark ? "ink" : "day") : theme;
+    return themeData[id]?.dark ?? true;
+  });
   let liveBg = $state(true);
   let reduceMotion = $state(false);
   /// Eight "r,g,b" strings from the cover currently on screen, or null for a flat --bg.
@@ -212,18 +297,26 @@
 
   const liveStyle = $derived.by(() => {
     if (!palette) return "";
+    // Extracted colours are luminance-capped so *light* type survives them, which is
+    // the right rule for a dark theme and exactly wrong for Daylight: the same field
+    // that carries white type swallows near-black type. On a light theme the art
+    // becomes a wash over --bg instead of a ground of its own.
+    const alpha = themeIsDark ? 0.8 : 0.14;
     const layers = STOPS.map(
       (at, i) =>
-        `radial-gradient(circle at ${at}, rgba(${palette[i + 1]}, 0.8) 0%, transparent 80%)`,
+        `radial-gradient(circle at ${at}, rgba(${palette[i + 1]}, ${alpha}) 0%, transparent 80%)`,
     );
-    return `background-color: rgb(${palette[0]}); background-image: ${layers.join(", ")};`;
+    const base = themeIsDark
+      ? `background-color: rgb(${palette[0]});`
+      : `background-color: transparent;`;
+    return `${base} background-image: ${layers.join(", ")};`;
   });
 
   /// Apply the theme by class, so the generated CSS does the work and there is no
   /// second copy of any colour in JS.
   function applyTheme() {
-    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const id = theme === "system" ? (dark ? "ink" : "day") : theme;
+    systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const id = theme === "system" ? (systemDark ? "ink" : "day") : theme;
     document.documentElement.className = `theme-${id}${
       reduceMotion ? " reduce-motion" : ""
     }`;
@@ -392,7 +485,8 @@
     }
   }
 
-  const coverUrl = (chapterId) => `${base}/c/${chapterId}/${COVER_W}`;
+  const coverUrl = (chapterId) =>
+    isMock ? mockCover(chapterId) : `${base}/c/${chapterId}/${COVER_W}`;
 
   /// The system folder picker. Pasting a path worked but is not how anyone expects to
   /// add a folder.
@@ -556,6 +650,7 @@
           theme,
           live_background: liveBg,
           reduce_animations: reduceMotion,
+          list_view: listView,
         },
       }).catch((e) => console.warn("could not save settings:", e));
     }, 500);
@@ -911,6 +1006,7 @@
       theme = saved.theme ?? "ink";
       liveBg = saved.live_background ?? true;
       reduceMotion = saved.reduce_animations ?? false;
+      listView = saved.list_view ?? false;
     } catch (e) {
       console.warn("could not load settings:", e);
     }
@@ -997,259 +1093,458 @@
        cross-fade is a compositor opacity change and never repaints the shelf. -->
   <div class="live" style={liveStyle} aria-hidden="true"></div>
 
-  <div class="library">
-    <header class="bar">
-      <h1>Library</h1>
-      <div class="chips">
-        {#each THEMES as t (t.id)}
+  <div class="shell">
+    <!-- Nav only, collapsible to icons. DESIGN.md, Layout shell. -->
+    <nav class="sidebar" class:icons={navIcons} aria-label="Sections">
+      <button
+        class="nav collapse"
+        onclick={() => (navIcons = !navIcons)}
+        aria-expanded={!navIcons}
+        title={navIcons ? "Expand" : "Collapse"}
+      >
+        <span class="ico">{navIcons ? "»" : "«"}</span>
+        {#if !navIcons}<span class="label">PanReader</span>{/if}
+      </button>
+
+      {#each NAV as item (item.id)}
+        <button
+          class="nav"
+          class:on={section === item.id}
+          aria-current={section === item.id ? "page" : undefined}
+          title={navIcons ? item.name : null}
+          onclick={() => (section = item.id)}
+        >
+          <span class="tick" aria-hidden="true"></span>
+          <span class="ico">{item.icon}</span>
+          {#if !navIcons}<span class="label">{item.name}</span>{/if}
+        </button>
+      {/each}
+    </nav>
+
+    <main class="main">
+      {#if error}
+        <p class="error" role="alert">{error}</p>
+      {/if}
+
+      {#if section === "library"}
+        <header class="bar">
+          <h1>Library</h1>
+          <input
+            class="search"
+            placeholder="Search series"
+            bind:value={query}
+            oninput={onSearch}
+          />
+        </header>
+
+        <div class="chips">
+          <button class="chip" class:on={activeCat === null} onclick={() => filterBy(null)}>
+            All
+          </button>
+          {#each cats as cat (cat.id)}
+            <button
+              class="chip"
+              class:on={activeCat === cat.id}
+              onclick={() => filterBy(cat.id)}
+            >
+              {cat.name}
+              <span class="count">{cat.series_count}</span>
+            </button>
+          {/each}
+          <button class="chip ghost" onclick={() => (manageCats = !manageCats)}>
+            {manageCats ? "Done" : "Edit categories"}
+          </button>
+        </div>
+
+        {#if manageCats}
+          <div class="manage">
+            <div class="row">
+              <input
+                placeholder="New category"
+                bind:value={newCat}
+                onkeydown={(e) => e.key === "Enter" && addCategory()}
+              />
+              <button class="chip accent" onclick={addCategory}>Add</button>
+            </div>
+            {#each cats as cat (cat.id)}
+              <div class="row">
+                <span class="name">{cat.name}</span>
+                <!-- A category with no mode leaves detection alone; that is the
+                     default and the common case. -->
+                <button class="chip" onclick={() => cycleCategoryMode(cat)}>
+                  reads {modeLabel(cat.reading_mode)}
+                </button>
+                <button
+                  class="chip danger"
+                  onclick={async () => {
+                    await invoke("delete_category", { id: cat.id });
+                    if (activeCat === cat.id) activeCat = null;
+                    await refreshCategories();
+                    await refreshLibrary();
+                  }}>Delete</button
+                >
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- The showcase: one large cover bleeding to the edges of a rounded panel,
+             the title at --text-2xl, one primary action. DESIGN.md, Layout shell. -->
+        {#if featured && !query && activeCat === null}
+          <section class="showcase">
+            {#if base && featured.cover_chapter_id !== null}
+              <img
+                class="art"
+                src={coverUrl(featured.cover_chapter_id)}
+                alt=""
+                decoding="async"
+              />
+            {/if}
+            <div class="veil" aria-hidden="true"></div>
+            <div class="say">
+              <span class="eyebrow">
+                {featuredResume ? "Continue reading" : "In your library"}
+              </span>
+              <h2>{featured.title}</h2>
+              <span class="meta">
+                {#if featuredResume}
+                  {featuredResume.chapter_title} · page {featuredResume.page + 1} of
+                  {featuredResume.page_count}
+                {:else}
+                  {featured.chapter_count} chapter{featured.chapter_count === 1 ? "" : "s"}
+                  {#if featured.unread > 0}· {featured.unread} unread{/if}
+                {/if}
+              </span>
+              <div class="chips">
+                <button
+                  class="chip accent"
+                  onclick={() =>
+                    featuredResume
+                      ? load({
+                          id: featuredResume.chapter_id,
+                          title: featuredResume.chapter_title,
+                          page: featuredResume.page,
+                          page_frac: featuredResume.page_frac,
+                        })
+                      : showSeries(featured)}
+                >
+                  {featuredResume ? "Resume" : "Open"}
+                </button>
+                <button class="chip" onclick={() => showSeries(featured)}>Chapters</button>
+              </div>
+            </div>
+          </section>
+        {/if}
+
+        {#each rows as row (row.name)}
+          {#if row.items.length}
+            <section class="strip">
+              <header class="strip-head">
+                <h2 class="section">{row.name}</h2>
+                <div class="chips">
+                  <button class="chip" aria-label="Scroll {row.name} left"
+                    onclick={(e) => nudge(e, -1)}>‹</button>
+                  <button class="chip" aria-label="Scroll {row.name} right"
+                    onclick={(e) => nudge(e, 1)}>›</button>
+                </div>
+              </header>
+              <div class="rail">
+                {#each row.items as row_item (row_item.key)}
+                  <button
+                    class="card"
+                    class:on={openSeries?.id === row_item.series.id}
+                    onclick={() =>
+                      row_item.resume
+                        ? load({
+                            id: row_item.resume.chapter_id,
+                            title: row_item.resume.chapter_title,
+                            page: row_item.resume.page,
+                            page_frac: row_item.resume.page_frac,
+                          })
+                        : showSeries(row_item.series)}
+                  >
+                    <div class="cover">
+                      {#if base && row_item.coverId !== null}
+                        <img
+                          src={coverUrl(row_item.coverId)}
+                          alt=""
+                          loading="lazy"
+                          decoding="async"
+                        />
+                      {/if}
+                      {#if row_item.resume}
+                        <div
+                          class="progress"
+                          style="width:{((row_item.resume.page + 1) /
+                            row_item.resume.page_count) * 100}%"
+                        ></div>
+                      {:else if row_item.series.unread > 0 && row_item.series.unread < row_item.series.chapter_count}
+                        <span class="badge">{row_item.series.unread}</span>
+                      {/if}
+                    </div>
+                    <b>{row_item.series.title}</b>
+                    <span class="meta">{row_item.note}</span>
+                  </button>
+                {/each}
+              </div>
+            </section>
+          {/if}
+        {/each}
+
+        <header class="strip-head">
+          <h2 class="section">
+            {query || activeCat !== null ? "Results" : "All series"}
+          </h2>
           <button
             class="chip"
-            class:on={theme === t.id}
-            aria-pressed={theme === t.id}
+            aria-pressed={listView}
             onclick={() => {
-              theme = t.id;
-              applyTheme();
+              listView = !listView;
               persist();
-            }}
+            }}>{listView ? "Grid" : "List"}</button
           >
-            {t.name}
-          </button>
-        {/each}
-        <button
-          class="chip"
-          class:on={liveBg}
-          aria-pressed={liveBg}
-          onclick={() => {
-            liveBg = !liveBg;
-            if (!liveBg) palette = null;
-            else showLive(openSeries?.cover_chapter_id ?? resume[0]?.chapter_id);
-            persist();
-          }}>Live background</button
-        >
-        <button
-          class="chip"
-          class:on={reduceMotion}
-          aria-pressed={reduceMotion}
-          onclick={() => {
-            reduceMotion = !reduceMotion;
-            applyTheme();
-            persist();
-          }}>Reduce motion</button
-        >
-      </div>
-    </header>
+        </header>
 
-    <div class="roots">
-      {#each libraryRoots as root (root)}
-        <div class="root">
-          <span>{root}</span>
-          <button
-            onclick={async () => {
-              await invoke("remove_root", { path: root });
-              refreshLibrary();
-            }}>remove</button
-          >
-        </div>
-      {/each}
-      <div class="root">
-        <button onclick={pickFolder}>Add folder…</button>
-        <input
-          placeholder="…or paste a path"
-          bind:value={rootInput}
-          onkeydown={(e) => e.key === "Enter" && addRoot()}
-        />
-        <button onclick={async () => { await invoke("rescan"); watchScan(); }}>
-          Rescan
-        </button>
-        {#if busy}<span class="busy">scanning…</span>{/if}
-      </div>
-
-      <div class="root">
-        <input
-          placeholder="OPDS catalog URL (Komga, Kavita, Calibre-Web)"
-          bind:value={catalogUrl}
-          onkeydown={(e) => e.key === "Enter" && addCatalog()}
-        />
-        <button onclick={addCatalog}>Add catalog</button>
-        {#if opdsBusy}<span class="busy">working…</span>{/if}
-      </div>
-
-      {#if catalogs.length}
-        <div class="chips">
-          {#each catalogs as cat (cat.id)}
-            <button class="chip" class:on={opds?.url === cat.url}
-              onclick={() => { opdsTrail = []; openFeed(cat.url, false); }}>
-              {cat.name}
-            </button>
-          {/each}
-          {#if opds}
-            <button class="chip ghost" onclick={() => { opds = null; opdsTrail = []; }}>
-              Close catalog
-            </button>
-          {/if}
-        </div>
-      {/if}
-    </div>
-
-    {#if opds}
-      <h2 class="section">
-        {#if opdsTrail.length}
-          <button class="chip" onclick={opdsBack}>Back</button>
+        {#if series.length === 0 && !busy}
+          <p class="empty">
+            {query
+              ? `Nothing matches “${query}”.`
+              : "Add a folder to start your library."}
+          </p>
         {/if}
-        {opds.feed.title || "Catalog"}
-      </h2>
 
-      {#if libraryRoots.length > 1}
-        <div class="chips">
-          <span class="meta">Download into</span>
-          {#each libraryRoots as root (root)}
+        <div class="shelf" class:list={listView}>
+          {#each series as row (row.id)}
             <button
-              class="chip"
-              class:on={(downloadRoot ?? libraryRoots[0]) === root}
-              onclick={() => (downloadRoot = root)}
+              class="card"
+              class:on={openSeries?.id === row.id}
+              onclick={() => showSeries(row)}
             >
-              {root}
+              <div class="cover">
+                {#if row.cover_chapter_id !== null && base}
+                  <img
+                    src={coverUrl(row.cover_chapter_id)}
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                  />
+                {/if}
+                {#if row.unread > 0 && row.unread < row.chapter_count}
+                  <span class="badge">{row.unread}</span>
+                {/if}
+              </div>
+              <b>{row.title}</b>
+              <span class="meta">
+                {row.chapter_count} chapter{row.chapter_count === 1 ? "" : "s"}
+              </span>
             </button>
           {/each}
         </div>
       {/if}
 
-      {#if opds.feed.entries.length === 0}
-        <p class="empty">This feed is empty.</p>
-      {/if}
-
-      <div class="shelf">
-        {#each opds.feed.entries as entry (entry.id)}
-          {@const nav = entry.kind.Navigation}
-          <button
-            class="card"
-            onclick={() => (nav ? openFeed(nav.href) : grab(entry))}
-          >
-            <div class="cover">
-              {#if entry.thumbnail}
-                <img src={entry.thumbnail} alt="" loading="lazy" decoding="async" />
+      {#if section === "catalogs"}
+        <header class="bar">
+          <h1>{opds ? opds.feed.title || "Catalog" : "Catalogs"}</h1>
+          {#if opds}
+            <div class="chips">
+              {#if opdsTrail.length}
+                <button class="chip" onclick={opdsBack}>Back</button>
               {/if}
-            </div>
-            <b>{entry.title}</b>
-            <span class="meta">
-              {nav ? "browse" : entry.author ?? "download"}
-            </span>
-          </button>
-        {/each}
-      </div>
-
-      {#if opds.feed.next}
-        <button class="chip" onclick={() => openFeed(opds.feed.next)}>Next page</button>
-      {/if}
-    {/if}
-
-    {#if series.length || query || activeCat !== null}
-      <input
-        class="search"
-        placeholder="Search series"
-        bind:value={query}
-        oninput={onSearch}
-      />
-
-      <div class="chips">
-        <button class="chip" class:on={activeCat === null} onclick={() => filterBy(null)}>
-          All
-        </button>
-        {#each cats as cat (cat.id)}
-          <button class="chip" class:on={activeCat === cat.id} onclick={() => filterBy(cat.id)}>
-            {cat.name}
-            <span class="count">{cat.series_count}</span>
-          </button>
-        {/each}
-        <button class="chip ghost" onclick={() => (manageCats = !manageCats)}>
-          {manageCats ? "Done" : "Edit categories"}
-        </button>
-      </div>
-
-      {#if manageCats}
-        <div class="manage">
-          <div class="row">
-            <input placeholder="New category" bind:value={newCat}
-              onkeydown={(e) => e.key === "Enter" && addCategory()} />
-            <button class="chip accent" onclick={addCategory}>Add</button>
-          </div>
-          {#each cats as cat (cat.id)}
-            <div class="row">
-              <span class="name">{cat.name}</span>
-              <!-- A category with no mode leaves detection alone; that is the default
-                   and the common case. -->
-              <button class="chip" onclick={() => cycleCategoryMode(cat)}>
-                reads {modeLabel(cat.reading_mode)}
-              </button>
               <button
-                class="chip danger"
-                onclick={async () => {
-                  await invoke("delete_category", { id: cat.id });
-                  if (activeCat === cat.id) activeCat = null;
-                  await refreshCategories();
-                  await refreshLibrary();
-                }}>Delete</button
+                class="chip ghost"
+                onclick={() => {
+                  opds = null;
+                  opdsTrail = [];
+                }}>Close</button
               >
             </div>
-          {/each}
-        </div>
-      {/if}
-    {/if}
+          {/if}
+        </header>
 
-    {#if series.length === 0 && !busy}
-      <p class="empty">
-        {query ? `Nothing matches “${query}”.` : "Add a folder to start your library."}
-      </p>
-    {/if}
-
-
-    <div class="shelf">
-      {#each series as row (row.id)}
-        <button class="card" class:on={openSeries?.id === row.id} onclick={() => showSeries(row)}>
-          <div class="cover">
-            {#if row.cover_chapter_id !== null && base}
-              <img src={coverUrl(row.cover_chapter_id)} alt="" loading="lazy" decoding="async" />
-            {/if}
-            {#if row.unread > 0 && row.unread < row.chapter_count}
-              <span class="badge">{row.unread}</span>
-            {/if}
+        {#if !opds}
+          <div class="row">
+            <input
+              placeholder="OPDS catalog URL (Komga, Kavita, Calibre-Web)"
+              bind:value={catalogUrl}
+              onkeydown={(e) => e.key === "Enter" && addCatalog()}
+            />
+            <button class="chip accent" onclick={addCatalog}>Add catalog</button>
+            {#if opdsBusy}<span class="meta">working…</span>{/if}
           </div>
-          <b>{row.title}</b>
-          <span class="meta">
-            {row.chapter_count} chapter{row.chapter_count === 1 ? "" : "s"}
-          </span>
-        </button>
-      {/each}
-    </div>
 
-    {#if openSeries}
-      <h2>{openSeries.title}</h2>
-      {#if cats.length}
+          {#if catalogs.length === 0}
+            <p class="empty">Add an OPDS catalog to browse it.</p>
+          {/if}
+
+          <div class="chips">
+            {#each catalogs as cat (cat.id)}
+              <button
+                class="chip"
+                onclick={() => {
+                  opdsTrail = [];
+                  openFeed(cat.url, false);
+                }}>{cat.name}</button
+              >
+            {/each}
+          </div>
+        {:else}
+          {#if libraryRoots.length > 1}
+            <div class="chips">
+              <span class="meta">Download into</span>
+              {#each libraryRoots as root (root)}
+                <button
+                  class="chip"
+                  class:on={(downloadRoot ?? libraryRoots[0]) === root}
+                  onclick={() => (downloadRoot = root)}
+                >
+                  {root}
+                </button>
+              {/each}
+            </div>
+          {/if}
+
+          {#if opds.feed.entries.length === 0}
+            <p class="empty">This feed is empty.</p>
+          {/if}
+
+          <div class="shelf">
+            {#each opds.feed.entries as entry (entry.id)}
+              {@const nav = entry.kind.Navigation}
+              <button class="card" onclick={() => (nav ? openFeed(nav.href) : grab(entry))}>
+                <div class="cover">
+                  {#if entry.thumbnail}
+                    <img src={entry.thumbnail} alt="" loading="lazy" decoding="async" />
+                  {/if}
+                </div>
+                <b>{entry.title}</b>
+                <span class="meta">{nav ? "Browse" : (entry.author ?? "Download")}</span>
+              </button>
+            {/each}
+          </div>
+
+          {#if opds.feed.next}
+            <button class="chip" onclick={() => openFeed(opds.feed.next)}>Next page</button>
+          {/if}
+        {/if}
+      {/if}
+
+      {#if section === "settings"}
+        <header class="bar"><h1>Settings</h1></header>
+
+        <h2 class="section">Library folders</h2>
+        {#each libraryRoots as root (root)}
+          <div class="row">
+            <span class="name grow">{root}</span>
+            <button
+              class="chip danger"
+              onclick={async () => {
+                await invoke("remove_root", { path: root });
+                refreshLibrary();
+              }}>Remove</button
+            >
+          </div>
+        {/each}
+        <div class="row">
+          <button class="chip accent" onclick={pickFolder}>Add folder…</button>
+          <input
+            placeholder="…or paste a path"
+            bind:value={rootInput}
+            onkeydown={(e) => e.key === "Enter" && addRoot()}
+          />
+          <button
+            class="chip"
+            onclick={async () => {
+              await invoke("rescan");
+              watchScan();
+            }}>Rescan</button
+          >
+          {#if busy}<span class="meta">scanning…</span>{/if}
+        </div>
+
+        <h2 class="section">Theme</h2>
         <div class="chips">
-          {#each cats as cat (cat.id)}
+          {#each THEMES as t (t.id)}
             <button
               class="chip"
-              class:on={seriesCats.includes(cat.id)}
-              onclick={() => toggleSeriesCategory(cat.id)}
+              class:on={theme === t.id}
+              aria-pressed={theme === t.id}
+              onclick={() => {
+                theme = t.id;
+                applyTheme();
+                persist();
+              }}
             >
-              {cat.name}
+              {t.name}
             </button>
           {/each}
         </div>
+
+        <h2 class="section">Appearance</h2>
+        <div class="chips">
+          <button
+            class="chip"
+            class:on={liveBg}
+            aria-pressed={liveBg}
+            onclick={() => {
+              liveBg = !liveBg;
+              if (!liveBg) palette = null;
+              else showLive(openSeries?.cover_chapter_id ?? resume[0]?.chapter_id);
+              persist();
+            }}>Live background</button
+          >
+          <button
+            class="chip"
+            class:on={reduceMotion}
+            aria-pressed={reduceMotion}
+            onclick={() => {
+              reduceMotion = !reduceMotion;
+              applyTheme();
+              persist();
+            }}>Reduce motion</button
+          >
+        </div>
       {/if}
-      <div class="chapters">
-        {#each seriesChapters as c (c.id)}
-          <button class="chapter" onclick={() => load(c)}>
-            <span>{c.title}</span>
-            <span class="meta">
-              {c.page_count} pages
-              {#if c.completed}· read{:else if c.page > 0}· page {c.page + 1}{/if}
-            </span>
+    </main>
+
+    <!-- Side panel: the chapter list, dismissible. Shared by both readers when the
+         text reader lands, which is why it is a region and not a section of main. -->
+    {#if openSeries}
+      <aside class="panel" aria-label="Chapters">
+        <header class="panel-head">
+          <b>{openSeries.title}</b>
+          <button class="chip ghost" onclick={() => (openSeries = null)} title="Close">
+            ✕
           </button>
-        {/each}
-      </div>
+        </header>
+
+        {#if cats.length}
+          <div class="chips">
+            {#each cats as cat (cat.id)}
+              <button
+                class="chip"
+                class:on={seriesCats.includes(cat.id)}
+                onclick={() => toggleSeriesCategory(cat.id)}
+              >
+                {cat.name}
+              </button>
+            {/each}
+          </div>
+        {/if}
+
+        <div class="chapters">
+          {#each seriesChapters as c (c.id)}
+            <button class="chapter" class:read={c.completed} onclick={() => load(c)}>
+              <span class="name">{c.title}</span>
+              <span class="meta">
+                {c.page_count} pages
+                {#if c.completed}· read{:else if c.page > 0}· page {c.page + 1}{/if}
+              </span>
+            </button>
+          {/each}
+        </div>
+      </aside>
     {/if}
-  </div>
+
   <!-- Signature 2. A floating card, not a docked strip: inset, translucent, and the
        only element in the app carrying --shadow-float. Present on every library
        screen, absent inside the reader. -->
@@ -1278,6 +1573,8 @@
       </span>
     </button>
   {/if}
+  </div>
+
 {/if}
 
 <!-- Signature 3: koma progress. Not a percentage and not a scrubber. -->
@@ -1341,6 +1638,246 @@
   /* Signature 1. Fixed behind everything, cross-fading on --dur-base when the
      selection changes. It never animates its gradients -- only its opacity -- so the
      transition is a compositor job and the shelf above it is not repainted. */
+  /* The showcase. One cover bleeding to the edges of a rounded panel, the title at the
+     largest step, one primary action. DESIGN.md, Layout shell. */
+  .showcase {
+    position: relative;
+    display: flex;
+    align-items: flex-end;
+    min-height: 260px;
+    margin-bottom: var(--s-6);
+    padding: var(--s-5);
+    border-radius: var(--r-3);
+    border: 1px solid var(--hairline);
+    overflow: hidden;
+  }
+  /* The cover itself, bleeding to the panel edges -- not a blurred wash of it. The
+     art is the point; a blur would make this a second live background. */
+  .showcase .art {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    /* Covers are portrait and the panel is wide, so bias to the upper third, which is
+       where cover art puts its subject. */
+    object-position: 50% 25%;
+  }
+  /* Type sits on art, so it gets a scrim rather than hoping the art is dark. Left to
+     right, because the type is on the left and the art should survive on the right. */
+  .showcase .veil {
+    position: absolute;
+    inset: 0;
+    background:
+      linear-gradient(
+        to right,
+        var(--scrim) 0%,
+        color-mix(in srgb, var(--scrim) 85%, transparent) 45%,
+        transparent 100%
+      ),
+      linear-gradient(to top, var(--scrim) 0%, transparent 60%);
+  }
+  .showcase .say {
+    position: relative;
+    max-width: 60ch;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+  }
+  .showcase .eyebrow {
+    font: 600 var(--text-xs) / 1 var(--font-display);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  /* A series title, so --font-body. The mono face has no CJK coverage. */
+  .showcase h2 {
+    margin: 0;
+    font: 600 var(--text-2xl) / var(--leading-tight) var(--font-body);
+  }
+
+  /* Horizontal rows. Hidden scrollbar, paired arrows, snap so a nudge lands on a card
+     edge rather than mid-cover. */
+  .strip {
+    margin-bottom: var(--s-5);
+  }
+  .strip-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s-3);
+  }
+  .rail {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 150px;
+    gap: var(--s-3);
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+    padding-bottom: var(--s-1);
+  }
+  .rail::-webkit-scrollbar {
+    display: none;
+  }
+  .rail > .card {
+    scroll-snap-align: start;
+  }
+
+  /* Grid and list share the card markup exactly, so the toggle flips one class rather
+     than re-rendering every card. DESIGN.md, Quality floor. */
+  .shelf.list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-1);
+  }
+  .shelf.list .card {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--s-3);
+    padding: var(--s-1) var(--s-2);
+    border-radius: var(--r-1);
+  }
+  .shelf.list .cover {
+    width: 32px;
+    flex: none;
+    margin-bottom: 0;
+  }
+  .shelf.list b {
+    margin-top: 0;
+    flex: 1;
+  }
+
+  /* Four regions, and only the main area scrolls. DESIGN.md, Layout shell. */
+  .shell {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    /* One row, and every region placed explicitly. The resume bar shares main's cell
+       rather than being auto-placed, which would otherwise push the side panel into a
+       second row it was never meant to have. */
+    grid-template-rows: 100%;
+    /* No background: depth is translucency over the live layer, so an opaque fill
+       here would paint Signature 1 out. */
+  }
+  .sidebar {
+    grid-column: 1;
+    grid-row: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 208px;
+    padding: var(--s-3) var(--s-2);
+    border-right: 1px solid var(--hairline);
+    overflow-y: auto;
+    transition: width var(--dur-base) var(--ease);
+  }
+  .sidebar.icons {
+    width: 56px;
+  }
+  /* kopuz's nav row, in our tokens: a rounded row that fills on hover and stays
+     filled when active, with a short tick growing in on the leading edge. */
+  .nav {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--s-3);
+    padding: var(--s-3);
+    border: 0;
+    border-radius: var(--r-1);
+    background: transparent;
+    color: var(--text-muted);
+    /* A label we author, in Latin, so the display face is right here. User content
+       never gets it. */
+    font: 500 var(--text-sm) / 1 var(--font-display);
+    text-align: left;
+    cursor: pointer;
+    transition:
+      background var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease);
+  }
+  .nav:hover {
+    background: var(--glass);
+    color: var(--text);
+  }
+  .nav.on {
+    background: var(--glass-hover);
+    color: var(--text);
+  }
+  .nav .tick {
+    position: absolute;
+    left: 0;
+    width: 2px;
+    height: 0;
+    border-radius: 0 2px 2px 0;
+    background: var(--accent);
+    transition: height var(--dur-base) var(--ease);
+  }
+  .nav:hover .tick {
+    height: 14px;
+  }
+  .nav.on .tick {
+    height: 22px;
+  }
+  .nav .ico {
+    width: 20px;
+    text-align: center;
+    font-size: 15px;
+    flex: none;
+  }
+  .nav.collapse {
+    color: var(--text-muted);
+    margin-bottom: var(--s-3);
+  }
+
+  .main {
+    grid-column: 2;
+    grid-row: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: var(--s-5);
+    /* Clearance for the floating resume bar, which overlaps rather than docks. */
+    padding-bottom: 108px;
+  }
+
+  .panel {
+    grid-column: 3;
+    grid-row: 1;
+    width: 320px;
+    padding: var(--s-4);
+    border-left: 1px solid var(--hairline);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-3);
+  }
+  .panel-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--s-2);
+  }
+  /* A series title can hold CJK, so it never takes the mono display face. */
+  .panel-head b {
+    font: 600 var(--text-base) / var(--leading-tight) var(--font-body);
+  }
+
+  /* Below 900px the side panel collapses first, then the sidebar goes to icons. */
+  @media (max-width: 900px) {
+    .panel {
+      display: none;
+    }
+  }
+  @media (max-width: 680px) {
+    .sidebar {
+      width: 56px;
+    }
+    .sidebar .label {
+      display: none;
+    }
+  }
   .live {
     position: fixed;
     inset: 0;
@@ -1366,11 +1903,12 @@
   /* Signature 2. Inset from the window edges, and the only --shadow-float in the app.
      If everything is floating, nothing is. */
   .resume-bar {
-    position: fixed;
-    left: var(--s-5);
-    right: var(--s-5);
-    bottom: var(--s-5);
+    grid-column: 2;
+    grid-row: 1;
+    align-self: end;
+    margin: var(--s-5);
     z-index: 3;
+    position: relative;
     display: flex;
     align-items: center;
     gap: var(--s-4);
@@ -1532,29 +2070,38 @@
     top: 12px;
     right: 12px;
     padding: 12px;
-    background: #1a1a1dee;
-    border: 1px solid #ffffff20;
+    background: color-mix(in srgb, var(--raised) 93%, transparent);
+    backdrop-filter: blur(var(--blur-chrome));
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-2);
     min-width: 210px;
   }
   .hud hr {
     border: 0;
-    border-top: 1px solid #ffffff20;
+    border-top: 1px solid var(--hairline);
     margin: 8px 0;
   }
   .hud b {
-    color: #6f9c7e;
+    color: var(--progress);
   }
-  button {
+  /* Only buttons that carry no class of their own. A bare `button:hover` rule
+     outspecifies `.card` and was tinting cover cards on hover, which is exactly the
+     frame DESIGN.md says a card must not have. */
+  button:where(:not([class])) {
     font: inherit;
-    background: #e8e6df;
-    color: var(--ink-on-accent);
-    border: 0;
-    padding: 3px 7px;
+    background: var(--glass);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-1);
+    padding: var(--s-1) var(--s-2);
     cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
+  }
+  button:where(:not([class])):hover:not(:disabled) {
+    background: var(--glass-hover);
   }
   button:disabled {
-    background: #55524a;
-    color: #e8e6df;
+    color: var(--text-muted);
     cursor: default;
   }
   .broken {
@@ -1564,21 +2111,10 @@
     transform: translateX(-50%);
     margin: 0;
     padding: 6px 10px;
-    background: #b33a2b;
-    color: #fff;
+    background: var(--danger);
+    color: var(--ink-on-danger);
+    border-radius: var(--r-1);
     white-space: nowrap;
-  }
-  .library {
-    position: fixed;
-    inset: 0;
-    overflow-y: auto;
-    padding: var(--s-5);
-    /* Deliberately no background. Depth in this app is translucency over the live
-       layer, so an opaque fill here would paint Signature 1 out. The flat --bg comes
-       from body, which shows through when there is no palette. */
-    z-index: 1;
-    /* Room for the floating resume bar to sit over rather than on top of content. */
-    padding-bottom: 108px;
   }
   .library h1,
   .library h2 {
@@ -1599,14 +2135,29 @@
     margin-bottom: 6px;
     color: var(--text-muted);
   }
-  .root input {
+  input {
     font: inherit;
-    flex: 1 1 340px;
-    max-width: 460px;
-    padding: 4px 8px;
-    background: var(--raised);
+    flex: 1 1 280px;
+    min-width: 0;
+    padding: var(--s-2) var(--s-3);
+    background: var(--glass);
     color: var(--text);
     border: 1px solid var(--hairline);
+    border-radius: var(--r-1);
+  }
+  input::placeholder {
+    color: var(--text-muted);
+  }
+  /* Rows of controls in settings and the catalog form. */
+  .row {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    margin-bottom: var(--s-2);
+    flex-wrap: wrap;
+  }
+  .row .grow {
+    flex: 1;
   }
   .busy {
     color: var(--accent);
@@ -1686,24 +2237,16 @@
   .manage .name {
     min-width: 160px;
   }
-  .manage input {
-    font: inherit;
-    padding: 4px 8px;
-    background: var(--raised);
-    color: var(--text);
-    border: 1px solid var(--hairline);
-    border-radius: var(--r-1);
-  }
   .search {
     font: inherit;
     display: block;
     width: 100%;
     max-width: 460px;
-    margin-bottom: 16px;
-    padding: 6px 10px;
-    background: #1a1a1d;
-    color: #e8e6df;
-    border: 1px solid #ffffff20;
+    padding: var(--s-2) var(--s-3);
+    background: var(--glass);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-1);
   }
   .cover {
     /* Reserve the 2:3 box before the image arrives so the grid does not reflow as
@@ -1757,38 +2300,73 @@
        scrollbar honest, so a ten thousand cover library still scrolls like a list. */
     content-visibility: auto;
     contain-intrinsic-size: auto 300px;
-  }
-  .card,
-  .chapter {
     font: inherit;
     text-align: left;
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: 10px 12px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text);
+    cursor: pointer;
+  }
+  /* The title, which can hold CJK and so never takes the mono display face.
+     Clamped to two lines: an unclamped long title pushes its own meta line down and
+     the grid row stops aligning with its neighbours. */
+  .card b {
+    font: 600 var(--text-sm) / var(--leading-tight) var(--font-body);
+    margin-top: var(--s-2);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  /* Rows align because every card is the same height, whatever its title does. */
+  .shelf .card {
+    align-content: start;
+  }
+  .chapter {
+    font: inherit;
+    text-align: left;
+    display: flex;
+    /* Title left, page count right: a chapter row is a line of a list, and the counts
+       line up down the edge because they are tabular. */
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--s-3);
+    padding: var(--s-2) var(--s-3);
     background: var(--glass);
     color: var(--text);
     border: 1px solid var(--hairline);
-    border-radius: var(--r-2);
+    border-radius: var(--r-1);
     cursor: pointer;
     transition: background var(--dur-fast) var(--ease);
   }
-  .card:hover,
+  .chapter .name {
+    font: 500 var(--text-sm) / var(--leading-tight) var(--font-body);
+  }
+  .chapter.read .name {
+    color: var(--text-muted);
+  }
   .chapter:hover {
     background: var(--glass-hover);
   }
-  .card.on {
-    border-color: var(--accent);
+  /* A card has no surface to tint, so hover and selection live on the cover itself:
+     the art lifts slightly and the selected one is ringed. */
+  .card:hover .cover {
+    outline: 1px solid var(--hairline);
+  }
+  .card.on .cover {
+    outline: 2px solid var(--accent);
+    outline-offset: 0;
   }
   .chapters {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    max-width: 620px;
-  }
-  .chapter {
-    flex-direction: row;
-    justify-content: space-between;
+    gap: var(--s-1);
   }
   .meta {
     color: var(--text-muted);
@@ -1803,8 +2381,9 @@
     bottom: 12px;
     max-width: 60ch;
     margin: 0;
-    padding: 12px;
-    background: #b33a2b;
-    color: #fff;
+    padding: var(--s-3);
+    background: var(--danger);
+    color: var(--ink-on-danger);
+    border-radius: var(--r-1);
   }
 </style>
