@@ -62,6 +62,23 @@ impl App {
         Ok(chapter)
     }
 
+    /// A series cover: the first page of its first chapter, scaled.
+    ///
+    /// Deliberately does not go through `Chapter`, which probes every page's header at
+    /// open. A cover needs exactly one page, and a library screen asks for hundreds of
+    /// them at once. Not cached in memory either: the response is immutable and the
+    /// webview keeps it, so a second look costs nothing.
+    fn cover(&self, chapter_id: i64, width: u32) -> anyhow::Result<Vec<u8>> {
+        let row = self
+            .db
+            .lock()
+            .chapter(chapter_id)?
+            .with_context(|| format!("chapter {chapter_id} is not in the library"))?;
+        let src = PageSource::open(Path::new(&row.path))?;
+        let img = pr_image::decode_scaled(&src.read(0)?, width)?;
+        Ok(pr_image::encode_jpeg(&img, 78)?)
+    }
+
     /// Walk every root and fold the result in.
     ///
     /// Runs on the caller's thread; the command that triggers it spawns, because a scan
@@ -225,16 +242,26 @@ fn tile_base() -> &'static str {
     }
 }
 
-/// `/t/{chapter_id}/{page}/{tile}/{display_w}` -> JPEG bytes.
+/// `/t/{chapter_id}/{page}/{tile}/{display_w}` -> tile bytes.
+/// `/c/{chapter_id}/{width}` -> a cover.
 ///
 /// Hard invariant 1: image bytes never cross Tauri IPC. They come through here.
 fn serve(app: &App, req: &Request<Vec<u8>>) -> anyhow::Result<tiles::Served> {
     let path = req.uri().path();
     let mut seg = path.trim_start_matches('/').split('/');
-    anyhow::ensure!(seg.next() == Some("t"), "unknown route {path}");
+    let route = seg.next().unwrap_or_default();
     let mut num =
         || -> anyhow::Result<i64> { Ok(seg.next().context("missing path segment")?.parse()?) };
     let chapter_id = num()?;
+
+    if route == "c" {
+        return Ok(tiles::Served {
+            data: Arc::new(app.cover(chapter_id, num()? as u32)?),
+            mime: "image/jpeg",
+        });
+    }
+    anyhow::ensure!(route == "t", "unknown route {path}");
+
     let key = TileKey {
         page: num()? as usize,
         tile: num()? as u32,
@@ -267,6 +294,7 @@ fn main() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(app)
         .register_asynchronous_uri_scheme_protocol("pan", |ctx, req, responder| {
             let app = ctx.app_handle().clone();

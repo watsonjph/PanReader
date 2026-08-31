@@ -1,6 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     clickStep,
     fitScale,
@@ -26,6 +27,8 @@
   /// Gap between pages, in CSS px. Zero is a seamless webtoon; anything above it is
   /// what Mihon calls CONTINUOUS_VERTICAL. One setting beats two modes.
   const PADS = [0, 8, 16, 32];
+  /// Cover request width in device px: twice the drawn card, so HiDPI stays sharp.
+  const COVER_W = 320;
 
   let series = $state([]);
   let seriesChapters = $state([]);
@@ -220,11 +223,28 @@
 
   async function refreshLibrary() {
     try {
+      base ||= await invoke("tile_base");
       [series, libraryRoots, busy] = await Promise.all([
         invoke("library"),
         invoke("roots"),
         invoke("scanning"),
       ]);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  const coverUrl = (chapterId) => `${base}/c/${chapterId}/${COVER_W}`;
+
+  /// The system folder picker. Pasting a path worked but is not how anyone expects to
+  /// add a folder.
+  async function pickFolder() {
+    error = null;
+    try {
+      const picked = await openDialog({ directory: true, multiple: false });
+      if (!picked) return; // cancelled
+      rootInput = picked;
+      await addRoot();
     } catch (e) {
       error = String(e);
     }
@@ -729,12 +749,12 @@
         </div>
       {/each}
       <div class="root">
+        <button onclick={pickFolder}>Add folder…</button>
         <input
-          placeholder="Paste a folder path, then Add"
+          placeholder="…or paste a path"
           bind:value={rootInput}
           onkeydown={(e) => e.key === "Enter" && addRoot()}
         />
-        <button onclick={addRoot}>Add folder</button>
         <button onclick={async () => { await invoke("rescan"); watchScan(); }}>
           Rescan
         </button>
@@ -749,8 +769,15 @@
     <div class="shelf">
       {#each series as row (row.id)}
         <button class="card" class:on={openSeries?.id === row.id} onclick={() => showSeries(row)}>
+          <div class="cover">
+            {#if row.cover_chapter_id !== null && base}
+              <img src={coverUrl(row.cover_chapter_id)} alt="" loading="lazy" decoding="async" />
+            {/if}
+          </div>
           <b>{row.title}</b>
-          <span>{row.chapter_count} chapter{row.chapter_count === 1 ? "" : "s"}</span>
+          <span class="meta">
+            {row.chapter_count} chapter{row.chapter_count === 1 ? "" : "s"}
+          </span>
         </button>
       {/each}
     </div>
@@ -957,9 +984,23 @@
     color: #8e8b84;
   }
   .shelf {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+  }
+  .cover {
+    /* Reserve the 2:3 box before the image arrives so the grid does not reflow as
+       covers stream in. */
+    aspect-ratio: 2 / 3;
+    background: #ffffff0d;
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .cover img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
   }
   .card,
   .chapter {
@@ -967,7 +1008,7 @@
     text-align: left;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
     padding: 10px 12px;
     background: #ffffff0d;
     color: #e8e6df;

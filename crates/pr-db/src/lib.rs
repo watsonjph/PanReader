@@ -172,6 +172,8 @@ pub struct SeriesRow {
     pub title: String,
     pub path: String,
     pub chapter_count: i64,
+    /// First chapter in reading order. Its first page is the cover.
+    pub cover_chapter_id: Option<i64>,
 }
 
 /// A chapter as the library lists it, with wherever the reader got to.
@@ -303,7 +305,9 @@ impl Db {
 
     pub fn library(&self) -> Result<Vec<SeriesRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.title, s.source_id, count(c.id)
+            "SELECT s.id, s.title, s.source_id, count(c.id),
+                    (SELECT id FROM chapters WHERE series_id = s.id
+                     ORDER BY number, title LIMIT 1)
              FROM series s LEFT JOIN chapters c ON c.series_id = s.id
              GROUP BY s.id ORDER BY s.title",
         )?;
@@ -313,6 +317,7 @@ impl Db {
                 title: r.get(1)?,
                 path: r.get(2)?,
                 chapter_count: r.get(3)?,
+                cover_chapter_id: r.get(4)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())

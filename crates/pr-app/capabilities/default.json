@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Phase 0 spike: window control only. App commands need no permission.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "Window control and a folder picker. App commands need no permission.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open"
+  ]
 }
