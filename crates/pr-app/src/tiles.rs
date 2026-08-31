@@ -246,7 +246,7 @@ impl Chapter {
         let meta = src
             .read_sidecar("ComicInfo.xml")
             .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|x| pr_core::parse_manga_flag(&x));
+            .and_then(|x| pr_core::parse_comic_info(&x).manga);
         let dims: Vec<(u32, u32)> = pages.iter().map(|p| p.dims).collect();
         let reading = pr_core::detect(&dims, meta, series_override, default_mode);
         tracing::info!(?reading, "reading mode");

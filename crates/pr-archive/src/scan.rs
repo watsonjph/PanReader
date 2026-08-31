@@ -21,6 +21,11 @@ pub struct Cached {
     pub size: u64,
     pub identity: String,
     pub page_count: usize,
+    /// The conclusions of the last scan, not just its identity. A chapter titled and
+    /// numbered from its ComicInfo.xml must not fall back to its filename on a rescan
+    /// that never opens it.
+    pub title: String,
+    pub number: Option<f64>,
 }
 
 /// Path to what the last scan saw there.
@@ -152,9 +157,9 @@ fn chapter_at(path: &Path, known: &Known) -> Option<ScannedChapter> {
         && hit.size == size
     {
         return Some(ScannedChapter {
-            number: chapter_number(&title),
+            number: hit.number,
             path: path.to_owned(),
-            title,
+            title: hit.title.clone(),
             page_count: hit.page_count,
             identity: hit.identity.clone(),
             mtime,
@@ -175,10 +180,20 @@ fn chapter_at(path: &Path, known: &Known) -> Option<ScannedChapter> {
         .inspect_err(|e| tracing::warn!(path = %path.display(), "no identity: {e}"))
         .ok()?;
 
+    // Real metadata beats guessing at a filename. Deliberately not the series name:
+    // the folder is what the reader organised and what they expect on the shelf, and
+    // chapters of one series routinely disagree about <Series>, leaving no principled
+    // winner. Number and title are per-chapter and have no such conflict.
+    let info = src
+        .read_sidecar("ComicInfo.xml")
+        .and_then(|x| String::from_utf8(x).ok())
+        .map(|x| pr_core::parse_comic_info(&x))
+        .unwrap_or_default();
+
     Some(ScannedChapter {
-        number: chapter_number(&title),
+        number: info.number.or_else(|| chapter_number(&title)),
         path: path.to_owned(),
-        title,
+        title: info.title.unwrap_or(title),
         page_count: src.len(),
         identity,
         mtime,
@@ -401,11 +416,18 @@ mod tests {
                 size: seen.size,
                 identity: "blake3:from-the-cache".into(),
                 page_count: 99,
+                title: "From The Cache".into(),
+                number: Some(7.0),
             },
         );
 
         let again = scan_root(&root, &known);
         assert_eq!(again[0].chapters[0].identity, "blake3:from-the-cache");
+        assert_eq!(
+            again[0].chapters[0].title, "From The Cache",
+            "a rescan keeps what the last scan concluded, not the filename"
+        );
+        assert_eq!(again[0].chapters[0].number, Some(7.0));
         assert_eq!(
             again[0].chapters[0].page_count, 99,
             "an unchanged chapter is never opened"
@@ -417,6 +439,33 @@ mod tests {
         let fresh = scan_root(&root, &known);
         assert_eq!(fresh[0].chapters[0].page_count, 2);
         assert_ne!(fresh[0].chapters[0].identity, "blake3:from-the-cache");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn comicinfo_names_and_numbers_a_chapter_where_the_filename_cannot() {
+        let root = tmp("pr_scan_comicinfo");
+        // The documented failure of filename parsing: the year wins.
+        let dir = root.join("S").join("Yotsuba (2020)");
+        page(&dir, "p1.jpg");
+
+        let bare = scan_root(&root, &Known::new());
+        assert_eq!(bare[0].chapters[0].number, Some(2020.0), "filename only");
+
+        std::fs::write(
+            dir.join("ComicInfo.xml"),
+            "<ComicInfo><Title>Danbo Arrives</Title><Number>4</Number>             <Series>Ignored On Purpose</Series></ComicInfo>",
+        )
+        .unwrap();
+
+        let tagged = scan_root(&root, &Known::new());
+        assert_eq!(tagged[0].chapters[0].number, Some(4.0));
+        assert_eq!(tagged[0].chapters[0].title, "Danbo Arrives");
+        assert_eq!(
+            tagged[0].title, "S",
+            "the series name stays the folder the reader organised"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

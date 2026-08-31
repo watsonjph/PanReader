@@ -145,6 +145,15 @@ impl App {
     }
 }
 
+/// The shelf's resume row. Small and fixed, so it is a command rather than a route.
+#[tauri::command]
+fn continue_reading(app: State<App>) -> Result<Vec<pr_db::ResumeRow>, String> {
+    app.db
+        .lock()
+        .continue_reading(12)
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command]
 fn search(
     app: State<App>,
@@ -463,6 +472,7 @@ fn main() {
             scanning,
             save_position,
             search,
+            continue_reading,
             categories,
             create_category,
             delete_category,

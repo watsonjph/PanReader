@@ -3054,6 +3054,7 @@ name = "pr-archive"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "pr-core",
  "thiserror 2.0.20",
  "tracing",
  "zip",

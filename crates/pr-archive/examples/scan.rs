@@ -22,6 +22,8 @@ fn main() {
                     size: c.size,
                     identity: c.identity.clone(),
                     page_count: c.page_count,
+                    title: c.title.clone(),
+                    number: c.number,
                 },
             )
         })

@@ -42,6 +42,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0004_chapter_stamp",
         include_str!("../migrations/0004_chapter_stamp.sql"),
     ),
+    (
+        "0005_position_millis",
+        include_str!("../migrations/0005_position_millis.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -176,8 +180,22 @@ pub struct SeriesRow {
     pub title: String,
     pub path: String,
     pub chapter_count: i64,
+    /// Chapters not finished. A series with none is read to the end.
+    pub unread: i64,
     /// First chapter in reading order. Its first page is the cover.
     pub cover_chapter_id: Option<i64>,
+}
+
+/// Somewhere the reader left off, for the shelf to offer back.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumeRow {
+    pub chapter_id: i64,
+    pub series_id: i64,
+    pub series_title: String,
+    pub chapter_title: String,
+    pub number: Option<f64>,
+    pub page: i64,
+    pub page_count: i64,
 }
 
 /// A chapter as the library lists it, with wherever the reader got to.
@@ -347,9 +365,9 @@ impl Db {
     /// One query for the whole library rather than a lookup per chapter: ten thousand
     /// rows of four small columns is nothing next to the I/O it saves.
     pub fn known(&self) -> Result<pr_archive::scan::Known> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, mtime, size, source_id, page_count FROM chapters")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT path, mtime, size, source_id, page_count, title, number FROM chapters",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 PathBuf::from(r.get::<_, String>(0)?),
@@ -358,6 +376,8 @@ impl Db {
                     size: r.get::<_, i64>(2)? as u64,
                     identity: r.get(3)?,
                     page_count: r.get::<_, i64>(4)? as usize,
+                    title: r.get(5)?,
+                    number: r.get(6)?,
                 },
             ))
         })?;
@@ -403,9 +423,12 @@ impl Db {
     pub fn search(&self, query: &str, category: Option<i64>) -> Result<Vec<SeriesRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.title, s.source_id, count(c.id),
+                    coalesce(sum(CASE WHEN p.completed = 1 THEN 0 ELSE 1 END), 0),
                     (SELECT id FROM chapters WHERE series_id = s.id
                      ORDER BY number, title LIMIT 1)
-             FROM series s LEFT JOIN chapters c ON c.series_id = s.id
+             FROM series s
+             LEFT JOIN chapters c ON c.series_id = s.id
+             LEFT JOIN positions p ON p.chapter_id = c.id
              WHERE s.title LIKE ?1 ESCAPE '\\'
                AND (?2 IS NULL OR EXISTS (
                    SELECT 1 FROM series_categories sc
@@ -424,7 +447,39 @@ impl Db {
                 title: r.get(1)?,
                 path: r.get(2)?,
                 chapter_count: r.get(3)?,
-                cover_chapter_id: r.get(4)?,
+                unread: r.get(4)?,
+                cover_chapter_id: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Where to pick back up, most recently read first.
+    ///
+    /// Finished chapters are excluded, and so is one still on page zero: opening
+    /// something and closing it immediately is not a thing to offer back. One row per
+    /// series, or six chapters of one title would be the whole list.
+    pub fn continue_reading(&self, limit: i64) -> Result<Vec<ResumeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, s.id, s.title, c.title, c.number, p.page, c.page_count,
+                    max(p.updated_at)
+             FROM positions p
+             JOIN chapters c ON c.id = p.chapter_id
+             JOIN series s ON s.id = c.series_id
+             WHERE p.completed = 0 AND p.page > 0
+             GROUP BY s.id
+             ORDER BY max(p.updated_at) DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(ResumeRow {
+                chapter_id: r.get(0)?,
+                series_id: r.get(1)?,
+                series_title: r.get(2)?,
+                chapter_title: r.get(3)?,
+                number: r.get(4)?,
+                page: r.get(5)?,
+                page_count: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -575,7 +630,7 @@ impl Db {
     pub fn save_position(&self, chapter_id: i64, page: i64, completed: bool) -> Result<()> {
         self.conn.execute(
             "INSERT INTO positions (chapter_id, page, completed, updated_at)
-             VALUES (?1, ?2, ?3, unixepoch())
+             VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
              ON CONFLICT(chapter_id) DO UPDATE
              SET page = excluded.page, completed = excluded.completed,
                  updated_at = excluded.updated_at",
@@ -938,5 +993,62 @@ mod tests {
             checksum("CREATE TABLE x;\r\nSELECT 1;")
         );
         assert_ne!(checksum("CREATE TABLE x;"), checksum("CREATE TABLE y;"));
+    }
+
+    #[test]
+    fn continue_reading_offers_the_latest_chapter_of_each_series_and_skips_finished() {
+        let mut db = Db::open_memory().unwrap();
+        db.sync(&[
+            scanned("A", "/lib/A", &[("A1", "blake3:a1"), ("A2", "blake3:a2")]),
+            scanned("B", "/lib/B", &[("B1", "blake3:b1")]),
+            scanned("C", "/lib/C", &[("C1", "blake3:c1")]),
+        ])
+        .unwrap();
+
+        let id = |identity: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT id FROM chapters WHERE source_id = ?1",
+                    params![identity],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        db.save_position(id("blake3:a1"), 5, false).unwrap();
+        db.save_position(id("blake3:a2"), 9, false).unwrap();
+        db.save_position(id("blake3:b1"), 3, true).unwrap();
+        // Opened and closed without reading. Not somewhere to be sent back to.
+        db.save_position(id("blake3:c1"), 0, false).unwrap();
+
+        // Stamped explicitly. Two saves can land in the same millisecond, and the
+        // ordering rule is what is under test, not the clock.
+        for (identity, at) in [("blake3:a1", 100), ("blake3:a2", 200)] {
+            db.conn
+                .execute(
+                    "UPDATE positions SET updated_at = ?2 WHERE chapter_id = ?1",
+                    params![id(identity), at],
+                )
+                .unwrap();
+        }
+
+        let resume = db.continue_reading(10).unwrap();
+        assert_eq!(
+            resume.len(),
+            1,
+            "one row per series, and only series actually in progress"
+        );
+        assert_eq!(resume[0].series_title, "A");
+        assert_eq!(
+            resume[0].chapter_title, "A2",
+            "the most recently read chapter of the series, not the first"
+        );
+        assert_eq!(resume[0].page, 9);
+
+        let shelf = db.search("", None).unwrap();
+        let unread = |title: &str| shelf.iter().find(|r| r.title == title).unwrap().unread;
+        assert_eq!(unread("A"), 2, "neither chapter is finished");
+        assert_eq!(unread("B"), 0, "its only chapter is read");
+        assert_eq!(unread("C"), 1);
     }
 }

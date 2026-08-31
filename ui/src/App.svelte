@@ -31,6 +31,7 @@
   const COVER_W = 320;
 
   let series = $state([]);
+  let resume = $state([]);
   let seriesChapters = $state([]);
   let openSeries = $state(null);
   let chapterId = $state(null);
@@ -293,10 +294,11 @@
   async function refreshLibrary() {
     try {
       base ||= await invoke("tile_base");
-      [series, libraryRoots, busy] = await Promise.all([
+      [series, libraryRoots, busy, resume] = await Promise.all([
         invoke("search", { query, category: activeCat }),
         invoke("roots"),
         invoke("scanning"),
+        invoke("continue_reading"),
       ]);
     } catch (e) {
       error = String(e);
@@ -904,12 +906,42 @@
       </p>
     {/if}
 
+    <!-- Where you were, before what you own. A reader who opens the app is far more
+         often resuming than browsing. -->
+    {#if resume.length && !query && activeCat === null}
+      <h2 class="section">Continue reading</h2>
+      <div class="shelf resume">
+        {#each resume as r (r.chapter_id)}
+          <button
+            class="card"
+            onclick={() =>
+              load({ id: r.chapter_id, title: r.chapter_title, page: r.page })}
+          >
+            <div class="cover">
+              {#if base}
+                <img src={coverUrl(r.chapter_id)} alt="" loading="lazy" decoding="async" />
+              {/if}
+              <div class="progress" style="width:{((r.page + 1) / r.page_count) * 100}%"></div>
+            </div>
+            <b>{r.series_title}</b>
+            <span class="meta">
+              {r.chapter_title} · {r.page + 1}/{r.page_count}
+            </span>
+          </button>
+        {/each}
+      </div>
+      <h2 class="section">Library</h2>
+    {/if}
+
     <div class="shelf">
       {#each series as row (row.id)}
         <button class="card" class:on={openSeries?.id === row.id} onclick={() => showSeries(row)}>
           <div class="cover">
             {#if row.cover_chapter_id !== null && base}
               <img src={coverUrl(row.cover_chapter_id)} alt="" loading="lazy" decoding="async" />
+            {/if}
+            {#if row.unread > 0 && row.unread < row.chapter_count}
+              <span class="badge">{row.unread}</span>
             {/if}
           </div>
           <b>{row.title}</b>
@@ -1262,6 +1294,39 @@
     background: var(--glass);
     overflow: hidden;
     margin-bottom: 8px;
+    /* Anchors the unread badge and the progress bar. */
+    position: relative;
+  }
+  .section {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin: 0 0 10px;
+  }
+  /* The one place a raw accent bar is right: it is progress, not decoration. */
+  .progress {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 3px;
+    background: var(--progress);
+  }
+  /* Unread count, shown only when some are read -- an untouched series would put the
+     same number on every card, which tells the reader nothing. */
+  .badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: var(--r-full);
+    background: var(--accent);
+    color: #16150f;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
   }
   .cover img {
     width: 100%;

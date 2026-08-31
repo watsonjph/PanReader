@@ -184,23 +184,138 @@ pub fn detect(
     }
 }
 
-/// Pull the `Manga` field out of a ComicInfo.xml.
+/// What a ComicInfo.xml says about a chapter.
 ///
-/// ponytail: a substring scan, not an XML parser. ComicInfo is a flat document with no
-/// namespaces and this reads one element of it. Phase 2 parses the whole thing for
-/// series and chapter metadata; move this onto that parser then rather than adding an
-/// XML dependency for a single tag.
-pub fn parse_manga_flag(xml: &str) -> Option<MangaFlag> {
-    let start = xml.find("<Manga>")? + "<Manga>".len();
-    let rest = &xml[start..];
-    let value = rest[..rest.find("</Manga>")?].trim();
+/// The ComicRack schema as Mylar, Komga, Kavita and every CBZ tagger write it. Absent
+/// fields are `None`; a present but empty field is also `None`, because taggers emit
+/// `<Series />` for "not set" and an empty title is worse than no title.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ComicInfo {
+    pub series: Option<String>,
+    pub title: Option<String>,
+    pub number: Option<f64>,
+    pub volume: Option<i64>,
+    /// Chapters in the series, when the tagger knew.
+    pub count: Option<i64>,
+    pub summary: Option<String>,
+    pub writer: Option<String>,
+    pub penciller: Option<String>,
+    pub publisher: Option<String>,
+    pub genre: Option<String>,
+    pub tags: Option<String>,
+    pub characters: Option<String>,
+    pub age_rating: Option<String>,
+    pub web: Option<String>,
+    /// ISO code. The source language for translation, eventually.
+    pub language: Option<String>,
+    pub year: Option<i64>,
+    pub month: Option<i64>,
+    pub day: Option<i64>,
+    /// What the tagger claimed. We count the real pages and trust those instead; this
+    /// is here because a mismatch is a useful signal that a file was modified.
+    pub page_count: Option<i64>,
+    pub manga: Option<MangaFlag>,
+}
 
-    Some(match value {
-        v if v.eq_ignore_ascii_case("YesAndRightToLeft") => MangaFlag::YesAndRightToLeft,
-        v if v.eq_ignore_ascii_case("Yes") => MangaFlag::Yes,
-        v if v.eq_ignore_ascii_case("No") => MangaFlag::No,
-        _ => MangaFlag::Unknown,
-    })
+/// The five predefined entities and numeric references.
+///
+/// Taggers write `&amp;` in series titles constantly, and a title reading
+/// `Fullmetal Alchemist &amp; Co` is a visible bug on the shelf.
+fn unescape(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let Some(semi) = tail.find(';').filter(|i| *i <= 10) else {
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let body = &tail[1..semi];
+        let resolved = match body {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => body
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => n.parse().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match resolved {
+            Some(c) => out.push(c),
+            // Not an entity we know. Leave it exactly as written rather than eating it.
+            None => out.push_str(&tail[..=semi]),
+        }
+        rest = &tail[semi + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text of one top-level element.
+///
+/// ponytail: a substring scan, not an XML parser. ComicInfo is flat, has no namespaces
+/// and is machine-written, so the shapes a real parser buys — nesting, attributes on
+/// these elements, mixed content — do not occur in it. Reach for `quick-xml` if we ever
+/// parse XML we did not expect the shape of; do not add it for this.
+fn field<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let rest = &xml[start..];
+    Some(&rest[..rest.find(&format!("</{tag}>"))?])
+}
+
+fn text(xml: &str, tag: &str) -> Option<String> {
+    let value = unescape(field(xml, tag)?.trim());
+    (!value.is_empty()).then_some(value)
+}
+
+fn int(xml: &str, tag: &str) -> Option<i64> {
+    field(xml, tag)?.trim().parse().ok()
+}
+
+/// Parse a ComicInfo.xml.
+///
+/// Never fails: a malformed or truncated document yields whatever fields survived. A
+/// chapter with unreadable metadata still reads, it just falls back to its filename.
+pub fn parse_comic_info(xml: &str) -> ComicInfo {
+    ComicInfo {
+        series: text(xml, "Series"),
+        title: text(xml, "Title"),
+        // Real, because 10.5 happens, and ComicInfo writes it as a string.
+        number: field(xml, "Number").and_then(|n| n.trim().parse().ok()),
+        volume: int(xml, "Volume"),
+        count: int(xml, "Count"),
+        summary: text(xml, "Summary"),
+        writer: text(xml, "Writer"),
+        penciller: text(xml, "Penciller"),
+        publisher: text(xml, "Publisher"),
+        genre: text(xml, "Genre"),
+        tags: text(xml, "Tags"),
+        characters: text(xml, "Characters"),
+        age_rating: text(xml, "AgeRating"),
+        web: text(xml, "Web"),
+        language: text(xml, "LanguageISO"),
+        year: int(xml, "Year"),
+        month: int(xml, "Month"),
+        day: int(xml, "Day"),
+        page_count: int(xml, "PageCount"),
+        manga: field(xml, "Manga").map(|v| match v.trim() {
+            v if v.eq_ignore_ascii_case("YesAndRightToLeft") => MangaFlag::YesAndRightToLeft,
+            v if v.eq_ignore_ascii_case("Yes") => MangaFlag::Yes,
+            v if v.eq_ignore_ascii_case("No") => MangaFlag::No,
+            _ => MangaFlag::Unknown,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -295,24 +410,83 @@ mod tests {
     #[test]
     fn comicinfo_manga_field_is_read_in_the_shapes_tools_actually_write() {
         let xml = r#"<?xml version="1.0"?><ComicInfo><Series>X</Series><Manga>YesAndRightToLeft</Manga></ComicInfo>"#;
-        assert_eq!(parse_manga_flag(xml), Some(MangaFlag::YesAndRightToLeft));
+        assert_eq!(
+            parse_comic_info(xml).manga,
+            Some(MangaFlag::YesAndRightToLeft)
+        );
 
         assert_eq!(
-            parse_manga_flag("<ComicInfo>\n  <Manga> Yes </Manga>\n</ComicInfo>"),
+            parse_comic_info("<ComicInfo>\n  <Manga> Yes </Manga>\n</ComicInfo>").manga,
             Some(MangaFlag::Yes)
         );
         assert_eq!(
-            parse_manga_flag("<ComicInfo><Manga>No</Manga></ComicInfo>"),
+            parse_comic_info("<ComicInfo><Manga>No</Manga></ComicInfo>").manga,
             Some(MangaFlag::No)
         );
         assert_eq!(
-            parse_manga_flag("<ComicInfo><Manga>nonsense</Manga></ComicInfo>"),
+            parse_comic_info("<ComicInfo><Manga>nonsense</Manga></ComicInfo>").manga,
             Some(MangaFlag::Unknown)
         );
         assert_eq!(
-            parse_manga_flag("<ComicInfo><Series>X</Series></ComicInfo>"),
+            parse_comic_info("<ComicInfo><Series>X</Series></ComicInfo>").manga,
             None
         );
-        assert_eq!(parse_manga_flag("<ComicInfo><Manga>truncated"), None);
+        assert_eq!(parse_comic_info("<ComicInfo><Manga>truncated").manga, None);
+    }
+
+    #[test]
+    fn a_full_comicinfo_is_read_and_entities_are_resolved() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<ComicInfo>
+  <Series>Fullmetal Alchemist &amp; Co</Series>
+  <Title>The Two Alchemists</Title>
+  <Number>10.5</Number>
+  <Volume>2</Volume>
+  <Count>27</Count>
+  <Summary>Ed &amp; Al say &quot;hello&quot;</Summary>
+  <Writer>Hiromu Arakawa</Writer>
+  <Publisher>Square Enix</Publisher>
+  <LanguageISO>ja</LanguageISO>
+  <Year>2002</Year>
+  <PageCount>186</PageCount>
+  <Manga>YesAndRightToLeft</Manga>
+  <Genre />
+</ComicInfo>"#;
+        let info = parse_comic_info(xml);
+        assert_eq!(info.series.as_deref(), Some("Fullmetal Alchemist & Co"));
+        assert_eq!(info.title.as_deref(), Some("The Two Alchemists"));
+        assert_eq!(info.number, Some(10.5), "10.5 happens");
+        assert_eq!(info.volume, Some(2));
+        assert_eq!(info.count, Some(27));
+        assert_eq!(info.summary.as_deref(), Some(r#"Ed & Al say "hello""#));
+        assert_eq!(info.language.as_deref(), Some("ja"));
+        assert_eq!(info.year, Some(2002));
+        assert_eq!(info.page_count, Some(186));
+        assert_eq!(info.manga, Some(MangaFlag::YesAndRightToLeft));
+        assert_eq!(info.genre, None, "a self-closed field is not a value");
+        assert_eq!(info.characters, None);
+    }
+
+    #[test]
+    fn numeric_entities_and_lone_ampersands_survive() {
+        let info =
+            parse_comic_info("<ComicInfo><Series>A&#38;B&#x2764;C &amp; D</Series></ComicInfo>");
+        assert_eq!(info.series.as_deref(), Some("A&B\u{2764}C & D"));
+
+        // A bare & is not an entity. Taggers emit them and the title must not lose text.
+        let bare = parse_comic_info("<ComicInfo><Series>Q &  A</Series></ComicInfo>");
+        assert_eq!(bare.series.as_deref(), Some("Q &  A"));
+
+        // Something entity-shaped that we do not know stays verbatim.
+        let unknown = parse_comic_info("<ComicInfo><Series>x&nbsp;y</Series></ComicInfo>");
+        assert_eq!(unknown.series.as_deref(), Some("x&nbsp;y"));
+    }
+
+    #[test]
+    fn a_document_that_is_not_comicinfo_yields_nothing_rather_than_failing() {
+        assert_eq!(
+            parse_comic_info("<html><body>404 not found</body></html>"),
+            ComicInfo::default()
+        );
     }
 }
