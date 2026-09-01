@@ -189,6 +189,14 @@
   let detected = $state(null); // what the backend worked out, and why
   let mode = $state("rtl"); // effective mode; a manual pick overrides the detection
   let overridden = $state(false);
+  /// The app-wide fallback, which is a different thing from `mode`. `mode` is what the
+  /// open chapter is being read as; this is what is used when nothing else knows. They
+  /// were the same variable until pressing [m] on one manhwa was found to be rewriting
+  /// the default for every unlabelled series in the library.
+  let defaultMode = $state("rtl");
+  /// The series the open chapter belongs to, wherever it was opened from. The chapter
+  /// panel knows it; a resume, history or bookmark row carries it on the row.
+  let openSeriesId = $state(null);
   let fit = $state("page");
   let sample = $state(1);
   let pad = $state(0);
@@ -386,6 +394,7 @@
     // The one branch in the shell that knows there are two readers. Everything below
     // this line is the image reader; the text reader shares nothing with it but the
     // library, the position table and the chrome around both.
+    openSeriesId = chapter.series_id ?? openSeries?.id ?? null;
     if (chapter.kind === "text") return loadText(chapter);
 
     const wanted = keepPage ? page : chapter.page ?? 0;
@@ -730,6 +739,16 @@
     }
   }
 
+  /// A catalog could be added and never removed, which left the list a one-way door.
+  async function dropCatalog(id) {
+    try {
+      await invoke("remove_catalog", { id });
+      catalogs = await invoke("catalogs");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /// Follow a feed. `push` records where we came from so Back works.
   async function openFeed(url, push = true) {
     opdsBusy = true;
@@ -824,6 +843,7 @@
   /// invariant 9, and the reason none of those settings calls this again.
   async function loadText(chapter) {
     error = null;
+    openSeriesId = chapter.series_id ?? openSeries?.id ?? null;
     chapterId = chapter.id;
     chapterTitle = chapter.title;
     palette = null;
@@ -996,7 +1016,7 @@
     saveTimer = setTimeout(() => {
       invoke("save_settings", {
         settings: {
-          default_reading_mode: overridden ? mode : (detected?.mode ?? "rtl"),
+          default_reading_mode: defaultMode,
           fit,
           downsample: sample,
           page_padding: pad,
@@ -1226,10 +1246,23 @@
     dirty = true;
   }
 
+  /// Pin the mode where it belongs.
+  ///
+  /// To the series when there is one, through the override column that `pr-db` already
+  /// resolves ahead of the category and the default. Only a chapter opened with no
+  /// series in hand falls back to moving the app-wide default, which is the one case
+  /// where there is nothing narrower to write it to.
   function setMode(next) {
     mode = next;
     overridden = true;
-    persist();
+    if (openSeriesId !== null) {
+      invoke("set_series_mode", { seriesId: openSeriesId, mode: next }).catch(
+        (e) => (error = String(e)),
+      );
+    } else {
+      defaultMode = next;
+      persist();
+    }
     if (mode === "webtoon") {
       dirty = true;
     } else {
@@ -1279,6 +1312,13 @@
     else if (k === "r") {
       overridden = false;
       if (detected) mode = detected.mode;
+      // Clearing the override is a write too, or the series keeps the old one and the
+      // reset lasts exactly as long as this chapter is open.
+      if (openSeriesId !== null) {
+        invoke("set_series_mode", { seriesId: openSeriesId, mode: null }).catch(
+          (e) => (error = String(e)),
+        );
+      }
     } else if (!paged) return;
     else if (k === "Home") go(-pageCount);
     else if (k === "End") go(pageCount);
@@ -1404,7 +1444,8 @@
   async function loadSettings() {
     try {
       const saved = await invoke("settings");
-      mode = saved.default_reading_mode;
+      defaultMode = saved.default_reading_mode;
+      mode = defaultMode;
       fit = saved.fit;
       sample = saved.downsample;
       pad = saved.page_padding;
@@ -1963,13 +2004,21 @@
 
           <div class="chips">
             {#each catalogs as cat (cat.id)}
-              <button
-                class="chip"
-                onclick={() => {
-                  opdsTrail = [];
-                  openFeed(cat.url, false);
-                }}>{cat.name}</button
-              >
+              <span class="pair">
+                <button
+                  class="chip"
+                  onclick={() => {
+                    opdsTrail = [];
+                    openFeed(cat.url, false);
+                  }}>{cat.name}</button
+                >
+                <button
+                  class="chip danger"
+                  title="Remove {cat.name}"
+                  aria-label="Remove {cat.name}"
+                  onclick={() => dropCatalog(cat.id)}>×</button
+                >
+              </span>
             {/each}
           </div>
         {:else}
@@ -2675,6 +2724,12 @@
   .note {
     width: 12rem;
     flex: none;
+  }
+  /* A thing and the button that removes it, so they wrap as one. */
+  .pair {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s-1);
   }
   .lede {
     max-width: 60ch;

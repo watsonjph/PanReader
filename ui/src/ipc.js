@@ -292,6 +292,31 @@ const FIXTURES = {
   ],
 };
 
+/// Commands that write.
+///
+/// Accepted and discarded. The fixture models no library, so none of these can be made
+/// to stick -- but a write that throws puts a red banner over the layout you were
+/// looking at, which is worse than one that quietly does nothing. Reads are the ones
+/// that must never be faked, because a read is where a fixture could tell you something
+/// untrue about how the app behaves.
+const WRITES = new Set([
+  "save_settings",
+  "save_position",
+  "set_series_mode",
+  "set_series_category",
+  "set_category_mode",
+  "create_category",
+  "delete_category",
+  "remove_catalog",
+  "add_catalog",
+  "add_root",
+  "remove_root",
+  "remove_bookmark",
+  "set_bookmark_note",
+  "forget",
+  "rescan",
+]);
+
 /** Covers are served over pan:// in the app; in the browser they are data URIs. */
 export const isMock = !inTauri && import.meta.env.DEV;
 
@@ -306,7 +331,7 @@ export function mockPage(index) {
 export function invoke(command, args = {}) {
   if (inTauri || !import.meta.env.DEV) return tauriInvoke(command, args);
 
-  const fixture = FIXTURES[command];
+  const fixture = FIXTURES[command] ?? (WRITES.has(command) ? () => null : null);
   if (!fixture) {
     return Promise.reject(
       new Error(`no dev fixture for "${command}" -- add one in ui/src/ipc.js`),

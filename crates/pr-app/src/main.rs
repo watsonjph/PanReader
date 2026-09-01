@@ -860,6 +860,9 @@ mod cover_tests {
         // App::open reads PANREADER_DB, so the whole thing lands in the temp dir and
         // the cover cache goes beside it.
         let db_path = dir.join("library.db");
+        // SAFETY: `set_var` is unsound only when another thread may be reading the
+        // environment concurrently. This runs at the top of a `#[test]` before anything
+        // is spawned, and the tests that call it are the only ones touching this var.
         unsafe { std::env::set_var("PANREADER_DB", &db_path) };
         let app = App::open().unwrap();
         app.db.lock().add_root(dir).unwrap();
