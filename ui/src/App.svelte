@@ -3,7 +3,7 @@
   // Names from the same file the colours come from, so adding a theme still touches
   // data/themes.json and nothing else.
   import themeData from "../../data/themes.json";
-  import { invoke, isMock, mockCover } from "./ipc.js";
+  import { invoke, isMock, mockCover, mockPage } from "./ipc.js";
   import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import {
     clickStep,
@@ -245,7 +245,7 @@
   const css = (deviceY) => Math.round(deviceY / dpr);
 
   const tileUrl = (index, t) =>
-    `${base}/t/${chapterId}/${index}/${t}/${layout.display_w}`;
+    isMock ? mockPage(index) : `${base}/t/${chapterId}/${index}/${t}/${layout.display_w}`;
 
   function rebuildTops() {
     tops = layout ? pageTops(layout.pages, pad, dpr) : [];
@@ -1516,7 +1516,7 @@
      JavaScript on every reflow is the one reliable way to miss the frame budget here. -->
 {#if text}
   <div
-    class="reading"
+    class="novel"
     class:paper={textPaper}
     class:columns={textPaged}
     class:vertical={textVertical}
@@ -2381,7 +2381,10 @@
    * measure is a max-width in `ch`, so it tracks the font; pagination is `columns`, so
    * the browser breaks the text; vertical Japanese is `writing-mode`. Nothing in
    * JavaScript measures a glyph. */
-  .reading {
+  /* `novel`, not `reading`: the debug HUD already carries `class:reading` as a state
+     flag, so a bare rule of that name applied to it too and turned it into a
+     full-screen blurred panel over the page. `styles.test.js` fails on that shape now. */
+  .novel {
     position: fixed;
     inset: 0;
     z-index: 5;
@@ -2398,7 +2401,7 @@
      the chrome inside the reader is drawn from --glass, --hairline and --text-muted,
      all of which are tuned for a dark ground and vanish on a light one. Redefining them
      here cascades to every control inside without touching the shell. */
-  .reading.paper {
+  .novel.paper {
     --bg: #f3ece0;
     --text: #241f19;
     --text-muted: #6b6154;
@@ -2433,12 +2436,12 @@
   /* Pagination. `columns` with the container's own width means one screenful is one
      column, so scrolling by clientWidth is a page turn and the browser decided where
      every break falls. */
-  .reading.columns .prose {
+  .novel.columns .prose {
     overflow-x: auto;
     overflow-y: hidden;
     scroll-behavior: smooth;
   }
-  .reading.columns .column {
+  .novel.columns .column {
     height: 100%;
     max-width: none;
     column-width: var(--measure);
@@ -2447,7 +2450,7 @@
   }
   /* Raw Japanese. One declaration, and the columns above become horizontal bands of a
      vertical text -- which is why it was worth doing at all. */
-  .reading.vertical .column {
+  .novel.vertical .column {
     writing-mode: vertical-rl;
     height: 100%;
     max-width: none;
@@ -3416,7 +3419,10 @@
   .hud:not(.reading) {
     display: none;
   }
+  /* Above everything, including the text reader. An error nobody can see is worse than
+     no error handling at all: the app looks like it did nothing. */
   .error {
+    z-index: 20;
     position: fixed;
     left: 12px;
     bottom: 12px;

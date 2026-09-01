@@ -101,16 +101,6 @@ fn a_malformed_chapter_yields_the_text_that_was_readable() {
 }
 
 #[test]
-fn identity_ignores_styling_but_not_words() {
-    let plain = from_html("<p>The same words.</p>");
-    let styled = from_html(r#"<div class="x"><p><em>The</em> same words.</p></div>"#);
-    let other = from_html("<p>Different words.</p>");
-
-    assert_eq!(plain.identity(), styled.identity());
-    assert_ne!(plain.identity(), other.identity());
-}
-
-#[test]
 fn a_hard_wrapped_text_file_reflows_into_paragraphs() {
     let doc = from_plain(
         "The quick brown fox\njumped over the lazy dog.\n\n\nA second paragraph.\n",

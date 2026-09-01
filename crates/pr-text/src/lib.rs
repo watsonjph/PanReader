@@ -93,20 +93,6 @@ impl Document {
         self.blocks.iter().map(|b| b.text().chars().count()).sum()
     }
 
-    /// Content-derived identity, the same idea as a chapter of pages.
-    ///
-    /// Over the normalized text rather than the source bytes: two releases of the same
-    /// translation that differ only in stylesheet are the same chapter to a reader, and
-    /// treating them as different would lose their place for no reason.
-    pub fn identity(&self) -> String {
-        let mut hasher = blake3::Hasher::new();
-        for block in &self.blocks {
-            hasher.update(block.text().as_bytes());
-            hasher.update(b"\n");
-        }
-        format!("blake3:{}", hasher.finalize().to_hex())
-    }
-
     /// The first heading, for a chapter with no title in the table of contents.
     pub fn heading(&self) -> Option<String> {
         self.blocks

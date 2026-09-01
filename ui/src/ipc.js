@@ -24,6 +24,19 @@ const cover = (seed) => {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 };
 
+/** A stand-in page, shaped like a printed manga page so layout maths means something. */
+const page = (index) => {
+  const h = 255 - ((index * 7) % 40);
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="978" height="1400">` +
+    `<rect width="978" height="1400" fill="hsl(30 8% ${Math.round(h / 3)}%)"/>` +
+    `<rect x="60" y="60" width="858" height="1280" fill="none" ` +
+    `stroke="hsl(30 10% 45%)" stroke-width="4"/>` +
+    `<text x="489" y="720" font-family="monospace" font-size="200" fill="hsl(30 10% 55%)" ` +
+    `text-anchor="middle">${index + 1}</text></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+};
+
 const SERIES = [
   "Yotsuba&!",
   "よつばと！ 第2巻",
@@ -198,6 +211,32 @@ const FIXTURES = {
   toggle_bookmark: () => true,
   remove_bookmark: () => null,
   set_bookmark_note: () => null,
+  /// The image reader, with stand-in pages.
+  ///
+  /// Not here to test decoding -- there is none -- but so the reader renders at all
+  /// outside Tauri. A reader you cannot open in `pnpm dev` is a reader whose layout
+  /// bugs are found by the person using the app, which is how the debug HUD once
+  /// spread itself over the whole page.
+  open_chapter: ({ displayW }) => {
+    const w = displayW || 1200;
+    const h = Math.round(w * (1400 / 978));
+    return {
+      reading: { mode: "rtl", source: "default" },
+      display_w: w,
+      total_h: h * 24,
+      pages: Array.from({ length: 24 }, (_, index) => ({
+        index,
+        w,
+        h,
+        y: index * h,
+        tiles: 1,
+        tile_h: h,
+        readable: true,
+      })),
+    };
+  },
+  warm: () => null,
+  stats: () => ({}),
   open_text: () => {
     const para = (text) => ({ kind: "para", spans: [{ text }] });
     const blocks = [
@@ -258,6 +297,10 @@ export const isMock = !inTauri && import.meta.env.DEV;
 
 export function mockCover(chapterId) {
   return cover(Number(chapterId) || 0);
+}
+
+export function mockPage(index) {
+  return page(Number(index) || 0);
 }
 
 export function invoke(command, args = {}) {
