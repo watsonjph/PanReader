@@ -61,10 +61,12 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
                 if ca.is_ascii_digit() && cb.is_ascii_digit() {
                     let (mut na, mut nb) = (0u128, 0u128);
                     while x.peek().is_some_and(|c| c.is_ascii_digit()) {
-                        na = na.saturating_mul(10) + (x.next().unwrap() - b'0') as u128;
+                        let d = x.next().expect("peek said there is a digit here");
+                        na = na.saturating_mul(10) + (d - b'0') as u128;
                     }
                     while y.peek().is_some_and(|c| c.is_ascii_digit()) {
-                        nb = nb.saturating_mul(10) + (y.next().unwrap() - b'0') as u128;
+                        let d = y.next().expect("peek said there is a digit here");
+                        nb = nb.saturating_mul(10) + (d - b'0') as u128;
                     }
                     match na.cmp(&nb) {
                         Ordering::Equal => continue,

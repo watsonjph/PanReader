@@ -65,6 +65,33 @@ pub struct Settings {
     pub reduce_animations: bool,
     /// Shelf as a list rather than a grid. Same cards either way.
     pub list_view: bool,
+
+    /// Take a backup on launch when the newest is a day old. On by default, because a
+    /// backup nobody has to remember is the only kind that saves anyone.
+    pub auto_backup: bool,
+    /// How many automatic backups to keep. They are a few hundred kilobytes each.
+    pub backup_keep: u32,
+
+    // The text reader. Separate names from the image reader's on purpose: the two share
+    // the shell and share no rendering, and a `fit` that meant something to both would
+    // be the first crack in that.
+    /// `serif`, `sans` or `mono`. A stack, not a file: bundling a reading face is a
+    /// licence and a docs entry, and the system serif is a good one on every desktop.
+    pub text_font: String,
+    /// Body size in px.
+    pub text_size: u32,
+    /// Characters per line. The measure, which is the setting that actually decides
+    /// whether a page is comfortable.
+    pub text_measure: u32,
+    /// Line height as a multiple of the size, times 100 -- an integer so the settings
+    /// blob has no float rounding in it.
+    pub text_leading: u32,
+    /// Columns rather than one long scroll.
+    pub text_paged: bool,
+    /// A warm ground for long sessions, instead of the app theme's.
+    pub text_paper: bool,
+    /// `writing-mode: vertical-rl`, for raw Japanese.
+    pub text_vertical: bool,
 }
 
 impl Default for Settings {
@@ -85,6 +112,17 @@ impl Default for Settings {
             live_background: true,
             reduce_animations: false,
             list_view: false,
+            auto_backup: true,
+            backup_keep: 8,
+            text_font: "serif".to_owned(),
+            text_size: 19,
+            // Bringhurst's 66, near enough. Long lines lose the reader on the way back
+            // to the left margin.
+            text_measure: 66,
+            text_leading: 160,
+            text_paged: false,
+            text_paper: false,
+            text_vertical: false,
         }
     }
 }
@@ -232,11 +270,91 @@ pub struct ComicInfo {
     pub manga: Option<MangaFlag>,
 }
 
-/// The five predefined entities and numeric references.
+/// A chapter number out of a name.
+///
+/// ponytail: the last number in the string, which handles `Chapter 12`, `c012.5`,
+/// `Vol 1 Ch 3` and `Series 2 - 014` correctly because the chapter number is
+/// conventionally last. It gets `2020` from `Series (2020)` wrong. Replace it with real
+/// filename metadata parsing when Phase 2's ComicInfo work lands, not before.
+pub fn chapter_number(name: &str) -> Option<f64> {
+    let bytes = name.as_bytes();
+    let mut last = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // A single decimal point, and only when a digit follows it.
+            if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            last = name[start..i].parse::<f64>().ok().or(last);
+        } else {
+            i += 1;
+        }
+    }
+    last
+}
+
+/// One named or numeric entity, without its `&` and `;`.
+///
+/// Split out because the XML reader in `pr-text` receives entity references as
+/// their own events rather than inside a string, and two copies of this table is
+/// one copy too many.
+pub fn entity(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{a0}'),
+        "shy" => Some('\u{ad}'),
+        "ensp" => Some('\u{2002}'),
+        "emsp" => Some('\u{2003}'),
+        "thinsp" => Some('\u{2009}'),
+        "ndash" => Some('\u{2013}'),
+        "mdash" => Some('\u{2014}'),
+        "lsquo" => Some('\u{2018}'),
+        "rsquo" => Some('\u{2019}'),
+        "ldquo" => Some('\u{201c}'),
+        "rdquo" => Some('\u{201d}'),
+        "dagger" => Some('\u{2020}'),
+        "bull" => Some('\u{2022}'),
+        "hellip" => Some('\u{2026}'),
+        "prime" => Some('\u{2032}'),
+        "laquo" => Some('\u{ab}'),
+        "raquo" => Some('\u{bb}'),
+        "middot" => Some('\u{b7}'),
+        "deg" => Some('\u{b0}'),
+        "times" => Some('\u{d7}'),
+        "copy" => Some('\u{a9}'),
+        "reg" => Some('\u{ae}'),
+        "trade" => Some('\u{2122}'),
+        _ => name
+            .strip_prefix('#')
+            .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => n.parse().ok(),
+            })
+            .and_then(char::from_u32),
+    }
+}
+
+/// XML's five predefined entities, numeric references, and the handful of named HTML
+/// ones that actually turn up.
 ///
 /// Taggers write `&amp;` in series titles constantly, and a title reading
-/// `Fullmetal Alchemist &amp; Co` is a visible bug on the shelf.
-fn unescape(text: &str) -> String {
+/// `Fullmetal Alchemist &amp; Co` is a visible bug on the shelf. EPUBs bring the rest:
+/// XHTML declares hundreds of named entities that XML does not, and an unresolved
+/// `&mdash;` in the middle of a paragraph is the same visible bug one layer down. The
+/// table is short on purpose -- these are the ones publishers actually use.
+pub fn unescape(text: &str) -> String {
     if !text.contains('&') {
         return text.to_owned();
     }
@@ -250,21 +368,7 @@ fn unescape(text: &str) -> String {
             rest = &tail[1..];
             continue;
         };
-        let body = &tail[1..semi];
-        let resolved = match body {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            _ => body
-                .strip_prefix('#')
-                .and_then(|n| match n.strip_prefix(['x', 'X']) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                    None => n.parse().ok(),
-                })
-                .and_then(char::from_u32),
-        };
+        let resolved = entity(&tail[1..semi]);
         match resolved {
             Some(c) => out.push(c),
             // Not an entity we know. Leave it exactly as written rather than eating it.
@@ -492,9 +596,14 @@ mod tests {
         let bare = parse_comic_info("<ComicInfo><Series>Q &  A</Series></ComicInfo>");
         assert_eq!(bare.series.as_deref(), Some("Q &  A"));
 
-        // Something entity-shaped that we do not know stays verbatim.
-        let unknown = parse_comic_info("<ComicInfo><Series>x&nbsp;y</Series></ComicInfo>");
-        assert_eq!(unknown.series.as_deref(), Some("x&nbsp;y"));
+        // Named HTML entities resolve too, which is what `pr-text` needs from EPUBs and
+        // what a tagger writing a no-break space meant here.
+        let named = parse_comic_info("<ComicInfo><Series>x&nbsp;y&mdash;z</Series></ComicInfo>");
+        assert_eq!(named.series.as_deref(), Some("x\u{a0}y\u{2014}z"));
+
+        // Something entity-shaped that is not in the table stays verbatim.
+        let unknown = parse_comic_info("<ComicInfo><Series>x&thorn;y</Series></ComicInfo>");
+        assert_eq!(unknown.series.as_deref(), Some("x&thorn;y"));
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! `pr-engine`; callers here use `spawn_blocking`. SQLite is fast enough that an async
 //! driver would buy nothing but a runtime dependency and compile-time schema plumbing.
 
+pub use rusqlite;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -57,6 +59,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0008_history_bookmarks",
         include_str!("../migrations/0008_history_bookmarks.sql"),
+    ),
+    (
+        "0009_chapter_locator",
+        include_str!("../migrations/0009_chapter_locator.sql"),
     ),
 ];
 
@@ -175,6 +181,15 @@ impl Db {
             .unwrap_or_default())
     }
 
+    /// A transaction over the whole schema, for `pr-sync`.
+    ///
+    /// Backup is schema-coupled by definition -- exporting what rows mean is still
+    /// reading rows -- and re-stating every table's columns as accessors here would put
+    /// the schema in two crates. One narrow handle instead.
+    pub fn transaction(&mut self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self.conn.transaction()?)
+    }
+
     pub fn save_settings(&self, settings: &pr_core::Settings) -> Result<()> {
         self.conn.execute(
             "INSERT INTO app_config (id, json) VALUES (1, ?1)
@@ -199,6 +214,9 @@ pub struct SeriesRow {
     /// Unix seconds. The home screen's "Recently added" row sorts on it, which is why
     /// it is here rather than being a second query.
     pub added_at: i64,
+    /// `image` or `text`. Which reader a click opens, and the one thing the shell has
+    /// to know about a series before it opens anything.
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -219,6 +237,8 @@ pub struct ResumeRow {
     pub page: i64,
     pub page_frac: f64,
     pub page_count: i64,
+    /// Which reader to open. Every row the shell can click through to carries it.
+    pub kind: String,
 }
 
 /// One reading session, joined to enough of the library to render a row.
@@ -235,6 +255,7 @@ pub struct HistoryRow {
     pub ended_at: i64,
     pub pages: i64,
     pub last_page: i64,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -250,6 +271,7 @@ pub struct BookmarkRow {
     pub char_offset: Option<i64>,
     pub note: String,
     pub created_at: i64,
+    pub kind: String,
 }
 
 /// Derived from history every time it is asked for, never stored. A stored counter is a
@@ -274,6 +296,9 @@ pub struct ChapterRow {
     pub page_count: i64,
     /// Where to read it from. Identity matches; path opens.
     pub path: String,
+    /// Where inside the container, for a format that holds more than one chapter.
+    pub locator: String,
+    pub kind: String,
     pub page: i64,
     /// How far into that page, as a fraction of its height. Resolution-independent on
     /// purpose: a pixel offset stops meaning anything when the decode width changes.
@@ -290,7 +315,9 @@ pub struct CategoryRow {
     pub series_count: i64,
 }
 
-fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
+/// The reading mode as the schema stores it. Public because `pr-sync` writes the same
+/// column and a second spelling of these three strings is a second thing to get wrong.
+pub fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
     mode.map(|m| match m {
         pr_core::ReadingMode::Rtl => "rtl".to_owned(),
         pr_core::ReadingMode::Ltr => "ltr".to_owned(),
@@ -298,7 +325,9 @@ fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
     })
 }
 
-fn mode_from(text: Option<String>) -> Option<pr_core::ReadingMode> {
+/// An unrecognised mode reads as no override rather than as an error. The column is
+/// nullable for exactly this reason: "detect it" is always a valid answer.
+pub fn mode_from(text: Option<String>) -> Option<pr_core::ReadingMode> {
     match text.as_deref() {
         Some("rtl") => Some(pr_core::ReadingMode::Rtl),
         Some("ltr") => Some(pr_core::ReadingMode::Ltr),
@@ -360,9 +389,11 @@ impl Db {
         for series in scanned {
             let path = series.path.to_string_lossy().to_string();
             tx.execute(
-                "INSERT INTO series (source, source_id, title) VALUES ('local', ?1, ?2)
-                 ON CONFLICT(source, source_id) DO UPDATE SET title = excluded.title",
-                params![path, series.title],
+                "INSERT INTO series (source, source_id, title, author, kind)
+                 VALUES ('local', ?1, ?2, ?3, ?4)
+                 ON CONFLICT(source, source_id) DO UPDATE
+                 SET title = excluded.title, author = excluded.author, kind = excluded.kind",
+                params![path, series.title, series.author, series.kind],
             )?;
             let series_id: i64 = tx.query_row(
                 "SELECT id FROM series WHERE source = 'local' AND source_id = ?1",
@@ -388,7 +419,7 @@ impl Db {
                         tx.execute(
                             "UPDATE chapters
                              SET series_id = ?2, title = ?3, number = ?4, page_count = ?5,
-                                 path = ?6, mtime = ?7, size = ?8
+                                 path = ?6, mtime = ?7, size = ?8, locator = ?9
                              WHERE id = ?1",
                             params![
                                 id,
@@ -398,7 +429,8 @@ impl Db {
                                 count,
                                 chapter.path.to_string_lossy(),
                                 chapter.mtime,
-                                chapter.size as i64
+                                chapter.size as i64,
+                                chapter.locator
                             ],
                         )?;
                         summary.chapters_kept += 1;
@@ -407,8 +439,8 @@ impl Db {
                         tx.execute(
                             "INSERT INTO chapters
                                  (series_id, source_id, title, number, page_count, path,
-                                  mtime, size)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                  mtime, size, locator)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             params![
                                 series_id,
                                 chapter.identity,
@@ -417,7 +449,8 @@ impl Db {
                                 count,
                                 chapter.path.to_string_lossy(),
                                 chapter.mtime,
-                                chapter.size as i64
+                                chapter.size as i64,
+                                chapter.locator
                             ],
                         )?;
                         summary.chapters_added += 1;
@@ -494,8 +527,10 @@ impl Db {
     pub fn chapters(&self, series_id: i64) -> Result<Vec<ChapterRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.number, c.page_count, c.path,
-                    coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0)
+                    coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0),
+                    c.locator, s.kind
              FROM chapters c
+             JOIN series s ON s.id = c.series_id
              LEFT JOIN positions p ON p.chapter_id = c.id
              WHERE c.series_id = ?1
              ORDER BY c.number, c.title",
@@ -510,6 +545,8 @@ impl Db {
                 page: r.get(5)?,
                 page_frac: r.get(6)?,
                 completed: r.get::<_, i64>(7)? != 0,
+                locator: r.get(8)?,
+                kind: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -526,7 +563,7 @@ impl Db {
                     coalesce(sum(CASE WHEN p.completed = 1 THEN 0 ELSE 1 END), 0),
                     (SELECT id FROM chapters WHERE series_id = s.id
                      ORDER BY number, title LIMIT 1),
-                    s.added_at
+                    s.added_at, s.kind
              FROM series s
              LEFT JOIN chapters c ON c.series_id = s.id
              LEFT JOIN positions p ON p.chapter_id = c.id
@@ -551,6 +588,7 @@ impl Db {
                 unread: r.get(4)?,
                 cover_chapter_id: r.get(5)?,
                 added_at: r.get(6)?,
+                kind: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -564,7 +602,7 @@ impl Db {
     pub fn continue_reading(&self, limit: i64) -> Result<Vec<ResumeRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, s.id, s.title, c.title, c.number, p.page, p.page_frac, c.page_count,
-                    max(p.updated_at)
+                    s.kind, max(p.updated_at)
              FROM positions p
              JOIN chapters c ON c.id = p.chapter_id
              JOIN series s ON s.id = c.series_id
@@ -583,6 +621,7 @@ impl Db {
                 page: r.get(5)?,
                 page_frac: r.get(6)?,
                 page_count: r.get(7)?,
+                kind: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -708,8 +747,10 @@ impl Db {
             .conn
             .query_row(
                 "SELECT c.id, c.title, c.number, c.page_count, c.path,
-                        coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0)
+                        coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0),
+                        c.locator, s.kind
                  FROM chapters c
+                 JOIN series s ON s.id = c.series_id
                  LEFT JOIN positions p ON p.chapter_id = c.id
                  WHERE c.id = ?1",
                 params![chapter_id],
@@ -723,10 +764,27 @@ impl Db {
                         page: r.get(5)?,
                         page_frac: r.get(6)?,
                         completed: r.get::<_, i64>(7)? != 0,
+                        locator: r.get(8)?,
+                        kind: r.get(9)?,
                     })
                 },
             )
             .optional()?)
+    }
+
+    /// How long a chapter turned out to be.
+    ///
+    /// The image reader knows this from the scan -- a CBZ's page count is its entry
+    /// count. A novel chapter's length is its block count, and finding that means
+    /// parsing it, which a scan of a twelve-hundred-chapter book has no business doing.
+    /// So the reader records it the first time the chapter is opened, and the chapter
+    /// list shows a length from then on.
+    pub fn set_page_count(&self, chapter_id: i64, count: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chapters SET page_count = ?2 WHERE id = ?1 AND page_count <> ?2",
+            params![chapter_id, count],
+        )?;
+        Ok(())
     }
 
     /// One row per chapter, rewritten on every page turn. This is precisely why
@@ -789,7 +847,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT h.id, h.chapter_id, s.id, s.title, c.title, c.number,
                     (SELECT id FROM chapters WHERE series_id = s.id ORDER BY number, id LIMIT 1),
-                    h.started_at, h.ended_at, h.pages, h.last_page
+                    h.started_at, h.ended_at, h.pages, h.last_page, s.kind
              FROM history h
              JOIN chapters c ON c.id = h.chapter_id
              JOIN series s ON s.id = c.series_id
@@ -808,6 +866,7 @@ impl Db {
                 ended_at: r.get(8)?,
                 pages: r.get(9)?,
                 last_page: r.get(10)?,
+                kind: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -925,7 +984,7 @@ impl Db {
     pub fn bookmarks(&self, chapter_id: Option<i64>) -> Result<Vec<BookmarkRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.chapter_id, s.id, s.title, c.title, b.page, b.page_frac,
-                    b.paragraph, b.char_offset, b.note, b.created_at
+                    b.paragraph, b.char_offset, b.note, b.created_at, s.kind
              FROM bookmarks b
              JOIN chapters c ON c.id = b.chapter_id
              JOIN series s ON s.id = c.series_id
@@ -945,6 +1004,7 @@ impl Db {
                 char_offset: r.get(8)?,
                 note: r.get(9)?,
                 created_at: r.get(10)?,
+                kind: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1108,10 +1168,13 @@ mod tests {
         pr_archive::scan::ScannedSeries {
             path: PathBuf::from(path),
             title: title.to_owned(),
+            author: String::new(),
+            kind: "image",
             chapters: chapters
                 .iter()
                 .map(|(name, identity)| pr_archive::scan::ScannedChapter {
                     path: PathBuf::from(path).join(name),
+                    locator: String::new(),
                     title: (*name).to_owned(),
                     number: pr_archive::scan::chapter_number(name),
                     mtime: 0,

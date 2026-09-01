@@ -143,7 +143,12 @@ impl App {
             let known = self.db.lock().known()?;
             let mut total = pr_db::ScanSummary::default();
             for root in roots {
-                let found = pr_archive::scan::scan_root(&root, &known);
+                // Two walkers over one root, on purpose. A CBZ is one file holding one
+                // chapter and an EPUB is one file holding a whole series, so the two
+                // scans answer different questions; sharing a walker would mean a
+                // walker that knows both readers.
+                let mut found = pr_archive::scan::scan_root(&root, &known);
+                found.extend(pr_text::scan::scan_root(&root).into_iter().map(books));
                 let summary = self.db.lock().sync(&found)?;
                 total.series += summary.series;
                 total.chapters_added += summary.chapters_added;
@@ -155,6 +160,91 @@ impl App {
         self.scanning.store(false, SeqCst);
         result
     }
+}
+
+/// A book as the library stores it.
+///
+/// The one place the two scanners meet, and it is a field-for-field move rather than a
+/// shared type: `pr-text` describes a book and `pr-archive` describes a shelf of
+/// chapters, and neither should have to import the other to say so.
+fn books(book: pr_text::scan::Scanned) -> pr_archive::scan::ScannedSeries {
+    pr_archive::scan::ScannedSeries {
+        path: book.path,
+        title: book.title,
+        author: book.author,
+        kind: "text",
+        chapters: book
+            .chapters
+            .into_iter()
+            .map(|c| pr_archive::scan::ScannedChapter {
+                path: c.path,
+                locator: c.locator,
+                title: c.title,
+                number: c.number,
+                // Filled in when the chapter is first opened and its blocks counted.
+                // Parsing every chapter of every book to scan a shelf is not a scan.
+                page_count: 0,
+                identity: c.identity,
+                // Not stamped: `pr-text` has no cache to skip, so a zero here keeps the
+                // image scanner's cache from ever matching a text chapter by accident.
+                mtime: 0,
+                size: 0,
+            })
+            .collect(),
+    }
+}
+
+/// A chapter of prose, parsed once.
+///
+/// Hard invariant 9: changing font, size, measure or theme reflows this in the browser
+/// and never comes back here. Held in the same map as open image chapters so closing
+/// the reader drops it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct TextChapter {
+    title: String,
+    document: pr_text::Document,
+    /// Blocks, which is what a text position counts in.
+    blocks: i64,
+    characters: i64,
+    page: i64,
+    paragraph: Option<i64>,
+    char_offset: Option<i64>,
+}
+
+/// Open a novel chapter.
+///
+/// Over IPC as JSON, which invariant 1 forbids for image bytes and permits here: a
+/// chapter of prose is tens of kilobytes of text, and it is text either way. Sending it
+/// through `pan://` would mean a second protocol handler to avoid a cost that does not
+/// exist.
+#[tauri::command]
+fn open_text(app: State<App>, chapter_id: i64) -> Result<TextChapter, String> {
+    let row = app
+        .db
+        .lock()
+        .chapter(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or("no such chapter")?;
+
+    let document = pr_text::scan::read(std::path::Path::new(&row.path), &row.locator)
+        .map_err(|e| format!("{e:#}"))?;
+    let blocks = document.blocks.len() as i64;
+
+    // The scan left this at zero because counting blocks means parsing, and now it has
+    // been parsed anyway.
+    if row.page_count != blocks {
+        let _ = app.db.lock().set_page_count(chapter_id, blocks);
+    }
+
+    Ok(TextChapter {
+        title: row.title,
+        characters: document.chars() as i64,
+        blocks,
+        document,
+        page: row.page,
+        paragraph: None,
+        char_offset: None,
+    })
 }
 
 #[tauri::command]
@@ -432,6 +522,58 @@ fn save_position(
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Where the automatic backups live, and what is in there.
+#[tauri::command]
+fn backups() -> Result<Vec<pr_sync::Kept>, String> {
+    let dir = pr_sync::dir().map_err(|e| format!("{e:#}"))?;
+    Ok(pr_sync::kept(&dir))
+}
+
+/// Write a backup wherever the reader asked for one.
+#[tauri::command]
+fn export_backup(app: State<App>, path: String) -> Result<String, String> {
+    let mut db = app.db.lock();
+    let bytes = pr_sync::export(&mut db)
+        .and_then(|backup| pr_sync::write(&backup))
+        .map_err(|e| format!("{e:#}"))?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+    Ok(path)
+}
+
+/// What restoring this file would do. The dry run and the real thing are one code path
+/// in `pr-sync`, so this cannot drift from what `import_backup` then does.
+#[tauri::command]
+fn preview_backup(app: State<App>, path: String) -> Result<pr_sync::Report, String> {
+    merge(&app, &path, false)
+}
+
+#[tauri::command]
+fn import_backup(app: tauri::AppHandle, path: String) -> Result<pr_sync::Report, String> {
+    let report = merge(&app.state::<App>(), &path, true)?;
+    // Restored chapters come back without a path, because a backup carries what rows
+    // mean and not where this machine keeps them. A scan re-links every one whose file
+    // is here.
+    std::thread::spawn(move || {
+        if let Err(e) = app.state::<App>().scan() {
+            tracing::warn!("scan after import failed: {e:#}");
+        }
+    });
+    Ok(report)
+}
+
+fn merge(app: &App, path: &str, commit: bool) -> Result<pr_sync::Report, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let backup = pr_sync::read(&bytes).map_err(|e| format!("{e:#}"))?;
+    let mut db = app.db.lock();
+    let report = pr_sync::restore(&mut db, &backup, commit).map_err(|e| format!("{e:#}"))?;
+    if commit {
+        // Settings are replaced wholesale by a restore, and the tile path reads them
+        // from the cache rather than from SQLite.
+        *app.settings.lock() = db.settings().map_err(|e| format!("{e:#}"))?;
+    }
+    Ok(report)
+}
+
 #[tauri::command]
 fn history(app: State<App>, limit: i64) -> Result<Vec<pr_db::HistoryRow>, String> {
     app.db
@@ -599,6 +741,24 @@ fn main() {
         }
     };
 
+    // Off the launch path on purpose: a backup is an export of the whole library and
+    // the budget to a visible shelf is 500 ms.
+    if app.settings.lock().auto_backup {
+        let keep = app.settings.lock().backup_keep as usize;
+        std::thread::spawn(move || {
+            // Its own connection rather than the app's mutex: an export reads every
+            // table, and holding that lock would stall the first chapter open behind a
+            // file nobody asked for. WAL makes the concurrent read free.
+            let taken = pr_sync::dir().and_then(|dir| {
+                let mut db = pr_db::Db::open(&pr_db::default_path()?)?;
+                pr_sync::automatic(&mut db, &dir, keep)
+            });
+            if let Err(e) = taken {
+                tracing::warn!("automatic backup failed: {e:#}");
+            }
+        });
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(app)
@@ -665,7 +825,12 @@ fn main() {
             toggle_bookmark,
             bookmarks,
             remove_bookmark,
-            set_bookmark_note
+            set_bookmark_note,
+            backups,
+            export_backup,
+            preview_backup,
+            import_backup,
+            open_text
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
@@ -695,6 +860,9 @@ mod cover_tests {
         // App::open reads PANREADER_DB, so the whole thing lands in the temp dir and
         // the cover cache goes beside it.
         let db_path = dir.join("library.db");
+        // SAFETY: `set_var` is unsound only when another thread may be reading the
+        // environment concurrently. This runs at the top of a `#[test]` before anything
+        // is spawned, and the tests that call it are the only ones touching this var.
         unsafe { std::env::set_var("PANREADER_DB", &db_path) };
         let app = App::open().unwrap();
         app.db.lock().add_root(dir).unwrap();

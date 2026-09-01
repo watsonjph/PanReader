@@ -3155,6 +3155,8 @@ dependencies = [
  "pr-db",
  "pr-image",
  "pr-opds",
+ "pr-sync",
+ "pr-text",
  "rayon",
  "reqwest",
  "serde",
@@ -3218,6 +3220,32 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pr-sync"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "pr-core",
+ "pr-db",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "pr-text"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "pr-core",
+ "quick-xml 0.42.0",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
+ "zip",
 ]
 
 [[package]]
