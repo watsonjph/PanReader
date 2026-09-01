@@ -787,14 +787,24 @@
     }
   }
 
-  /// Download the first format the image reader can open, falling back to whatever is
-  /// offered. Nothing here needs to know it came from a server: it lands in a library
-  /// root and the rescan treats it as an ordinary local chapter.
+  /// Download a format one of the two readers can actually open.
+  ///
+  /// CBZ first, then EPUB now that the text reader exists. Never "whatever is offered":
+  /// that quietly fetched PDFs, which the scan does not recognise and neither reader
+  /// can open, so the file landed in someone's library and did nothing. A format we
+  /// cannot read is named and refused, the way `pr-archive` names a CBR.
   async function grab(entry) {
     const downloads = entry.kind.Publication?.downloads ?? [];
     const pick =
-      downloads.find((d) => /comicbook|zip/.test(d.mime)) ?? downloads[0];
-    if (!pick) return;
+      downloads.find((d) => /comicbook|zip/.test(d.mime)) ??
+      downloads.find((d) => /epub/.test(d.mime));
+    if (!pick) {
+      const offered = [...new Set(downloads.map((d) => d.mime))].join(", ");
+      error = downloads.length
+        ? `${entry.title} is offered as ${offered}. PanReader reads CBZ and EPUB.`
+        : `${entry.title} offers nothing to download.`;
+      return;
+    }
     opdsBusy = true;
     error = null;
     try {
