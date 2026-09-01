@@ -4,6 +4,8 @@
 //! `pr-engine`; callers here use `spawn_blocking`. SQLite is fast enough that an async
 //! driver would buy nothing but a runtime dependency and compile-time schema plumbing.
 
+pub use rusqlite;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -175,6 +177,15 @@ impl Db {
             .unwrap_or_default())
     }
 
+    /// A transaction over the whole schema, for `pr-sync`.
+    ///
+    /// Backup is schema-coupled by definition -- exporting what rows mean is still
+    /// reading rows -- and re-stating every table's columns as accessors here would put
+    /// the schema in two crates. One narrow handle instead.
+    pub fn transaction(&mut self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self.conn.transaction()?)
+    }
+
     pub fn save_settings(&self, settings: &pr_core::Settings) -> Result<()> {
         self.conn.execute(
             "INSERT INTO app_config (id, json) VALUES (1, ?1)
@@ -290,7 +301,9 @@ pub struct CategoryRow {
     pub series_count: i64,
 }
 
-fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
+/// The reading mode as the schema stores it. Public because `pr-sync` writes the same
+/// column and a second spelling of these three strings is a second thing to get wrong.
+pub fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
     mode.map(|m| match m {
         pr_core::ReadingMode::Rtl => "rtl".to_owned(),
         pr_core::ReadingMode::Ltr => "ltr".to_owned(),
@@ -298,7 +311,9 @@ fn mode_text(mode: Option<pr_core::ReadingMode>) -> Option<String> {
     })
 }
 
-fn mode_from(text: Option<String>) -> Option<pr_core::ReadingMode> {
+/// An unrecognised mode reads as no override rather than as an error. The column is
+/// nullable for exactly this reason: "detect it" is always a valid answer.
+pub fn mode_from(text: Option<String>) -> Option<pr_core::ReadingMode> {
     match text.as_deref() {
         Some("rtl") => Some(pr_core::ReadingMode::Rtl),
         Some("ltr") => Some(pr_core::ReadingMode::Ltr),

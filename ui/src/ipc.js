@@ -61,6 +61,8 @@ const FIXTURES = {
     live_background: true,
     reduce_animations: false,
     list_view: false,
+    auto_backup: true,
+    backup_keep: 8,
   }),
   save_settings: () => null,
   roots: () => ["D:/manga"],
@@ -100,6 +102,29 @@ const FIXTURES = {
       page_frac: 0,
       completed: i < 3,
     })),
+  backups: () => {
+    const now = Math.floor(Date.now() / 1000);
+    return [0, 1, 2, 5].map((back) => ({
+      path: `C:/Users/you/AppData/Roaming/panreader/backups/panreader-${now - back * 86400}.pnbk`,
+      taken_at: now - back * 86400,
+      bytes: 184_320 + back * 2_100,
+    }));
+  },
+  export_backup: ({ path }) => path,
+  preview_backup: () => ({
+    series_added: 3,
+    series_matched: 7,
+    chapters_added: 41,
+    chapters_matched: 260,
+    positions_advanced: 12,
+    positions_kept: 4,
+    bookmarks_added: 6,
+    sessions_added: 88,
+    categories_added: 1,
+    catalogs_added: 0,
+    roots_added: 0,
+  }),
+  import_backup: () => FIXTURES.preview_backup(),
   history: () => {
     const day = 86_400_000;
     const now = Date.now();

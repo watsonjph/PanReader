@@ -65,6 +65,12 @@ pub struct Settings {
     pub reduce_animations: bool,
     /// Shelf as a list rather than a grid. Same cards either way.
     pub list_view: bool,
+
+    /// Take a backup on launch when the newest is a day old. On by default, because a
+    /// backup nobody has to remember is the only kind that saves anyone.
+    pub auto_backup: bool,
+    /// How many automatic backups to keep. They are a few hundred kilobytes each.
+    pub backup_keep: u32,
 }
 
 impl Default for Settings {
@@ -85,6 +91,8 @@ impl Default for Settings {
             live_background: true,
             reduce_animations: false,
             list_view: false,
+            auto_backup: true,
+            backup_keep: 8,
         }
     }
 }

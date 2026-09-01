@@ -3155,6 +3155,7 @@ dependencies = [
  "pr-db",
  "pr-image",
  "pr-opds",
+ "pr-sync",
  "rayon",
  "reqwest",
  "serde",
@@ -3218,6 +3219,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pr-sync"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "pr-core",
+ "pr-db",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

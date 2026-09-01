@@ -4,7 +4,7 @@
   // data/themes.json and nothing else.
   import themeData from "../../data/themes.json";
   import { invoke, isMock, mockCover } from "./ipc.js";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import {
     clickStep,
     fitScale,
@@ -140,6 +140,8 @@
     { id: "settings", name: "Settings", icon: "⚙" },
   ];
   let error = $state(null);
+  let autoBackup = $state(true);
+  let backupKeep = $state(8);
 
   /// History, bookmarks and the numbers derived from them. Loaded when the section is
   /// opened, not on launch: none of it is on the path to a first page.
@@ -502,6 +504,85 @@
     }
   }
 
+  /// Automatic backups on disk, and the pending import if one is being looked at.
+  let saves = $state([]);
+  let plan = $state(null);
+  let backupBusy = $state(false);
+
+  async function refreshBackups() {
+    try {
+      saves = await invoke("backups");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Write one wherever they ask. Save dialog rather than a fixed location: a backup
+  /// they cannot find is a backup they do not have.
+  async function exportBackup() {
+    error = null;
+    try {
+      const path = await saveDialog({
+        defaultPath: `panreader-${Math.floor(Date.now() / 1000)}.pnbk`,
+        filters: [{ name: "PanReader backup", extensions: ["pnbk"] }],
+      });
+      if (!path) return;
+      backupBusy = true;
+      await invoke("export_backup", { path });
+      await refreshBackups();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  /// Never restore straight from a click. The dry run and the real restore are one code
+  /// path in Rust, so what this shows is exactly what confirming does.
+  async function previewBackup(path) {
+    error = null;
+    backupBusy = true;
+    try {
+      if (!path) {
+        path = await openDialog({
+          multiple: false,
+          filters: [{ name: "PanReader backup", extensions: ["pnbk", "json", "gz"] }],
+        });
+        if (!path) return;
+      }
+      plan = { path, report: await invoke("preview_backup", { path }) };
+    } catch (e) {
+      error = String(e);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function applyBackup() {
+    if (!plan) return;
+    backupBusy = true;
+    try {
+      await invoke("import_backup", { path: plan.path });
+      plan = null;
+      await Promise.all([refreshLibrary(), refreshBackups()]);
+      // A restore replaces the settings blob, so the shell has to re-read it.
+      await loadSettings();
+      watchScan();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  /// Bytes, at the one precision a backup ever needs.
+  const weigh = (bytes) => `${(bytes / 1024).toFixed(0)} kB`;
+  const when = (seconds) =>
+    new Date(seconds * 1000).toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+
   async function refreshHistory() {
     try {
       [log, marks, tally] = await Promise.all([
@@ -760,6 +841,8 @@
           live_background: liveBg,
           reduce_animations: reduceMotion,
           list_view: listView,
+          auto_backup: autoBackup,
+          backup_keep: Number(backupKeep) || 1,
         },
       }).catch((e) => console.warn("could not save settings:", e));
     }, 500);
@@ -1099,11 +1182,9 @@
     }, 300);
   }
 
-  onMount(async () => {
-    vw = window.innerWidth;
-    vh = window.innerHeight;
-    // Settings first: the chapter open uses the persisted reading-mode default, so
-    // loading them afterwards would detect against the wrong fallback once.
+  /// Read the settings blob into the shell. Called at launch, and again after a
+  /// restore: settings are one blob and a restore replaces it wholesale.
+  async function loadSettings() {
     try {
       const saved = await invoke("settings");
       mode = saved.default_reading_mode;
@@ -1117,9 +1198,19 @@
       liveBg = saved.live_background ?? true;
       reduceMotion = saved.reduce_animations ?? false;
       listView = saved.list_view ?? false;
+      autoBackup = saved.auto_backup ?? true;
+      backupKeep = saved.backup_keep ?? 8;
     } catch (e) {
       console.warn("could not load settings:", e);
     }
+  }
+
+  onMount(async () => {
+    vw = window.innerWidth;
+    vh = window.innerHeight;
+    // Settings first: the chapter open uses the persisted reading-mode default, so
+    // loading them afterwards would detect against the wrong fallback once.
+    await loadSettings();
     applyTheme();
     // Following the system means following it while the app is open, not only at
     // launch.
@@ -1225,6 +1316,7 @@
           onclick={() => {
             section = item.id;
             if (item.id === "history") refreshHistory();
+            if (item.id === "settings") refreshBackups();
           }}
         >
           <span class="tick" aria-hidden="true"></span>
@@ -1568,7 +1660,7 @@
             {#each marks as mark (mark.id)}
               <li>
                 <button
-                  class="row"
+                  class="entry"
                   onclick={() =>
                     load({
                       id: mark.chapter_id,
@@ -1605,7 +1697,7 @@
             {#each day.rows as row (row.id)}
               <li>
                 <button
-                  class="row"
+                  class="entry"
                   onclick={() =>
                     load({ id: row.chapter_id, title: row.chapter_title, page: row.last_page })}
                 >
@@ -1706,6 +1798,72 @@
             }}>Reduce motion</button
           >
         </div>
+
+        <h2 class="section">Backup</h2>
+        <p class="meta lede">
+          What the rows mean, not a copy of the database: library, progress, history,
+          bookmarks, categories, catalogs and settings. No pages, no covers.
+        </p>
+        <div class="row">
+          <button class="chip accent" disabled={backupBusy} onclick={exportBackup}>
+            Export…
+          </button>
+          <button class="chip" disabled={backupBusy} onclick={() => previewBackup(null)}>
+            Restore from a file…
+          </button>
+          <button
+            class="chip"
+            class:on={autoBackup}
+            aria-pressed={autoBackup}
+            onclick={() => {
+              autoBackup = !autoBackup;
+              persist();
+            }}>Automatic</button
+          >
+          {#if autoBackup}
+            <label class="meta keep">
+              keep
+              <input
+                type="number"
+                min="1"
+                max="99"
+                bind:value={backupKeep}
+                onchange={persist}
+              />
+            </label>
+          {/if}
+        </div>
+
+        <!-- The dry run. Shown before anything is written, every time. -->
+        {#if plan}
+          <div class="plan">
+            <b>{plan.path.split(/[\\/]/).pop()}</b>
+            <p class="meta">
+              {plan.report.series_added} new series and {plan.report.chapters_added} new chapters;
+              {plan.report.series_matched} series and {plan.report.chapters_matched} chapters
+              already here. {plan.report.positions_advanced} positions move forward,
+              {plan.report.positions_kept} stay where they are.
+              {plan.report.bookmarks_added} bookmarks and {plan.report.sessions_added} sessions
+              added. Settings are replaced.
+            </p>
+            <div class="chips">
+              <button class="chip accent" disabled={backupBusy} onclick={applyBackup}>
+                Restore
+              </button>
+              <button class="chip" onclick={() => (plan = null)}>Cancel</button>
+            </div>
+          </div>
+        {/if}
+
+        {#each saves as save (save.path)}
+          <div class="row">
+            <span class="name grow">{when(save.taken_at)}</span>
+            <span class="meta">{weigh(save.bytes)}</span>
+            <button class="chip" disabled={backupBusy} onclick={() => previewBackup(save.path)}>
+              Restore
+            </button>
+          </div>
+        {/each}
       {/if}
     </main>
 
@@ -1875,8 +2033,8 @@
     align-items: center;
     gap: var(--s-2);
   }
-  /* The row takes the width; its trailing controls do not grow. */
-  .row {
+  /* The entry takes the width; its trailing controls do not grow. */
+  .entry {
     flex: 1;
     min-width: 0;
     display: flex;
@@ -1891,17 +2049,17 @@
     text-align: left;
     cursor: pointer;
   }
-  .row:hover {
+  .entry:hover {
     background: var(--glass);
   }
-  .row .thumb {
+  .entry .thumb {
     width: 32px;
     height: 48px;
     object-fit: cover;
     border-radius: var(--r-1);
     flex: none;
   }
-  .row .what {
+  .entry .what {
     flex: 1;
     min-width: 0;
     display: flex;
@@ -1909,7 +2067,7 @@
     gap: 2px;
   }
   /* Series and chapter names can hold CJK, so --font-body, never --font-display. */
-  .row .what b {
+  .entry .what b {
     font: 600 var(--text-base) / var(--leading-tight) var(--font-body);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1918,6 +2076,27 @@
   .note {
     width: 12rem;
     flex: none;
+  }
+  .lede {
+    max-width: 60ch;
+    margin: 0 0 var(--s-3);
+  }
+  .keep input {
+    width: 4rem;
+    margin-left: var(--s-2);
+  }
+  /* A restore is the one destructive thing in the app, so its preview is the one place
+     that gets a panel rather than a line. */
+  .plan {
+    margin: var(--s-3) 0;
+    padding: var(--s-4);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-2);
+    background: var(--raised);
+  }
+  .plan p {
+    max-width: 60ch;
+    margin: var(--s-2) 0 var(--s-3);
   }
 
   /* DESIGN.md's token layer. The full themes-as-data generator is S2; these are the
