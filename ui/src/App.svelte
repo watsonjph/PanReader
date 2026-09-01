@@ -136,9 +136,22 @@
   const NAV = [
     { id: "library", name: "Library", icon: "▤" },
     { id: "catalogs", name: "Catalogs", icon: "☁" },
+    { id: "history", name: "History", icon: "◷" },
     { id: "settings", name: "Settings", icon: "⚙" },
   ];
   let error = $state(null);
+
+  /// History, bookmarks and the numbers derived from them. Loaded when the section is
+  /// opened, not on launch: none of it is on the path to a first page.
+  let log = $state([]);
+  let marks = $state([]);
+  let tally = $state(null);
+  /// Which pages of the open chapter are bookmarked. Fetched once when the chapter
+  /// opens: asking the backend on every turn would put an IPC round trip on the page
+  /// turn path to answer a question a set already answers.
+  let chapterMarks = $state(new Set());
+  const bookmarked = $derived(chapterMarks.has(page));
+
   let hud = $state({ fps: 0, worst: 0, dropped: 0, mounted: 0, firstPaint: null });
   let rust = $state({});
   let autoscroll = $state(false);
@@ -355,6 +368,10 @@
     // on the way in. DESIGN.md, The image reader view.
     palette = null;
     error = null;
+    chapterMarks = new Set();
+    invoke("bookmarks", { chapterId: chapter.id })
+      .then((rows) => (chapterMarks = new Set(rows.map((m) => m.page))))
+      .catch(() => {});
     hud.firstPaint = null;
     for (const el of live.values()) el.remove();
     live.clear();
@@ -480,6 +497,98 @@
         invoke("continue_reading"),
         invoke("catalogs"),
       ]);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function refreshHistory() {
+    try {
+      [log, marks, tally] = await Promise.all([
+        invoke("history", { limit: 200 }),
+        invoke("bookmarks", { chapterId: null }),
+        invoke("reading_stats"),
+      ]);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// The log, cut into days. Grouping in the template would re-derive it on every
+  /// unrelated state change; this only runs when the log does.
+  const byDay = $derived.by(() => {
+    const days = [];
+    for (const row of log) {
+      const key = new Date(row.ended_at).toDateString();
+      if (days.at(-1)?.key !== key) days.push({ key, rows: [] });
+      days.at(-1).rows.push(row);
+    }
+    return days;
+  });
+
+  const DAY = 86_400_000;
+  /// "Today" beats a date, and a date beats a relative age older than a week.
+  function dayName(key) {
+    const midnight = new Date().setHours(0, 0, 0, 0);
+    const back = Math.round((midnight - new Date(key).setHours(0, 0, 0, 0)) / DAY);
+    if (back <= 0) return "Today";
+    if (back === 1) return "Yesterday";
+    if (back < 7) return new Date(key).toLocaleDateString(undefined, { weekday: "long" });
+    return new Date(key).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
+  const clock = (ms) =>
+    new Date(ms).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+  /// Minutes are unreadable past a couple of hours, hours are useless below one. Kept
+  /// tight because it shares a row with five plain counts and must not wrap past them.
+  const spell = (minutes) =>
+    minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+
+  async function forget(id) {
+    try {
+      await invoke("forget", { id: id ?? null });
+      await refreshHistory();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Mark or unmark where the reader is. The image reader has a page and an offset into
+  /// it; the text reader will pass a paragraph and a character instead, which is why
+  /// both pairs are on the call and both are nullable.
+  async function toggleBookmark() {
+    if (chapterId === null) return;
+    const frac = paged || !scroller ? 0 : pageFrac(tops, scroller.scrollTop, page, canvasHeight());
+    try {
+      const now = await invoke("toggle_bookmark", {
+        chapterId,
+        page,
+        frac,
+        paragraph: null,
+        charOffset: null,
+      });
+      // A new Set, not a mutation: the derived flag is watching the reference.
+      const next = new Set(chapterMarks);
+      next[now ? "add" : "delete"](page);
+      chapterMarks = next;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function dropBookmark(id) {
+    try {
+      await invoke("remove_bookmark", { id });
+      marks = marks.filter((m) => m.id !== id);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function noteBookmark(id, note) {
+    try {
+      await invoke("set_bookmark_note", { id, note });
     } catch (e) {
       error = String(e);
     }
@@ -856,6 +965,7 @@
 
     if (k === "Escape") toLibrary();
     else if (k === "s") autoscroll = !autoscroll;
+    else if (k === "b") toggleBookmark();
     else if (k === "f") { fit = FITS[(FITS.indexOf(fit) + 1) % FITS.length]; persist(); }
     else if (k === "d") setSample(SAMPLES[(SAMPLES.indexOf(sample) + 1) % SAMPLES.length]);
     else if (k === "p") setPad(PADS[(PADS.indexOf(pad) + 1) % PADS.length]);
@@ -1112,7 +1222,10 @@
           class:on={section === item.id}
           aria-current={section === item.id ? "page" : undefined}
           title={navIcons ? item.name : null}
-          onclick={() => (section = item.id)}
+          onclick={() => {
+            section = item.id;
+            if (item.id === "history") refreshHistory();
+          }}
         >
           <span class="tick" aria-hidden="true"></span>
           <span class="ico">{item.icon}</span>
@@ -1428,6 +1541,96 @@
         {/if}
       {/if}
 
+      {#if section === "history"}
+        <header class="bar">
+          <h1>History</h1>
+          {#if log.length}
+            <button class="chip danger" onclick={() => forget(null)}>Clear history</button>
+          {/if}
+        </header>
+
+        <!-- Derived from the log every time this renders. Deleting history therefore
+             resets these honestly instead of leaving a stale number behind. -->
+        {#if tally}
+          <div class="tally">
+            <div><b>{tally.chapters}</b><span class="meta">chapters</span></div>
+            <div><b>{tally.pages}</b><span class="meta">pages</span></div>
+            <div><b>{spell(tally.minutes)}</b><span class="meta">reading</span></div>
+            <div><b>{tally.days}</b><span class="meta">days</span></div>
+            <div><b>{tally.streak}</b><span class="meta">day streak</span></div>
+            <div><b>{tally.best_streak}</b><span class="meta">best streak</span></div>
+          </div>
+        {/if}
+
+        {#if marks.length}
+          <h2 class="section">Bookmarks</h2>
+          <ul class="rows">
+            {#each marks as mark (mark.id)}
+              <li>
+                <button
+                  class="row"
+                  onclick={() =>
+                    load({
+                      id: mark.chapter_id,
+                      title: mark.chapter_title,
+                      page: mark.page,
+                      page_frac: mark.page_frac,
+                    })}
+                >
+                  <span class="what">
+                    <b>{mark.series_title}</b>
+                    <span class="meta">{mark.chapter_title} · page {mark.page + 1}</span>
+                  </span>
+                </button>
+                <input
+                  class="note"
+                  value={mark.note}
+                  placeholder="Note"
+                  aria-label="Note on {mark.series_title}, page {mark.page + 1}"
+                  onchange={(e) => noteBookmark(mark.id, e.currentTarget.value)}
+                />
+                <button
+                  class="chip"
+                  aria-label="Remove bookmark"
+                  onclick={() => dropBookmark(mark.id)}>×</button
+                >
+              </li>
+            {/each}
+          </ul>
+        {/if}
+
+        {#each byDay as day (day.key)}
+          <h2 class="section">{dayName(day.key)}</h2>
+          <ul class="rows">
+            {#each day.rows as row (row.id)}
+              <li>
+                <button
+                  class="row"
+                  onclick={() =>
+                    load({ id: row.chapter_id, title: row.chapter_title, page: row.last_page })}
+                >
+                  {#if base && row.cover_chapter_id !== null}
+                    <img class="thumb" src={coverUrl(row.cover_chapter_id)} alt="" loading="lazy" />
+                  {/if}
+                  <span class="what">
+                    <b>{row.series_title}</b>
+                    <span class="meta">{row.chapter_title} · {row.pages} pages</span>
+                  </span>
+                  <span class="meta">{clock(row.ended_at)}</span>
+                </button>
+                <button class="chip" aria-label="Forget this" onclick={() => forget(row.id)}
+                  >×</button
+                >
+              </li>
+            {/each}
+          </ul>
+        {/each}
+
+        {#if !log.length && !marks.length}
+          <p class="meta empty">Nothing read yet. Open a chapter and it shows up here.</p>
+        {/if}
+      {/if}
+
       {#if section === "settings"}
         <header class="bar"><h1>Settings</h1></header>
 
@@ -1581,7 +1784,7 @@
 {#if chapterId !== null && pageCount > 0 && pageCount <= 400}
   <div class="koma" class:left={rtl} class:right={!rtl} aria-hidden="true">
     {#each { length: pageCount } as _, i (i)}
-      <i class:on={i === page}></i>
+      <i class:on={i === page} class:done={i < page}></i>
     {/each}
   </div>
 {/if}
@@ -1589,6 +1792,7 @@
 <div class="hud" class:reading={chapterId !== null}>
   <b>{chapterTitle}</b>
   <button onclick={toLibrary}>library [esc]</button>
+  <button onclick={toggleBookmark}>{bookmarked ? "unmark" : "bookmark"} [b]</button>
   {#if !paged}
     <button onclick={() => (autoscroll = !autoscroll)}>
       {autoscroll ? "stop" : "flick"} [s]
@@ -1633,6 +1837,89 @@
 </div>
 
 <style>
+  /* Six numbers, equal weight, no chartjunk. They are counts, so they read as counts,
+     in --font-data for the tabular figures. */
+  .tally {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+    gap: var(--s-3);
+    margin-bottom: var(--s-6);
+  }
+  .tally div {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-1);
+    padding: var(--s-4);
+    border-radius: var(--r-2);
+    background: var(--raised);
+  }
+  .tally b {
+    font: var(--text-lg) / var(--leading-tight) var(--font-data);
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    /* "21h 24m" is the widest of the six and the only one that can break. A wrapped
+       count reads as two counts. */
+    white-space: nowrap;
+  }
+
+  .rows {
+    list-style: none;
+    margin: 0 0 var(--s-6);
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .rows li {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+  }
+  /* The row takes the width; its trailing controls do not grow. */
+  .row {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--s-3);
+    padding: var(--s-2) var(--s-3);
+    border: 0;
+    border-radius: var(--r-2);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .row:hover {
+    background: var(--glass);
+  }
+  .row .thumb {
+    width: 32px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: var(--r-1);
+    flex: none;
+  }
+  .row .what {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  /* Series and chapter names can hold CJK, so --font-body, never --font-display. */
+  .row .what b {
+    font: 600 var(--text-base) / var(--leading-tight) var(--font-body);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .note {
+    width: 12rem;
+    flex: none;
+  }
+
   /* DESIGN.md's token layer. The full themes-as-data generator is S2; these are the
      same names, so that work becomes a swap rather than a rewrite. */
   /* Signature 1. Fixed behind everything, cross-fading on --dur-base when the
@@ -2116,25 +2403,6 @@
     border-radius: var(--r-1);
     white-space: nowrap;
   }
-  .library h1,
-  .library h2 {
-    font-weight: 600;
-    margin: 0 0 12px;
-  }
-  .library h2 {
-    margin-top: 24px;
-    font-size: 15px;
-  }
-  .roots {
-    margin-bottom: 20px;
-  }
-  .root {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    margin-bottom: 6px;
-    color: var(--text-muted);
-  }
   input {
     font: inherit;
     flex: 1 1 280px;
@@ -2159,10 +2427,8 @@
   .row .grow {
     flex: 1;
   }
-  .busy {
-    color: var(--accent);
-  }
   .empty {
+    padding: var(--s-7) 0;
     color: var(--text-muted);
   }
   .shelf {
