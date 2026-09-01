@@ -97,6 +97,11 @@ pub struct Chapter {
     pub title: String,
     pub number: Option<f64>,
     pub page_count: i64,
+    /// Where inside the container. A path is machine-local and is not carried; this is
+    /// not -- it is the spine entry inside the book, and a restored novel chapter
+    /// without it is unopenable even once the file turns up.
+    #[serde(default)]
+    pub locator: String,
     #[serde(default)]
     pub page: i64,
     #[serde(default)]
@@ -240,7 +245,7 @@ pub fn export(db: &mut pr_db::Db) -> Result<Backup> {
         &tx,
         "SELECT c.series_id, c.id, c.source_id, c.title, c.number, c.page_count,
                 coalesce(p.page, 0), coalesce(p.page_frac, 0), p.paragraph, p.char_offset,
-                coalesce(p.completed, 0), coalesce(p.updated_at, 0)
+                coalesce(p.completed, 0), coalesce(p.updated_at, 0), c.locator
          FROM chapters c
          LEFT JOIN positions p ON p.chapter_id = c.id
          ORDER BY c.series_id, c.number, c.id",
@@ -259,6 +264,7 @@ pub fn export(db: &mut pr_db::Db) -> Result<Backup> {
                     char_offset: r.get(9)?,
                     completed: r.get::<_, i64>(10)? != 0,
                     updated_at: r.get(11)?,
+                    locator: r.get(12)?,
                     bookmarks: Vec::new(),
                     sessions: Vec::new(),
                 },
@@ -506,14 +512,15 @@ fn merge_chapter(
             // No path: this chapter is not on this disk. The progress is restored and
             // the row becomes readable when a scan finds a file whose content matches.
             tx.execute(
-                "INSERT INTO chapters (series_id, source_id, title, number, page_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO chapters (series_id, source_id, title, number, page_count, locator)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     series_id,
                     chapter.identity,
                     chapter.title,
                     chapter.number,
-                    chapter.page_count
+                    chapter.page_count,
+                    chapter.locator
                 ],
             )?;
             report.chapters_added += 1;

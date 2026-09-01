@@ -315,3 +315,59 @@ fn something_that_is_not_an_epub_says_so_by_name() {
         Err(crate::Error::NotAnEpub(_, _))
     ));
 }
+
+#[test]
+fn a_root_yields_books_and_folders_of_prose_as_two_different_shapes() {
+    let root = std::env::temp_dir().join("pr_text_scan_root");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("Notes")).unwrap();
+    build_epub(&root.join("bocchi.epub"), true);
+    std::fs::write(
+        root.join("Notes/Chapter 2.txt"),
+        "second
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Notes/Chapter 10.txt"),
+        "tenth
+",
+    )
+    .unwrap();
+    std::fs::write(root.join("Notes/cover.jpg"), b"not text").unwrap();
+
+    let found = crate::scan::scan_root(&root);
+    assert_eq!(found.len(), 2, "one book, one folder of prose");
+
+    let book = found
+        .iter()
+        .find(|s| s.title.starts_with("Bocchi"))
+        .unwrap();
+    assert_eq!(book.chapters.len(), 2);
+    // Every chapter shares the container; the locator is what separates them.
+    assert!(
+        book.chapters
+            .iter()
+            .all(|c| c.path == root.join("bocchi.epub"))
+    );
+    assert_eq!(book.chapters[0].locator, "OEBPS/text/one.xhtml");
+    // Spine position, because "Chapter Twenty" has no digits to parse.
+    assert_eq!(book.chapters[1].number, Some(2.0));
+
+    let notes = found.iter().find(|s| s.title == "Notes").unwrap();
+    assert_eq!(notes.chapters.len(), 2, "the jpeg is not prose");
+    // Numbered from the filename and sorted by it, so 10 follows 2 rather than sorting
+    // before it the way a plain string compare would.
+    assert_eq!(
+        notes.chapters.iter().map(|c| c.number).collect::<Vec<_>>(),
+        [Some(2.0), Some(10.0)]
+    );
+
+    // And reading one goes through the same call whichever container it came from.
+    let from_book = crate::scan::read(&book.chapters[0].path, &book.chapters[0].locator).unwrap();
+    assert_eq!(from_book.blocks[1].text(), "It began badly.");
+    let from_file = crate::scan::read(&notes.chapters[0].path, "").unwrap();
+    assert_eq!(from_file.blocks[0].text(), "second");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

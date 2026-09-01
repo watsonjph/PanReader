@@ -143,7 +143,12 @@ impl App {
             let known = self.db.lock().known()?;
             let mut total = pr_db::ScanSummary::default();
             for root in roots {
-                let found = pr_archive::scan::scan_root(&root, &known);
+                // Two walkers over one root, on purpose. A CBZ is one file holding one
+                // chapter and an EPUB is one file holding a whole series, so the two
+                // scans answer different questions; sharing a walker would mean a
+                // walker that knows both readers.
+                let mut found = pr_archive::scan::scan_root(&root, &known);
+                found.extend(pr_text::scan::scan_root(&root).into_iter().map(books));
                 let summary = self.db.lock().sync(&found)?;
                 total.series += summary.series;
                 total.chapters_added += summary.chapters_added;
@@ -155,6 +160,91 @@ impl App {
         self.scanning.store(false, SeqCst);
         result
     }
+}
+
+/// A book as the library stores it.
+///
+/// The one place the two scanners meet, and it is a field-for-field move rather than a
+/// shared type: `pr-text` describes a book and `pr-archive` describes a shelf of
+/// chapters, and neither should have to import the other to say so.
+fn books(book: pr_text::scan::Scanned) -> pr_archive::scan::ScannedSeries {
+    pr_archive::scan::ScannedSeries {
+        path: book.path,
+        title: book.title,
+        author: book.author,
+        kind: "text",
+        chapters: book
+            .chapters
+            .into_iter()
+            .map(|c| pr_archive::scan::ScannedChapter {
+                path: c.path,
+                locator: c.locator,
+                title: c.title,
+                number: c.number,
+                // Filled in when the chapter is first opened and its blocks counted.
+                // Parsing every chapter of every book to scan a shelf is not a scan.
+                page_count: 0,
+                identity: c.identity,
+                // Not stamped: `pr-text` has no cache to skip, so a zero here keeps the
+                // image scanner's cache from ever matching a text chapter by accident.
+                mtime: 0,
+                size: 0,
+            })
+            .collect(),
+    }
+}
+
+/// A chapter of prose, parsed once.
+///
+/// Hard invariant 9: changing font, size, measure or theme reflows this in the browser
+/// and never comes back here. Held in the same map as open image chapters so closing
+/// the reader drops it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct TextChapter {
+    title: String,
+    document: pr_text::Document,
+    /// Blocks, which is what a text position counts in.
+    blocks: i64,
+    characters: i64,
+    page: i64,
+    paragraph: Option<i64>,
+    char_offset: Option<i64>,
+}
+
+/// Open a novel chapter.
+///
+/// Over IPC as JSON, which invariant 1 forbids for image bytes and permits here: a
+/// chapter of prose is tens of kilobytes of text, and it is text either way. Sending it
+/// through `pan://` would mean a second protocol handler to avoid a cost that does not
+/// exist.
+#[tauri::command]
+fn open_text(app: State<App>, chapter_id: i64) -> Result<TextChapter, String> {
+    let row = app
+        .db
+        .lock()
+        .chapter(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or("no such chapter")?;
+
+    let document = pr_text::scan::read(std::path::Path::new(&row.path), &row.locator)
+        .map_err(|e| format!("{e:#}"))?;
+    let blocks = document.blocks.len() as i64;
+
+    // The scan left this at zero because counting blocks means parsing, and now it has
+    // been parsed anyway.
+    if row.page_count != blocks {
+        let _ = app.db.lock().set_page_count(chapter_id, blocks);
+    }
+
+    Ok(TextChapter {
+        title: row.title,
+        characters: document.chars() as i64,
+        blocks,
+        document,
+        page: row.page,
+        paragraph: None,
+        char_offset: None,
+    })
 }
 
 #[tauri::command]
@@ -739,7 +829,8 @@ fn main() {
             backups,
             export_backup,
             preview_backup,
-            import_backup
+            import_backup,
+            open_text
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

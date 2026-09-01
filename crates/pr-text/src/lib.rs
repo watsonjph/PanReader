@@ -12,6 +12,7 @@
 pub mod epub;
 mod html;
 mod plain;
+pub mod scan;
 
 pub use epub::Book;
 pub use html::from_html;

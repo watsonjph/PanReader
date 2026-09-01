@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   // Names from the same file the colours come from, so adding a theme still touches
   // data/themes.json and nothing else.
   import themeData from "../../data/themes.json";
@@ -140,6 +140,34 @@
     { id: "settings", name: "Settings", icon: "⚙" },
   ];
   let error = $state(null);
+
+  /// Stacks rather than bundled files. A reading face is a licence entry and a line in
+  /// docs/FONTS.md; the system serif is good on every desktop and costs neither.
+  const FACES = [
+    { id: "serif", name: "Serif" },
+    { id: "sans", name: "Sans" },
+    { id: "mono", name: "Mono" },
+  ];
+
+  // The text reader. It shares the shell, the library, positions, history and
+  // bookmarks with the image reader, and shares no rendering with it at all: the
+  // browser measures prose and nothing here ever does.
+  let text = $state(null);
+  let prose = $state(null);
+  /// Which block the reader is on, and how far into it. The same pair as the image
+  /// reader's page and page_frac, so it persists through the same one-row upsert and
+  /// backs up through the same file.
+  let block = $state(0);
+  let blockFrac = $state(0);
+  let textFont = $state("serif");
+  let textSize = $state(19);
+  let textMeasure = $state(66);
+  let textLeading = $state(160);
+  let textPaged = $state(false);
+  let textPaper = $state(false);
+  let textVertical = $state(false);
+  let textChrome = $state(false);
+
   let autoBackup = $state(true);
   let backupKeep = $state(8);
 
@@ -152,7 +180,7 @@
   /// opens: asking the backend on every turn would put an IPC round trip on the page
   /// turn path to answer a question a set already answers.
   let chapterMarks = $state(new Set());
-  const bookmarked = $derived(chapterMarks.has(page));
+  const bookmarked = $derived(chapterMarks.has(text ? block : page));
 
   let hud = $state({ fps: 0, worst: 0, dropped: 0, mounted: 0, firstPaint: null });
   let rust = $state({});
@@ -355,6 +383,11 @@
   }
 
   async function load(chapter, keepPage = false) {
+    // The one branch in the shell that knows there are two readers. Everything below
+    // this line is the image reader; the text reader shares nothing with it but the
+    // library, the position table and the chrome around both.
+    if (chapter.kind === "text") return loadText(chapter);
+
     const wanted = keepPage ? page : chapter.page ?? 0;
     // Strip mode keeps its place by page and a fraction of that page, never by pixel: a
     // reload can change the decode width and the padding, so an old pixel offset means
@@ -640,18 +673,23 @@
   /// both pairs are on the call and both are nullable.
   async function toggleBookmark() {
     if (chapterId === null) return;
-    const frac = paged || !scroller ? 0 : pageFrac(tops, scroller.scrollTop, page, canvasHeight());
+    const spot = text ? block : page;
+    const frac = text
+      ? blockFrac
+      : paged || !scroller
+        ? 0
+        : pageFrac(tops, scroller.scrollTop, page, canvasHeight());
     try {
       const now = await invoke("toggle_bookmark", {
         chapterId,
-        page,
+        page: spot,
         frac,
         paragraph: null,
         charOffset: null,
       });
       // A new Set, not a mutation: the derived flag is watching the reference.
       const next = new Set(chapterMarks);
-      next[now ? "add" : "delete"](page);
+      next[now ? "add" : "delete"](spot);
       chapterMarks = next;
     } catch (e) {
       error = String(e);
@@ -779,6 +817,128 @@
     }
   }
 
+  /// Open a chapter of prose.
+  ///
+  /// Parsed once, in Rust, and handed over as blocks. Changing the font, the size, the
+  /// measure or the theme below only ever restyles what is already here -- hard
+  /// invariant 9, and the reason none of those settings calls this again.
+  async function loadText(chapter) {
+    error = null;
+    chapterId = chapter.id;
+    chapterTitle = chapter.title;
+    palette = null;
+    chapterMarks = new Set();
+    openedAt = performance.now();
+    try {
+      text = await invoke("open_text", { chapterId: chapter.id });
+      chapterTitle = text.title || chapter.title;
+      block = chapter.page ?? text.page ?? 0;
+      blockFrac = chapter.page_frac ?? 0;
+      invoke("bookmarks", { chapterId: chapter.id })
+        .then((rows) => (chapterMarks = new Set(rows.map((m) => m.page))))
+        .catch(() => {});
+      // The blocks have to exist before there is anything to scroll to.
+      await tick();
+      goToBlock(block, blockFrac);
+      hud.firstPaint = Math.round(performance.now() - openedAt);
+    } catch (e) {
+      error = String(e);
+      text = null;
+      chapterId = null;
+    }
+  }
+
+  /// Land on a block, and a fraction into it.
+  ///
+  /// `scrollIntoView` rather than arithmetic: the browser knows where the block ended
+  /// up after reflow and we do not, which is the whole point of letting it measure.
+  function goToBlock(index, frac = 0) {
+    const el = prose?.querySelector(`[data-b="${index}"]`);
+    if (!el) return;
+    if (textPaged) {
+      // In columns, the block's offset within the scroller is a column boundary away;
+      // snapping to the column that contains it is what a page turn means here.
+      const page = Math.floor(el.offsetLeft / prose.clientWidth);
+      prose.scrollLeft = page * prose.clientWidth;
+    } else {
+      prose.scrollTop = el.offsetTop + el.offsetHeight * frac - prose.clientHeight * 0.1;
+    }
+  }
+
+  /// Where the reader is now: the first block whose bottom is still on screen.
+  function readTextPosition() {
+    if (!prose || !text) return;
+    const blocks = prose.querySelectorAll("[data-b]");
+
+    // At the end, the position is the end. Picking the first block still on screen is
+    // right everywhere except the last screenful, where it stalls a few blocks short --
+    // and a chapter that can never reach its last block is a chapter that never marks
+    // itself read.
+    const along = textPaged
+      ? prose.scrollLeft + prose.clientWidth >= prose.scrollWidth - 2
+      : prose.scrollTop + prose.clientHeight >= prose.scrollHeight - 2;
+    if (along) {
+      block = text.blocks - 1;
+      blockFrac = 1;
+      savePosition();
+      return;
+    }
+
+    if (textPaged) {
+      const left = prose.scrollLeft;
+      const right = left + prose.clientWidth;
+      for (const el of blocks) {
+        if (el.offsetLeft + el.offsetWidth > left && el.offsetLeft < right) {
+          block = Number(el.dataset.b);
+          blockFrac = 0;
+          break;
+        }
+      }
+    } else {
+      const top = prose.scrollTop + prose.clientHeight * 0.1;
+      for (const el of blocks) {
+        if (el.offsetTop + el.offsetHeight > top) {
+          block = Number(el.dataset.b);
+          blockFrac = Math.min(
+            Math.max((top - el.offsetTop) / (el.offsetHeight || 1), 0),
+            1,
+          );
+          break;
+        }
+      }
+    }
+    savePosition();
+  }
+
+  /// The next or previous chapter of the open series, without going back to the shelf.
+  ///
+  /// Reads from the list the chapter panel already fetched, so it costs nothing and is
+  /// silently unavailable if a chapter was opened from history or a bookmark rather
+  /// than from its series.
+  const neighbours = $derived.by(() => {
+    const at = seriesChapters.findIndex((c) => c.id === chapterId);
+    if (at < 0) return { prev: null, next: null };
+    return { prev: seriesChapters[at - 1] ?? null, next: seriesChapters[at + 1] ?? null };
+  });
+
+  function stepChapter(delta) {
+    const to = delta < 0 ? neighbours.prev : neighbours.next;
+    if (to) load(to);
+  }
+
+  /// A page turn in columns, or a screenful in scroll.
+  function turnText(direction) {
+    if (!prose) return;
+    if (textPaged) {
+      prose.scrollLeft += direction * prose.clientWidth;
+    } else {
+      prose.scrollBy({
+        top: direction * prose.clientHeight * 0.9,
+        behavior: reduceMotion ? "auto" : "smooth",
+      });
+    }
+  }
+
   async function showSeries(row) {
     openSeries = row;
     showLive(row.cover_chapter_id);
@@ -793,6 +953,7 @@
   function toLibrary() {
     showLive(openSeries?.cover_chapter_id ?? chapterId);
     chapterId = null;
+    text = null;
     layout = null;
     for (const el of live.values()) el.remove();
     live.clear();
@@ -806,12 +967,18 @@
     if (chapterId === null) return;
     clearTimeout(positionTimer);
     const id = chapterId;
-    const at = page;
+    // Prose counts in blocks where pages count in pages, and both land in the same
+    // column: one position table, one backup, one merge rule.
+    const at = text ? block : page;
     // Paged mode has no within-page offset. The strip does, and losing it means
     // reopening a webtoon at the top of an eight thousand pixel page.
-    const frac =
-      paged || !scroller ? 0 : pageFrac(tops, scroller.scrollTop, at, canvasHeight());
-    const done = pageCount > 0 && page >= pageCount - 1;
+    const frac = text
+      ? blockFrac
+      : paged || !scroller
+        ? 0
+        : pageFrac(tops, scroller.scrollTop, at, canvasHeight());
+    const total = text ? text.blocks : pageCount;
+    const done = total > 0 && at >= total - 1;
     positionTimer = setTimeout(() => {
       invoke("save_position", { chapterId: id, page: at, frac, completed: done }).catch(
         () => {},
@@ -843,6 +1010,13 @@
           list_view: listView,
           auto_backup: autoBackup,
           backup_keep: Number(backupKeep) || 1,
+          text_font: textFont,
+          text_size: textSize,
+          text_measure: textMeasure,
+          text_leading: textLeading,
+          text_paged: textPaged,
+          text_paper: textPaper,
+          text_vertical: textVertical,
         },
       }).catch((e) => console.warn("could not save settings:", e));
     }, 500);
@@ -871,6 +1045,29 @@
     resetView();
     prefetch();
     reWarm();
+  }
+
+  /// A display change reflows what is already parsed and keeps your place.
+  ///
+  /// The two lines that matter: nothing here calls `open_text` again, and nothing here
+  /// measures a line of text in JavaScript. The browser reflows, and then we ask it
+  /// where the block we were reading ended up.
+  async function reflow() {
+    persist();
+    const was = block;
+    const frac = blockFrac;
+    await tick();
+    goToBlock(was, frac);
+  }
+
+  function setTextSize(next) {
+    textSize = Math.min(Math.max(next, 12), 40);
+    reflow();
+  }
+
+  function setTextPaged(next) {
+    textPaged = next;
+    reflow();
   }
 
   /// Zoom and pan belong to the page you were looking at, not the next one.
@@ -1046,6 +1243,26 @@
   function onKey(e) {
     const k = e.key;
 
+    // Prose has its own small set. None of fit, rotation, downsampling or double pages
+    // means anything to a paragraph, and binding them anyway is how a shared reader
+    // ends up with settings that do nothing.
+    if (text) {
+      if (k === "Escape") toLibrary();
+      else if (k === "b") toggleBookmark();
+      else if (k === "t") setTextPaged(!textPaged);
+      else if (k === "-") setTextSize(textSize - 1);
+      else if (k === "+" || k === "=") setTextSize(textSize + 1);
+      else if (k === "ArrowRight" || k === "PageDown" || k === " ") turnText(1);
+      else if (k === "ArrowLeft" || k === "PageUp") turnText(-1);
+      else if (k === "Home") goToBlock(0);
+      else if (k === "End") goToBlock(text.blocks - 1);
+      else if (k === "[") stepChapter(-1);
+      else if (k === "]") stepChapter(1);
+      else return;
+      e.preventDefault();
+      return;
+    }
+
     if (k === "Escape") toLibrary();
     else if (k === "s") autoscroll = !autoscroll;
     else if (k === "b") toggleBookmark();
@@ -1200,6 +1417,13 @@
       listView = saved.list_view ?? false;
       autoBackup = saved.auto_backup ?? true;
       backupKeep = saved.backup_keep ?? 8;
+      textFont = saved.text_font ?? "serif";
+      textSize = saved.text_size ?? 19;
+      textMeasure = saved.text_measure ?? 66;
+      textLeading = saved.text_leading ?? 160;
+      textPaged = saved.text_paged ?? false;
+      textPaper = saved.text_paper ?? false;
+      textVertical = saved.text_vertical ?? false;
     } catch (e) {
       console.warn("could not load settings:", e);
     }
@@ -1230,7 +1454,7 @@
 
 <div
   class="scroller"
-  class:hidden={paged}
+  class:hidden={paged || text}
   bind:this={scroller}
   onscroll={() => (dirty = true)}
 >
@@ -1284,6 +1508,162 @@
     </div>
   </div>
 {/if}
+
+<!-- The text reader.
+     Everything about it that matters is a CSS declaration: the measure is a max-width
+     in `ch`, the pagination is `columns`, and the vertical mode is `writing-mode`. The
+     browser does every measurement, which is hard invariant 10 -- measuring lines in
+     JavaScript on every reflow is the one reliable way to miss the frame budget here. -->
+{#if text}
+  <div
+    class="reading"
+    class:paper={textPaper}
+    class:columns={textPaged}
+    class:vertical={textVertical}
+    style="--measure:{textMeasure}ch; --prose-size:{textSize}px; --prose-leading:{textLeading /
+      100}; --prose-face:var(--face-{textFont})"
+  >
+    <div
+      class="prose"
+      bind:this={prose}
+      onscroll={readTextPosition}
+      tabindex="-1"
+      role="document"
+    >
+      <div class="column">
+        {#each text.document.blocks as b, i (i)}
+          {#if b.kind === "divider"}
+            <hr data-b={i} />
+          {:else if b.kind === "quote"}
+            <blockquote data-b={i}>{@render runs(b.spans)}</blockquote>
+          {:else if b.kind?.heading}
+            <h3 data-b={i} class="h{b.kind.heading}">{@render runs(b.spans)}</h3>
+          {:else}
+            <p data-b={i}>{@render runs(b.spans)}</p>
+          {/if}
+        {/each}
+      </div>
+    </div>
+
+    <!-- Reading chrome, hidden until asked for. Someone reading a novel is looking at
+         one column of text for an hour; a toolbar in the corner of that is furniture. -->
+    <button class="leave" onclick={toLibrary} title="Library [esc]" aria-label="Back to library">
+      ←
+    </button>
+
+    <div class="typeset" class:open={textChrome}>
+      <button class="chip" onclick={() => (textChrome = !textChrome)} aria-expanded={textChrome}>
+        {textChrome ? "✕" : "Aa"}
+      </button>
+      {#if textChrome}
+        <div class="set">
+          <label>
+            Size
+            <input
+              type="range"
+              min="12"
+              max="40"
+              value={textSize}
+              oninput={(e) => setTextSize(Number(e.currentTarget.value))}
+            />
+          </label>
+          <label>
+            Measure
+            <input
+              type="range"
+              min="40"
+              max="100"
+              value={textMeasure}
+              oninput={(e) => {
+                textMeasure = Number(e.currentTarget.value);
+                reflow();
+              }}
+            />
+          </label>
+          <label>
+            Leading
+            <input
+              type="range"
+              min="120"
+              max="220"
+              step="5"
+              value={textLeading}
+              oninput={(e) => {
+                textLeading = Number(e.currentTarget.value);
+                reflow();
+              }}
+            />
+          </label>
+          <div class="chips">
+            {#each FACES as face (face.id)}
+              <button
+                class="chip"
+                class:on={textFont === face.id}
+                aria-pressed={textFont === face.id}
+                onclick={() => {
+                  textFont = face.id;
+                  reflow();
+                }}>{face.name}</button
+              >
+            {/each}
+          </div>
+          <div class="chips">
+            <button
+              class="chip"
+              class:on={textPaged}
+              aria-pressed={textPaged}
+              onclick={() => setTextPaged(!textPaged)}>Pages [t]</button
+            >
+            <button
+              class="chip"
+              class:on={textPaper}
+              aria-pressed={textPaper}
+              onclick={() => {
+                textPaper = !textPaper;
+                persist();
+              }}>Paper</button
+            >
+            <button
+              class="chip"
+              class:on={textVertical}
+              aria-pressed={textVertical}
+              onclick={() => {
+                textVertical = !textVertical;
+                reflow();
+              }}>縦書き</button
+            >
+          </div>
+        </div>
+      {/if}
+    </div>
+
+    <!-- One line, always visible: which chapter, and how far in. A scrubber would be
+         the image reader's koma strip, and prose has no pages to draw. -->
+    <div class="thread">
+      <b>{chapterTitle}</b>
+      <span class="step">
+        <button
+          class="chip ghost"
+          disabled={!neighbours.prev}
+          title={neighbours.prev ? neighbours.prev.title : "First chapter"}
+          onclick={() => stepChapter(-1)}>‹</button
+        >
+        <span class="meta">{Math.round(((block + 1) / text.blocks) * 100)}%</span>
+        <button
+          class="chip ghost"
+          disabled={!neighbours.next}
+          title={neighbours.next ? neighbours.next.title : "Last chapter"}
+          onclick={() => stepChapter(1)}>›</button
+        >
+      </span>
+    </div>
+  </div>
+{/if}
+
+{#snippet runs(spans)}{#each spans as span, i (i)}{#if span.em && span.strong}<em
+        ><strong>{span.text}</strong></em
+      >{:else if span.em}<em>{span.text}</em>{:else if span.strong}<strong>{span.text}</strong
+      >{:else}{span.text}{/if}{/each}{/snippet}
 
 {#if error}
   <p class="error">{error}</p>
@@ -1939,7 +2319,7 @@
 {/if}
 
 <!-- Signature 3: koma progress. Not a percentage and not a scrubber. -->
-{#if chapterId !== null && pageCount > 0 && pageCount <= 400}
+{#if chapterId !== null && !text && pageCount > 0 && pageCount <= 400}
   <div class="koma" class:left={rtl} class:right={!rtl} aria-hidden="true">
     {#each { length: pageCount } as _, i (i)}
       <i class:on={i === page} class:done={i < page}></i>
@@ -1947,7 +2327,7 @@
   </div>
 {/if}
 
-<div class="hud" class:reading={chapterId !== null}>
+<div class="hud" class:reading={chapterId !== null && !text}>
   <b>{chapterTitle}</b>
   <button onclick={toLibrary}>library [esc]</button>
   <button onclick={toggleBookmark}>{bookmarked ? "unmark" : "bookmark"} [b]</button>
@@ -1995,6 +2375,222 @@
 </div>
 
 <style>
+  /* ------------------------------------------------------------------ text reader
+   *
+   * The whole layout engine of the text reader is here, and that is the point. The
+   * measure is a max-width in `ch`, so it tracks the font; pagination is `columns`, so
+   * the browser breaks the text; vertical Japanese is `writing-mode`. Nothing in
+   * JavaScript measures a glyph. */
+  .reading {
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    background: var(--bg);
+    color: var(--text);
+    --face-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+      "Noto Serif JP", serif;
+    --face-sans: var(--font-body);
+    --face-mono: var(--font-data);
+  }
+  /* A warm ground for a long session. Not a fourth theme -- it never leaves this
+     surface -- but it does have to redefine the tokens rather than just the background:
+     the chrome inside the reader is drawn from --glass, --hairline and --text-muted,
+     all of which are tuned for a dark ground and vanish on a light one. Redefining them
+     here cascades to every control inside without touching the shell. */
+  .reading.paper {
+    --bg: #f3ece0;
+    --text: #241f19;
+    --text-muted: #6b6154;
+    --hairline: rgba(36, 31, 25, 0.16);
+    --glass: rgba(36, 31, 25, 0.06);
+    --glass-hover: rgba(36, 31, 25, 0.12);
+    --shadow-float: 0 12px 40px rgba(36, 31, 25, 0.18);
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  .prose {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: var(--s-7) var(--s-5);
+    scrollbar-width: none;
+  }
+  .prose::-webkit-scrollbar {
+    display: none;
+  }
+  .column {
+    max-width: var(--measure);
+    margin: 0 auto;
+    font: var(--prose-size) / var(--prose-leading) var(--prose-face);
+    /* Hyphenation matters far more in columns, where a short line has nowhere to go. */
+    hyphens: auto;
+    text-wrap: pretty;
+  }
+
+  /* Pagination. `columns` with the container's own width means one screenful is one
+     column, so scrolling by clientWidth is a page turn and the browser decided where
+     every break falls. */
+  .reading.columns .prose {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-behavior: smooth;
+  }
+  .reading.columns .column {
+    height: 100%;
+    max-width: none;
+    column-width: var(--measure);
+    column-gap: var(--s-7);
+    column-fill: auto;
+  }
+  /* Raw Japanese. One declaration, and the columns above become horizontal bands of a
+     vertical text -- which is why it was worth doing at all. */
+  .reading.vertical .column {
+    writing-mode: vertical-rl;
+    height: 100%;
+    max-width: none;
+  }
+
+  .column p,
+  .column blockquote,
+  .column h3 {
+    margin: 0 0 var(--s-4);
+    /* An orphan or a widow in a paged view is the difference between typeset and
+       dumped, and it costs one declaration each. */
+    orphans: 2;
+    widows: 2;
+  }
+  .column blockquote {
+    padding-left: var(--s-4);
+    border-left: 2px solid var(--hairline);
+    font-style: italic;
+  }
+  .column h3 {
+    font-weight: 600;
+    margin-top: var(--s-6);
+    break-after: avoid-column;
+  }
+  .column .h1 {
+    font-size: 1.6em;
+  }
+  .column .h2 {
+    font-size: 1.35em;
+  }
+  /* A scene break, drawn rather than ruled: a hairline across the measure reads as a
+     divider in a UI and as a mistake in a novel. */
+  .column hr {
+    border: 0;
+    margin: var(--s-6) 0;
+    text-align: center;
+  }
+  .column hr::before {
+    content: "* * *";
+    letter-spacing: 0.4em;
+    opacity: 0.5;
+  }
+
+  /* Both bits of chrome sit at the same inset, one per corner, and neither takes a
+     shadow: the prose underneath is the thing being looked at. */
+  .leave {
+    position: absolute;
+    top: var(--s-4);
+    left: var(--s-4);
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: var(--r-full);
+    background: var(--glass);
+    color: var(--text-muted);
+    font: var(--text-base) / 1 var(--font-data);
+    cursor: pointer;
+  }
+  .leave:hover {
+    background: var(--glass-hover);
+    color: var(--text);
+  }
+
+  .typeset {
+    position: absolute;
+    top: var(--s-4);
+    right: var(--s-4);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--s-2);
+  }
+  /* A sheet along the bottom rather than a panel in the corner. The corner is where
+     the measure is, and typography controls that cover the text they are adjusting are
+     controls you have to close to use. */
+  .typeset .set {
+    position: fixed;
+    left: 50%;
+    bottom: var(--s-6);
+    transform: translateX(-50%);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s-3) var(--s-5);
+    max-width: min(56rem, calc(100vw - 2 * var(--s-5)));
+    padding: var(--s-3) var(--s-5);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-3);
+    /* Nearly opaque, unlike the rest of the app's chrome: this one sits directly on
+       body text, and prose showing through a control panel reads as a rendering bug. */
+    background: color-mix(in srgb, var(--bg) 97%, transparent);
+    backdrop-filter: blur(var(--blur-chrome));
+    box-shadow: var(--shadow-float);
+  }
+  .typeset label {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    font: var(--text-xs) / 1 var(--font-data);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  /* The app's `input` rule sets `flex: 1 1 280px` for text fields in horizontal rows.
+     These labels stack, so that basis lands on the height and each slider comes out
+     280px tall. */
+  .typeset input[type="range"] {
+    flex: none;
+    width: 7rem;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    accent-color: var(--accent);
+  }
+
+  .thread {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: space-between;
+    gap: var(--s-3);
+    padding: var(--s-2) var(--s-5);
+    font: var(--text-sm) / 1 var(--font-body);
+    color: var(--text-muted);
+    pointer-events: none;
+  }
+  /* The bar itself passes clicks through to the prose; only its buttons take them. */
+  .thread .step {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    pointer-events: auto;
+  }
+  .thread b {
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   /* Six numbers, equal weight, no chartjunk. They are counts, so they read as counts,
      in --font-data for the tabular figures. */
   .tally {

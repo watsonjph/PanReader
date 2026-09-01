@@ -38,6 +38,8 @@ const SERIES = [
 ].map((title, i) => ({
   id: i + 1,
   title,
+  // One novel on the shelf, so the shell has both readers to route to.
+  kind: i === 7 ? "text" : "image",
   path: `D:/manga/${title}`,
   chapter_count: 3 + (i % 9),
   unread: i % 4,
@@ -63,6 +65,13 @@ const FIXTURES = {
     list_view: false,
     auto_backup: true,
     backup_keep: 8,
+    text_font: "serif",
+    text_size: 19,
+    text_measure: 66,
+    text_leading: 160,
+    text_paged: false,
+    text_paper: false,
+    text_vertical: false,
   }),
   save_settings: () => null,
   roots: () => ["D:/manga"],
@@ -89,9 +98,10 @@ const FIXTURES = {
       page: 8,
       page_frac: 0.25,
       page_count: 24,
+      kind: "image",
     },
   ],
-  chapters: () =>
+  chapters: ({ seriesId }) =>
     Array.from({ length: 12 }, (_, i) => ({
       id: 200 + i,
       title: `Chapter ${i + 1}`,
@@ -101,6 +111,9 @@ const FIXTURES = {
       page: i === 0 ? 8 : 0,
       page_frac: 0,
       completed: i < 3,
+      locator: "",
+      // The novel on the shelf, so both readers are reachable from the fixture.
+      kind: SERIES.find((x) => x.id === seriesId)?.kind ?? "image",
     })),
   backups: () => {
     const now = Math.floor(Date.now() / 1000);
@@ -140,6 +153,7 @@ const FIXTURES = {
       ended_at: now - back * day,
       pages: 6 + i * 3,
       last_page: 6 + i * 3,
+      kind: "image",
     }));
   },
   reading_stats: () => ({
@@ -164,6 +178,7 @@ const FIXTURES = {
       char_offset: null,
       note: "the cicada page",
       created_at: 1_780_000_000,
+      kind: "image",
     },
     {
       id: 2,
@@ -177,11 +192,55 @@ const FIXTURES = {
       char_offset: null,
       note: "",
       created_at: 1_780_090_000,
+      kind: "image",
     },
   ],
   toggle_bookmark: () => true,
   remove_bookmark: () => null,
   set_bookmark_note: () => null,
+  open_text: () => {
+    const para = (text) => ({ kind: "para", spans: [{ text }] });
+    const blocks = [
+      { kind: { heading: 2 }, spans: [{ text: "Chapter One" }] },
+      para(
+        "The night was clear and the road ran straight for a long way, and she " +
+          "walked it without hurrying, because there was nothing at the end of it " +
+          "that would not wait.",
+      ),
+      {
+        kind: "para",
+        spans: [
+          { text: "She had been told, " },
+          { text: "once", em: true },
+          { text: ", that the town kept no records older than the fire." },
+        ],
+      },
+      { kind: "divider", spans: [] },
+      { kind: "quote", spans: [{ text: "Nothing is ever only itself." }] },
+    ];
+    // Enough of it to make scrolling and column paging mean something.
+    for (let i = 0; i < 60; i++) {
+      blocks.push(
+        para(
+          `Paragraph ${i + 1}. ` +
+            "The lamps came on one at a time along the length of the street, and " +
+            "each one made the dark between them a little more particular.",
+        ),
+      );
+    }
+    return {
+      title: "Chapter One",
+      document: { blocks },
+      blocks: blocks.length,
+      characters: blocks.reduce(
+        (n, b) => n + b.spans.reduce((m, s) => m + s.text.length, 0),
+        0,
+      ),
+      page: 0,
+      paragraph: null,
+      char_offset: null,
+    };
+  },
   palette: () => [
     "26,22,30",
     "90,44,38",

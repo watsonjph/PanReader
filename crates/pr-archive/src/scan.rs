@@ -56,6 +56,9 @@ fn stamp(path: &Path) -> Option<(i64, u64)> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScannedChapter {
     pub path: PathBuf,
+    /// Where inside the container. Empty for a folder or a CBZ, where the chapter is
+    /// the file; the spine entry for a chapter of an EPUB.
+    pub locator: String,
     pub title: String,
     /// Parsed from the name where one is there. Real, because 10.5 happens.
     pub number: Option<f64>,
@@ -71,6 +74,11 @@ pub struct ScannedChapter {
 pub struct ScannedSeries {
     pub path: PathBuf,
     pub title: String,
+    pub author: String,
+    /// Which reader opens it: `image` or `text`. A plain string rather than an enum
+    /// because it is a column value on its way to SQLite, and `pr-archive` and `pr-text`
+    /// both produce these without either knowing about the other.
+    pub kind: &'static str,
     pub chapters: Vec<ScannedChapter>,
 }
 
@@ -100,36 +108,9 @@ fn is_hidden(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with('.'))
 }
 
-/// A chapter number out of a name.
-///
-/// ponytail: the last number in the string, which handles `Chapter 12`, `c012.5`,
-/// `Vol 1 Ch 3` and `Series 2 - 014` correctly because the chapter number is
-/// conventionally last. It gets `2020` from `Series (2020)` wrong. Replace it with real
-/// filename metadata parsing when Phase 2's ComicInfo work lands, not before.
-pub fn chapter_number(name: &str) -> Option<f64> {
-    let bytes = name.as_bytes();
-    let mut last = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            // A single decimal point, and only when a digit follows it.
-            if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            last = name[start..i].parse::<f64>().ok().or(last);
-        } else {
-            i += 1;
-        }
-    }
-    last
-}
+/// A chapter number out of a name. Lives in `pr-core` because both readers name their
+/// chapters the same way; re-exported here so the scanner reads as one module.
+pub use pr_core::chapter_number;
 
 /// Identity of a chapter, from its content rather than its path.
 ///
@@ -159,6 +140,7 @@ fn chapter_at(path: &Path, known: &Known) -> Option<ScannedChapter> {
         return Some(ScannedChapter {
             number: hit.number,
             path: path.to_owned(),
+            locator: String::new(),
             title: hit.title.clone(),
             page_count: hit.page_count,
             identity: hit.identity.clone(),
@@ -193,6 +175,8 @@ fn chapter_at(path: &Path, known: &Known) -> Option<ScannedChapter> {
     Some(ScannedChapter {
         number: info.number.or_else(|| chapter_number(&title)),
         path: path.to_owned(),
+        // A CBZ or a folder is one chapter, so the file is the whole address.
+        locator: String::new(),
         title: info.title.unwrap_or(title),
         page_count: src.len(),
         identity,
@@ -239,6 +223,8 @@ pub fn scan_root(root: &Path, known: &Known) -> Vec<ScannedSeries> {
             if let Some(chapter) = chapter_at(&path, known) {
                 out.push(ScannedSeries {
                     title: stem(&path),
+                    author: String::new(),
+                    kind: "image",
                     path: path.clone(),
                     chapters: vec![chapter],
                 });
@@ -253,6 +239,8 @@ pub fn scan_root(root: &Path, known: &Known) -> Vec<ScannedSeries> {
         if let Some(chapter) = chapter_at(&path, known) {
             out.push(ScannedSeries {
                 title: file_name(&path),
+                author: String::new(),
+                kind: "image",
                 path: path.clone(),
                 chapters: vec![chapter],
             });
@@ -263,6 +251,8 @@ pub fn scan_root(root: &Path, known: &Known) -> Vec<ScannedSeries> {
         if !chapters.is_empty() {
             out.push(ScannedSeries {
                 title: file_name(&path),
+                author: String::new(),
+                kind: "image",
                 path,
                 chapters,
             });

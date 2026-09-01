@@ -30,6 +30,11 @@ pub struct Spine {
     /// The zip entry, resolved against the package document's own folder.
     pub href: String,
     pub title: String,
+    /// Content-derived, so re-downloading a book keeps the reader's place. Over the raw
+    /// entry bytes rather than the normalized text: hashing the parsed document would
+    /// mean parsing every chapter of a twelve-hundred-chapter book to list it, and a
+    /// scan that expensive is a scan people turn off.
+    pub identity: String,
 }
 
 /// Read the container, the package document and the table of contents.
@@ -66,16 +71,20 @@ pub fn open(path: &Path) -> Result<Book> {
         .spine
         .iter()
         .enumerate()
-        .map(|(n, href)| Spine {
-            title: titles
-                .get(href)
-                .cloned()
-                // No entry in the table of contents is normal -- a nav document lists
-                // what the publisher chose to list. The first heading in the chapter is
-                // the next best name, and it costs one entry read.
-                .or_else(|| entry(&mut zip, href).and_then(|x| crate::from_html(&x).heading()))
-                .unwrap_or_else(|| format!("Chapter {}", n + 1)),
-            href: href.clone(),
+        .map(|(n, href)| {
+            let raw = entry(&mut zip, href);
+            Spine {
+                title: titles
+                    .get(href)
+                    .cloned()
+                    // No entry in the table of contents is normal -- a nav document
+                    // lists what the publisher chose to list. The chapter's own first
+                    // heading is the next best name, and the bytes are already here.
+                    .or_else(|| raw.as_deref().and_then(|x| crate::from_html(x).heading()))
+                    .unwrap_or_else(|| format!("Chapter {}", n + 1)),
+                identity: identity(raw.as_deref().unwrap_or_default()),
+                href: href.clone(),
+            }
         })
         .collect();
 
@@ -101,6 +110,11 @@ pub fn chapter(path: &Path, href: &str) -> Result<Document> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
     let xhtml = entry(&mut zip, href).ok_or_else(|| Error::Empty(path.to_owned()))?;
     Ok(crate::from_html(&xhtml))
+}
+
+/// A chapter's identity, from the bytes of its entry.
+fn identity(raw: &str) -> String {
+    format!("blake3:{}", blake3::hash(raw.as_bytes()).to_hex())
 }
 
 // ----------------------------------------------------------------------------- zip

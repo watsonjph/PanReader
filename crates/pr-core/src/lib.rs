@@ -71,6 +71,27 @@ pub struct Settings {
     pub auto_backup: bool,
     /// How many automatic backups to keep. They are a few hundred kilobytes each.
     pub backup_keep: u32,
+
+    // The text reader. Separate names from the image reader's on purpose: the two share
+    // the shell and share no rendering, and a `fit` that meant something to both would
+    // be the first crack in that.
+    /// `serif`, `sans` or `mono`. A stack, not a file: bundling a reading face is a
+    /// licence and a docs entry, and the system serif is a good one on every desktop.
+    pub text_font: String,
+    /// Body size in px.
+    pub text_size: u32,
+    /// Characters per line. The measure, which is the setting that actually decides
+    /// whether a page is comfortable.
+    pub text_measure: u32,
+    /// Line height as a multiple of the size, times 100 -- an integer so the settings
+    /// blob has no float rounding in it.
+    pub text_leading: u32,
+    /// Columns rather than one long scroll.
+    pub text_paged: bool,
+    /// A warm ground for long sessions, instead of the app theme's.
+    pub text_paper: bool,
+    /// `writing-mode: vertical-rl`, for raw Japanese.
+    pub text_vertical: bool,
 }
 
 impl Default for Settings {
@@ -93,6 +114,15 @@ impl Default for Settings {
             list_view: false,
             auto_backup: true,
             backup_keep: 8,
+            text_font: "serif".to_owned(),
+            text_size: 19,
+            // Bringhurst's 66, near enough. Long lines lose the reader on the way back
+            // to the left margin.
+            text_measure: 66,
+            text_leading: 160,
+            text_paged: false,
+            text_paper: false,
+            text_vertical: false,
         }
     }
 }
@@ -238,6 +268,37 @@ pub struct ComicInfo {
     /// is here because a mismatch is a useful signal that a file was modified.
     pub page_count: Option<i64>,
     pub manga: Option<MangaFlag>,
+}
+
+/// A chapter number out of a name.
+///
+/// ponytail: the last number in the string, which handles `Chapter 12`, `c012.5`,
+/// `Vol 1 Ch 3` and `Series 2 - 014` correctly because the chapter number is
+/// conventionally last. It gets `2020` from `Series (2020)` wrong. Replace it with real
+/// filename metadata parsing when Phase 2's ComicInfo work lands, not before.
+pub fn chapter_number(name: &str) -> Option<f64> {
+    let bytes = name.as_bytes();
+    let mut last = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // A single decimal point, and only when a digit follows it.
+            if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            last = name[start..i].parse::<f64>().ok().or(last);
+        } else {
+            i += 1;
+        }
+    }
+    last
 }
 
 /// One named or numeric entity, without its `&` and `;`.
