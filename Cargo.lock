@@ -3235,6 +3235,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pr-text"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "pr-core",
+ "quick-xml 0.42.0",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
+ "zip",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
