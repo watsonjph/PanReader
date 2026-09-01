@@ -423,9 +423,71 @@ fn save_position(
     frac: f64,
     completed: bool,
 ) -> Result<(), String> {
+    let db = app.db.lock();
+    db.save_position(chapter_id, page, frac, completed)
+        .map_err(|e| format!("{e:#}"))?;
+    // Same call site on purpose: a turn is exactly when both facts change, and a second
+    // IPC round trip per page would be a round trip per page.
+    db.record_read(chapter_id, page)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn history(app: State<App>, limit: i64) -> Result<Vec<pr_db::HistoryRow>, String> {
     app.db
         .lock()
-        .save_position(chapter_id, page, frac, completed)
+        .history(limit.clamp(1, 500))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Drop one session, or the whole log. Stats derive from it, so this resets those too.
+#[tauri::command]
+fn forget(app: State<App>, id: Option<i64>) -> Result<(), String> {
+    app.db.lock().forget(id).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn reading_stats(app: State<App>) -> Result<pr_db::ReadingStats, String> {
+    app.db.lock().reading_stats().map_err(|e| format!("{e:#}"))
+}
+
+/// Returns whether the spot is bookmarked now, which is what the button renders from.
+#[tauri::command]
+fn toggle_bookmark(
+    app: State<App>,
+    chapter_id: i64,
+    page: i64,
+    frac: f64,
+    paragraph: Option<i64>,
+    char_offset: Option<i64>,
+) -> Result<bool, String> {
+    app.db
+        .lock()
+        .toggle_bookmark(chapter_id, page, frac, paragraph, char_offset)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn bookmarks(app: State<App>, chapter_id: Option<i64>) -> Result<Vec<pr_db::BookmarkRow>, String> {
+    app.db
+        .lock()
+        .bookmarks(chapter_id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn remove_bookmark(app: State<App>, id: i64) -> Result<(), String> {
+    app.db
+        .lock()
+        .remove_bookmark(id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn set_bookmark_note(app: State<App>, id: i64, note: String) -> Result<(), String> {
+    app.db
+        .lock()
+        .set_bookmark_note(id, &note)
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -596,7 +658,14 @@ fn main() {
             set_category_mode,
             set_series_category,
             categories_of,
-            set_series_mode
+            set_series_mode,
+            history,
+            forget,
+            reading_stats,
+            toggle_bookmark,
+            bookmarks,
+            remove_bookmark,
+            set_bookmark_note
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

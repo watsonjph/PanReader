@@ -54,6 +54,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0007_position_offset",
         include_str!("../migrations/0007_position_offset.sql"),
     ),
+    (
+        "0008_history_bookmarks",
+        include_str!("../migrations/0008_history_bookmarks.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -215,6 +219,50 @@ pub struct ResumeRow {
     pub page: i64,
     pub page_frac: f64,
     pub page_count: i64,
+}
+
+/// One reading session, joined to enough of the library to render a row.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryRow {
+    pub id: i64,
+    pub chapter_id: i64,
+    pub series_id: i64,
+    pub series_title: String,
+    pub chapter_title: String,
+    pub number: Option<f64>,
+    pub cover_chapter_id: Option<i64>,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub pages: i64,
+    pub last_page: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BookmarkRow {
+    pub id: i64,
+    pub chapter_id: i64,
+    pub series_id: i64,
+    pub series_title: String,
+    pub chapter_title: String,
+    pub page: i64,
+    pub page_frac: f64,
+    pub paragraph: Option<i64>,
+    pub char_offset: Option<i64>,
+    pub note: String,
+    pub created_at: i64,
+}
+
+/// Derived from history every time it is asked for, never stored. A stored counter is a
+/// second source of truth, and it starts lying the moment anything goes wrong.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct ReadingStats {
+    pub chapters: i64,
+    pub pages: i64,
+    /// Summed session length. A session with a single event is zero, honestly.
+    pub minutes: i64,
+    pub days: i64,
+    pub streak: i64,
+    pub best_streak: i64,
 }
 
 /// A chapter as the library lists it, with wherever the reader got to.
@@ -700,7 +748,227 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Note a page turn against the reading log.
+    ///
+    /// Called from the same place as `save_position`, because a turn is exactly when
+    /// both facts change. Re-opening a chapter inside the session window extends that
+    /// session rather than starting one, so closing the app for coffee does not shred an
+    /// afternoon into fifteen rows.
+    pub fn record_read(&self, chapter_id: i64, page: i64) -> Result<()> {
+        let touched = self.conn.execute(
+            "UPDATE history
+             SET ended_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+                 pages = pages + (last_page <> ?2),
+                 last_page = ?2
+             WHERE id = (SELECT id FROM history
+                         WHERE chapter_id = ?1
+                           AND ended_at >= CAST(unixepoch('subsec') * 1000 AS INTEGER) - ?3
+                         ORDER BY ended_at DESC LIMIT 1)",
+            params![chapter_id, page, SESSION_GAP_MS],
+        )?;
+        if touched > 0 {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO history (chapter_id, started_at, ended_at, pages, last_page)
+             VALUES (?1, CAST(unixepoch('subsec') * 1000 AS INTEGER),
+                         CAST(unixepoch('subsec') * 1000 AS INTEGER), 1, ?2)",
+            params![chapter_id, page],
+        )?;
+        // Pruned on insert only, and by id rather than by date: ids are monotonic, so
+        // this is a range delete on the primary key instead of a sort of the whole log.
+        self.conn.execute(
+            "DELETE FROM history WHERE id <= (SELECT max(id) - ?1 FROM history)",
+            params![HISTORY_CAP],
+        )?;
+        Ok(())
+    }
+
+    pub fn history(&self, limit: i64) -> Result<Vec<HistoryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT h.id, h.chapter_id, s.id, s.title, c.title, c.number,
+                    (SELECT id FROM chapters WHERE series_id = s.id ORDER BY number, id LIMIT 1),
+                    h.started_at, h.ended_at, h.pages, h.last_page
+             FROM history h
+             JOIN chapters c ON c.id = h.chapter_id
+             JOIN series s ON s.id = c.series_id
+             ORDER BY h.ended_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(HistoryRow {
+                id: r.get(0)?,
+                chapter_id: r.get(1)?,
+                series_id: r.get(2)?,
+                series_title: r.get(3)?,
+                chapter_title: r.get(4)?,
+                number: r.get(5)?,
+                cover_chapter_id: r.get(6)?,
+                started_at: r.get(7)?,
+                ended_at: r.get(8)?,
+                pages: r.get(9)?,
+                last_page: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Forget one session, or all of them. Stats are derived, so this resets them too,
+    /// which is the honest behaviour.
+    pub fn forget(&self, id: Option<i64>) -> Result<()> {
+        match id {
+            Some(id) => self
+                .conn
+                .execute("DELETE FROM history WHERE id = ?1", params![id])?,
+            None => self.conn.execute("DELETE FROM history", [])?,
+        };
+        Ok(())
+    }
+
+    pub fn reading_stats(&self) -> Result<ReadingStats> {
+        let (chapters, pages, millis) = self.conn.query_row(
+            "SELECT count(DISTINCT chapter_id), coalesce(sum(pages), 0),
+                    coalesce(sum(ended_at - started_at), 0) FROM history",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)?)),
+        )?;
+
+        // Day numbers rather than dates, so "consecutive" is a subtraction. Local time,
+        // because a streak is about the reader's evenings, not UTC's.
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT
+                    CAST(julianday(started_at / 1000, 'unixepoch', 'localtime') AS INTEGER) AS day
+             FROM history ORDER BY day DESC",
+        )?;
+        let days: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let today: i64 = self.conn.query_row(
+            "SELECT CAST(julianday('now', 'localtime') AS INTEGER)",
+            [],
+            |r| r.get(0),
+        )?;
+
+        let mut best = 0;
+        let mut run = 0;
+        let mut previous: Option<i64> = None;
+        for &day in &days {
+            run = if previous == Some(day + 1) {
+                run + 1
+            } else {
+                1
+            };
+            best = best.max(run);
+            previous = Some(day);
+        }
+
+        // Yesterday still counts: a streak should survive today not having started yet.
+        let offset = match days.first() {
+            Some(&first) if first == today => 0,
+            Some(&first) if first == today - 1 => 1,
+            _ => -1,
+        };
+        let streak = if offset < 0 {
+            0
+        } else {
+            days.iter()
+                .enumerate()
+                .take_while(|&(n, &day)| day == today - offset - n as i64)
+                .count() as i64
+        };
+
+        Ok(ReadingStats {
+            chapters,
+            pages,
+            minutes: millis / 60_000,
+            days: days.len() as i64,
+            streak,
+            best_streak: best,
+        })
+    }
+
+    /// Bookmark a spot, or clear it if it is already bookmarked. Returns whether one is
+    /// there now, which is what the reader's button needs in order to render.
+    pub fn toggle_bookmark(
+        &self,
+        chapter_id: i64,
+        page: i64,
+        frac: f64,
+        paragraph: Option<i64>,
+        char_offset: Option<i64>,
+    ) -> Result<bool> {
+        let gone = self.conn.execute(
+            "DELETE FROM bookmarks
+             WHERE chapter_id = ?1 AND page = ?2
+               AND coalesce(paragraph, -1) = coalesce(?3, -1)
+               AND coalesce(char_offset, -1) = coalesce(?4, -1)",
+            params![chapter_id, page, paragraph, char_offset],
+        )?;
+        if gone > 0 {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO bookmarks (chapter_id, page, page_frac, paragraph, char_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                chapter_id,
+                page,
+                frac.clamp(0.0, 1.0),
+                paragraph,
+                char_offset
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// Every bookmark, or one chapter's worth.
+    pub fn bookmarks(&self, chapter_id: Option<i64>) -> Result<Vec<BookmarkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, b.chapter_id, s.id, s.title, c.title, b.page, b.page_frac,
+                    b.paragraph, b.char_offset, b.note, b.created_at
+             FROM bookmarks b
+             JOIN chapters c ON c.id = b.chapter_id
+             JOIN series s ON s.id = c.series_id
+             WHERE ?1 IS NULL OR b.chapter_id = ?1
+             ORDER BY s.title, c.number, c.id, b.page",
+        )?;
+        let rows = stmt.query_map(params![chapter_id], |r| {
+            Ok(BookmarkRow {
+                id: r.get(0)?,
+                chapter_id: r.get(1)?,
+                series_id: r.get(2)?,
+                series_title: r.get(3)?,
+                chapter_title: r.get(4)?,
+                page: r.get(5)?,
+                page_frac: r.get(6)?,
+                paragraph: r.get(7)?,
+                char_offset: r.get(8)?,
+                note: r.get(9)?,
+                created_at: r.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn remove_bookmark(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_bookmark_note(&self, id: i64, note: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE bookmarks SET note = ?2 WHERE id = ?1",
+            params![id, note],
+        )?;
+        Ok(())
+    }
 }
+
+/// Half an hour away and you were still reading; a day away and you were not.
+const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
+/// Rows kept. An unbounded log on the page turn path is how a database gets slow.
+const HISTORY_CAP: i64 = 5_000;
 
 /// Where the database lives. `PANREADER_DB` overrides it, which is what the tests and a
 /// portable install use.
@@ -1137,5 +1405,144 @@ mod tests {
         db.save_position(chapter.id, 3, 4.0, false).unwrap();
         let clamped = db.chapters(db.library().unwrap()[0].id).unwrap().remove(0);
         assert_eq!(clamped.page_frac, 1.0);
+    }
+    /// A chapter to log against, so the history tests are about history.
+    fn one_chapter(db: &mut Db) -> i64 {
+        db.sync(&[scanned("S", "/lib/S", &[("C1", "blake3:c1")])])
+            .unwrap();
+        db.chapters(db.library().unwrap()[0].id).unwrap()[0].id
+    }
+
+    /// The distinction the table exists for: positions are overwritten, history is not.
+    #[test]
+    fn a_reading_session_is_one_row_however_many_turns_it_holds() {
+        let mut db = Db::open_memory().unwrap();
+        let chapter = one_chapter(&mut db);
+
+        for page in [0, 1, 1, 2, 3] {
+            db.record_read(chapter, page).unwrap();
+        }
+
+        let history = db.history(50).unwrap();
+        assert_eq!(history.len(), 1, "one session, not five rows");
+        // Five calls, four distinct pages, and the first one opened the session.
+        assert_eq!(
+            history[0].pages, 4,
+            "a re-save of the same page is not a turn"
+        );
+        assert_eq!(history[0].last_page, 3);
+    }
+
+    #[test]
+    fn history_prunes_itself_rather_than_growing_without_end() {
+        let mut db = Db::open_memory().unwrap();
+        let chapter = one_chapter(&mut db);
+
+        // Straight inserts, bypassing the session window, which is the only way to get
+        // past the cap without waiting half an hour per row.
+        for n in 0..HISTORY_CAP + 20 {
+            db.conn
+                .execute(
+                    "INSERT INTO history (chapter_id, started_at, ended_at) VALUES (?1, ?2, ?2)",
+                    params![chapter, n],
+                )
+                .unwrap();
+        }
+        db.record_read(chapter, 0).unwrap();
+
+        let kept: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM history", [], |r| r.get(0))
+            .unwrap();
+        assert!(kept <= HISTORY_CAP, "capped, got {kept}");
+    }
+
+    #[test]
+    fn stats_come_from_history_alone_so_forgetting_it_resets_them() {
+        let mut db = Db::open_memory().unwrap();
+        let chapter = one_chapter(&mut db);
+        for page in 0..5 {
+            db.record_read(chapter, page).unwrap();
+        }
+
+        let stats = db.reading_stats().unwrap();
+        assert_eq!(stats.chapters, 1);
+        assert_eq!(stats.pages, 5);
+        assert_eq!(stats.days, 1);
+        assert_eq!(stats.streak, 1, "read today");
+        assert_eq!(stats.best_streak, 1);
+
+        db.forget(None).unwrap();
+        let after = db.reading_stats().unwrap();
+        assert_eq!(after.pages, 0, "no stored counter left behind");
+        assert_eq!(after.streak, 0);
+    }
+
+    #[test]
+    fn a_streak_counts_consecutive_days_and_a_gap_ends_it() {
+        let mut db = Db::open_memory().unwrap();
+        let chapter = one_chapter(&mut db);
+        let day = 86_400_000i64;
+        let now: i64 = db
+            .conn
+            .query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Today, yesterday, the day before -- then a gap, then two more.
+        for back in [0, 1, 2, 5, 6] {
+            db.conn
+                .execute(
+                    "INSERT INTO history (chapter_id, started_at, ended_at) VALUES (?1, ?2, ?2)",
+                    params![chapter, now - back * day],
+                )
+                .unwrap();
+        }
+
+        let stats = db.reading_stats().unwrap();
+        assert_eq!(stats.streak, 3, "the gap at four days back ends it");
+        assert_eq!(stats.days, 5);
+        assert_eq!(stats.best_streak, 3);
+    }
+
+    #[test]
+    fn bookmarking_the_same_spot_twice_clears_it() {
+        let mut db = Db::open_memory().unwrap();
+        let chapter = one_chapter(&mut db);
+
+        assert!(db.toggle_bookmark(chapter, 12, 0.4, None, None).unwrap());
+        let marks = db.bookmarks(Some(chapter)).unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].page, 12);
+        assert_eq!(
+            marks[0].page_frac, 0.4,
+            "returns to the spot, not the page top"
+        );
+
+        assert!(!db.toggle_bookmark(chapter, 12, 0.4, None, None).unwrap());
+        assert!(db.bookmarks(None).unwrap().is_empty());
+    }
+
+    /// Text coordinates and image coordinates share a table without colliding: the two
+    /// readers bookmark different things about the same chapter id.
+    #[test]
+    fn a_text_bookmark_is_a_paragraph_not_a_page() {
+        let mut db = Db::open_memory().unwrap();
+        let chapter = one_chapter(&mut db);
+
+        db.toggle_bookmark(chapter, 0, 0.0, Some(31), Some(140))
+            .unwrap();
+        db.toggle_bookmark(chapter, 0, 0.0, Some(31), Some(900))
+            .unwrap();
+        db.toggle_bookmark(chapter, 0, 0.0, None, None).unwrap();
+
+        let marks = db.bookmarks(Some(chapter)).unwrap();
+        assert_eq!(marks.len(), 3, "same page, three distinct spots");
+
+        db.set_bookmark_note(marks[0].id, "the good bit").unwrap();
+        assert_eq!(db.bookmarks(None).unwrap()[0].note, "the good bit");
     }
 }
