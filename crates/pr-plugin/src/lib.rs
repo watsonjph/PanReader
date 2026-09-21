@@ -19,6 +19,8 @@
 //! the runtime synchronous and testable (workspace convention: tokio lives in `pr-app`,
 //! `pr-server` and `pr-engine`, and everything else is called via `spawn_blocking`).
 
+pub mod repo;
+
 use rquickjs::{
     CatchResultExt, Context, Function, Module, Object, Persistent, Promise, Runtime, Value,
 };

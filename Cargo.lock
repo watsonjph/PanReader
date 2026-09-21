@@ -1253,6 +1253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -3155,6 +3156,7 @@ dependencies = [
  "pr-db",
  "pr-image",
  "pr-opds",
+ "pr-plugin",
  "pr-sync",
  "pr-text",
  "rayon",
@@ -3228,6 +3230,8 @@ version = "0.1.0"
 dependencies = [
  "rquickjs",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tracing",
  "url",
@@ -3718,6 +3722,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

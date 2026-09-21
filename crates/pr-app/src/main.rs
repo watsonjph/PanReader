@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod opds;
+mod sources;
 mod tiles;
 
 use anyhow::Context;
@@ -27,6 +28,11 @@ struct App {
     /// Decoded covers, so a cold start paints the shelf without opening every archive
     /// in the library.
     covers: PathBuf,
+    /// Running source isolates, started on first use and dropped when removed.
+    ///
+    /// Lazy because starting one costs a thread and a JavaScript heap, and a reader
+    /// with thirty installed sources browses one of them at a time.
+    sources: Mutex<HashMap<String, Arc<sources::Loaded>>>,
 }
 
 impl App {
@@ -47,11 +53,36 @@ impl App {
             db: Mutex::new(db),
             settings: Mutex::new(settings),
             covers,
+            sources: Mutex::new(HashMap::new()),
         })
     }
 }
 
 impl App {
+    /// The running isolate for a source, starting it if this is its first use.
+    ///
+    /// A source that has been disabled or removed has no bundle to start, which is what
+    /// makes the toggle in Settings actually stop a plugin rather than only hide it.
+    fn source(&self, id: &str) -> anyhow::Result<Arc<sources::Loaded>> {
+        if let Some(running) = self.sources.lock().get(id)
+            && running.is_running()
+        {
+            return Ok(running.clone());
+        }
+        let bundle = self
+            .db
+            .lock()
+            .source_bundle(id)?
+            .ok_or_else(|| anyhow::anyhow!("{id} is not installed, or is turned off"))?;
+        let started = Arc::new(sources::Loaded::start(
+            id,
+            bundle,
+            pr_plugin::Limits::default(),
+        )?);
+        self.sources.lock().insert(id.to_owned(), started.clone());
+        Ok(started)
+    }
+
     /// Open a chapter by id, or hand back the one already open.
     fn chapter(&self, chapter_id: i64) -> anyhow::Result<Arc<Chapter>> {
         if let Some(open) = self.chapters.lock().get(&chapter_id) {
@@ -226,8 +257,24 @@ fn open_text(app: State<App>, chapter_id: i64) -> Result<TextChapter, String> {
         .map_err(|e| format!("{e:#}"))?
         .ok_or("no such chapter")?;
 
-    let document = pr_text::scan::read(std::path::Path::new(&row.path), &row.locator)
-        .map_err(|e| format!("{e:#}"))?;
+    // A file on this disk, or a request to the source it came from. The normalization
+    // is the same either way, which is the point of doing it in `pr-text`: an extension
+    // never returns markup we render as it arrives.
+    let document = if row.source == "local" {
+        pr_text::scan::read(std::path::Path::new(&row.path), &row.locator)
+            .map_err(|e| format!("{e:#}"))?
+    } else {
+        let content = app
+            .source(&row.source)
+            .and_then(|s| s.content(&row.locator))
+            .map_err(|e| format!("{e:#}"))?;
+        match content {
+            pr_plugin::Content::Html(html) => pr_text::from_html(&html),
+            pr_plugin::Content::Pages(_) => {
+                return Err("this chapter is pages, not prose".into());
+            }
+        }
+    };
     let blocks = document.blocks.len() as i64;
 
     // The scan left this at zero because counting blocks means parsing, and now it has
@@ -519,6 +566,175 @@ fn save_position(
     // Same call site on purpose: a turn is exactly when both facts change, and a second
     // IPC round trip per page would be a round trip per page.
     db.record_read(chapter_id, page)
+        .map_err(|e| format!("{e:#}"))
+}
+
+// ---------------------------------------------------------------------- sources
+
+#[tauri::command]
+fn repositories(app: State<App>) -> Result<Vec<pr_db::RepoRow>, String> {
+    app.db.lock().repositories().map_err(|e| format!("{e:#}"))
+}
+
+/// Read a repository index and remember the URL.
+///
+/// Fetching before storing, so a URL that is not a repository is refused while it is
+/// still a typo rather than becoming a row that fails on every launch.
+#[tauri::command]
+fn add_repository(app: State<App>, url: String) -> Result<Vec<pr_plugin::repo::Listed>, String> {
+    let json = sources::get_text(&url).map_err(|e| format!("{e:#}"))?;
+    let index = pr_plugin::repo::parse_index(&json, &url).map_err(|e| format!("{e:#}"))?;
+    if index.sources.is_empty() {
+        return Err(format!("{url} lists no sources this reader can use"));
+    }
+    let name = url::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.clone());
+    app.db
+        .lock()
+        .add_repository(&url, &name)
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(index.sources)
+}
+
+/// What a repository offers right now, re-read rather than remembered: a repository is
+/// somebody else's file and it changes without telling us.
+#[tauri::command]
+fn repository_sources(url: String) -> Result<Vec<pr_plugin::repo::Listed>, String> {
+    let json = sources::get_text(&url).map_err(|e| format!("{e:#}"))?;
+    Ok(pr_plugin::repo::parse_index(&json, &url)
+        .map_err(|e| format!("{e:#}"))?
+        .sources)
+}
+
+#[tauri::command]
+fn remove_repository(app: State<App>, id: i64) -> Result<(), String> {
+    app.db
+        .lock()
+        .remove_repository(id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn sources(app: State<App>) -> Result<Vec<pr_db::SourceRow>, String> {
+    app.db.lock().sources().map_err(|e| format!("{e:#}"))
+}
+
+/// Fetch a bundle, check it, run it once, and only then keep it.
+#[tauri::command]
+fn install_source(
+    app: State<App>,
+    repo_url: Option<String>,
+    listed: pr_plugin::repo::Listed,
+) -> Result<pr_db::SourceRow, String> {
+    let (manifest, bundle) = sources::install(&listed).map_err(|e| format!("{e:#}"))?;
+
+    let db = app.db.lock();
+    let repo_id = match &repo_url {
+        Some(url) => db
+            .repositories()
+            .map_err(|e| format!("{e:#}"))?
+            .into_iter()
+            .find(|r| &r.url == url)
+            .map(|r| r.id),
+        None => None,
+    };
+    db.install_source(
+        repo_id,
+        &manifest.id,
+        &manifest.name,
+        &manifest.version,
+        &manifest.lang,
+        sources::kind_text(manifest.kind),
+        manifest.nsfw,
+        &manifest.hosts,
+        &bundle,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+
+    let row = db
+        .sources()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|s| s.id == manifest.id)
+        .ok_or("the source vanished between installing and listing it")?;
+    Ok(row)
+}
+
+#[tauri::command]
+fn remove_source(app: State<App>, id: String) -> Result<(), String> {
+    // Dropping the handle ends its thread, so the isolate is gone before this returns.
+    app.sources.lock().remove(&id);
+    app.db
+        .lock()
+        .remove_source(&id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn set_source_enabled(app: State<App>, id: String, enabled: bool) -> Result<(), String> {
+    if !enabled {
+        app.sources.lock().remove(&id);
+    }
+    app.db
+        .lock()
+        .set_source_enabled(&id, enabled)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Browse or search one source. An empty query is a browse, which is the distinction
+/// the UI has rather than two commands that differ by one argument.
+#[tauri::command]
+fn source_browse(
+    app: State<App>,
+    id: String,
+    page: u32,
+    query: String,
+    latest: bool,
+) -> Result<pr_plugin::Listing, String> {
+    app.source(&id)
+        .and_then(|s| s.browse(page.max(1), &query, latest))
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn source_chapters(
+    app: State<App>,
+    id: String,
+    entry_id: String,
+) -> Result<Vec<pr_plugin::SourceChapter>, String> {
+    app.source(&id)
+        .and_then(|s| s.chapters(&entry_id))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Put a remote entry in the library.
+///
+/// It becomes an ordinary series row with `source` set to the plugin id, so positions,
+/// history, bookmarks, categories and backup all work on it without learning that
+/// remote entries exist. Chapters land with no path: they are readable through the
+/// source, and downloading one later gives it a file the same way a scan would.
+#[tauri::command]
+fn add_source_series(app: tauri::AppHandle, id: String, entry_id: String) -> Result<i64, String> {
+    let app = app.state::<App>();
+    let source = app.source(&id).map_err(|e| format!("{e:#}"))?;
+    let entry = source.details(&entry_id).map_err(|e| format!("{e:#}"))?;
+    let chapters = source.chapters(&entry_id).map_err(|e| format!("{e:#}"))?;
+    let kind = sources::kind_text(source.manifest.kind);
+
+    let chapters: Vec<pr_db::RemoteChapter> = chapters
+        .into_iter()
+        .map(|c| pr_db::RemoteChapter {
+            id: c.id,
+            title: c.title,
+            number: c.number,
+        })
+        .collect();
+
+    app.db
+        .lock()
+        .add_remote_series(&id, &entry_id, &entry.title, &entry.author, kind, &chapters)
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -830,7 +1046,18 @@ fn main() {
             export_backup,
             preview_backup,
             import_backup,
-            open_text
+            open_text,
+            repositories,
+            add_repository,
+            repository_sources,
+            remove_repository,
+            sources,
+            install_source,
+            remove_source,
+            set_source_enabled,
+            source_browse,
+            source_chapters,
+            add_source_series
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

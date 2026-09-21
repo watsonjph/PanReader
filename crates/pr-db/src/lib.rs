@@ -64,6 +64,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0009_chapter_locator",
         include_str!("../migrations/0009_chapter_locator.sql"),
     ),
+    (
+        "0010_sources",
+        include_str!("../migrations/0010_sources.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -219,6 +223,45 @@ pub struct SeriesRow {
     pub kind: String,
 }
 
+/// A chapter a source offers, in the shape this crate needs to store one.
+///
+/// Deliberately not `pr_plugin::SourceChapter`: dependencies point downward, and the
+/// database has no business knowing that a plugin host exists. `pr-app` maps between
+/// them, which is a three-line `map` and the correct place for the coupling.
+#[derive(Debug, Clone)]
+pub struct RemoteChapter {
+    pub id: String,
+    pub title: String,
+    pub number: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepoRow {
+    pub id: i64,
+    pub url: String,
+    pub name: String,
+    /// How many installed sources came from it, so removing one can say what it costs.
+    pub source_count: i64,
+}
+
+/// An installed source, without its bundle. The bundle is only read when a source is
+/// actually started, and listing Settings should not load thirty of them into memory.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceRow {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub lang: String,
+    /// `image` or `text`, matching `series.kind`.
+    pub kind: String,
+    pub nsfw: bool,
+    /// What the bundle declared it may reach, so Settings can show it without waking
+    /// the isolate.
+    pub hosts: Vec<String>,
+    pub enabled: bool,
+    pub repo_url: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CatalogRow {
     pub id: i64,
@@ -299,6 +342,9 @@ pub struct ChapterRow {
     /// Where inside the container, for a format that holds more than one chapter.
     pub locator: String,
     pub kind: String,
+    /// `local` for a scanned file, otherwise the id of the source it came from. The one
+    /// fact that decides whether opening this means reading a file or asking a plugin.
+    pub source: String,
     pub page: i64,
     /// How far into that page, as a fraction of its height. Resolution-independent on
     /// purpose: a pixel offset stops meaning anything when the decode width changes.
@@ -463,6 +509,193 @@ impl Db {
         Ok(summary)
     }
 
+    // ------------------------------------------------------------------- sources
+
+    pub fn repositories(&self) -> Result<Vec<RepoRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.url, r.name, count(s.id)
+             FROM repositories r LEFT JOIN sources s ON s.repo_id = r.id
+             GROUP BY r.id ORDER BY r.added_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RepoRow {
+                id: r.get(0)?,
+                url: r.get(1)?,
+                name: r.get(2)?,
+                source_count: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Add a repository, or return the one already there. Adding the same URL twice is
+    /// a refresh, not an error.
+    pub fn add_repository(&self, url: &str, name: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO repositories (url, name) VALUES (?1, ?2)
+             ON CONFLICT(url) DO UPDATE SET name = excluded.name",
+            params![url, name],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT id FROM repositories WHERE url = ?1",
+            params![url],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Removing a repository takes its sources with it and stops there.
+    ///
+    /// Library entries that came from those sources are left alone: `series.source`
+    /// holds a plugin id and carries no foreign key, so an entry survives as unlinked
+    /// -- title, chapters and read state intact, unable to fetch. That is the same
+    /// state an unmatched import lands in, and for the same reason.
+    pub fn remove_repository(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM repositories WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn sources(&self) -> Result<Vec<SourceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.name, s.version, s.lang, s.kind, s.nsfw, s.hosts, s.enabled, r.url
+             FROM sources s LEFT JOIN repositories r ON r.id = s.repo_id
+             ORDER BY s.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SourceRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                version: r.get(2)?,
+                lang: r.get(3)?,
+                kind: r.get(4)?,
+                nsfw: r.get::<_, i64>(5)? != 0,
+                hosts: r
+                    .get::<_, String>(6)?
+                    .lines()
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                enabled: r.get::<_, i64>(7)? != 0,
+                repo_url: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Install or upgrade. Keyed by the plugin's own id, so a reinstall keeps every
+    /// library entry that already points at it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_source(
+        &self,
+        repo_id: Option<i64>,
+        id: &str,
+        name: &str,
+        version: &str,
+        lang: &str,
+        kind: &str,
+        nsfw: bool,
+        hosts: &[String],
+        bundle: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sources (id, repo_id, name, version, lang, kind, nsfw, hosts, bundle)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE
+             SET repo_id = excluded.repo_id, name = excluded.name,
+                 version = excluded.version, lang = excluded.lang, kind = excluded.kind,
+                 nsfw = excluded.nsfw, hosts = excluded.hosts, bundle = excluded.bundle",
+            params![
+                id,
+                repo_id,
+                name,
+                version,
+                lang,
+                kind,
+                nsfw as i64,
+                hosts.join("\n"),
+                bundle
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Put a remote entry in the library as an ordinary series.
+    ///
+    /// Idempotent: adding the same entry twice refreshes its chapter list rather than
+    /// duplicating it, and a chapter already present keeps its row and its position.
+    /// Chapter identity is `<source>:<chapter id>`, which is stable across a reinstall
+    /// for the same reason `series.source` is -- the plugin's own id, not a row number.
+    pub fn add_remote_series(
+        &mut self,
+        source: &str,
+        entry_id: &str,
+        title: &str,
+        author: &str,
+        kind: &str,
+        chapters: &[RemoteChapter],
+    ) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO series (source, source_id, title, author, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(source, source_id) DO UPDATE
+             SET title = excluded.title, author = excluded.author",
+            params![source, entry_id, title, author, kind],
+        )?;
+        let series_id: i64 = tx.query_row(
+            "SELECT id FROM series WHERE source = ?1 AND source_id = ?2",
+            params![source, entry_id],
+            |r| r.get(0),
+        )?;
+
+        for chapter in chapters {
+            let identity = format!("{source}:{}", chapter.id);
+            tx.execute(
+                "INSERT INTO chapters (series_id, source_id, title, number, page_count, locator)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)
+                 ON CONFLICT(series_id, source_id) DO UPDATE
+                 SET title = excluded.title, number = excluded.number,
+                     locator = excluded.locator",
+                params![
+                    series_id,
+                    identity,
+                    chapter.title,
+                    chapter.number,
+                    chapter.id
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(series_id)
+    }
+
+    pub fn remove_source(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM sources WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_source_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sources SET enabled = ?2 WHERE id = ?1",
+            params![id, enabled as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The bundle for one enabled source, which is the only time it is read.
+    pub fn source_bundle(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT bundle FROM sources WHERE id = ?1 AND enabled = 1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn catalogs(&self) -> Result<Vec<CatalogRow>> {
         let mut stmt = self
             .conn
@@ -528,7 +761,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.number, c.page_count, c.path,
                     coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0),
-                    c.locator, s.kind
+                    c.locator, s.kind, s.source
              FROM chapters c
              JOIN series s ON s.id = c.series_id
              LEFT JOIN positions p ON p.chapter_id = c.id
@@ -547,6 +780,7 @@ impl Db {
                 completed: r.get::<_, i64>(7)? != 0,
                 locator: r.get(8)?,
                 kind: r.get(9)?,
+                source: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -748,7 +982,7 @@ impl Db {
             .query_row(
                 "SELECT c.id, c.title, c.number, c.page_count, c.path,
                         coalesce(p.page, 0), coalesce(p.page_frac, 0), coalesce(p.completed, 0),
-                        c.locator, s.kind
+                        c.locator, s.kind, s.source
                  FROM chapters c
                  JOIN series s ON s.id = c.series_id
                  LEFT JOIN positions p ON p.chapter_id = c.id
@@ -766,6 +1000,7 @@ impl Db {
                         completed: r.get::<_, i64>(7)? != 0,
                         locator: r.get(8)?,
                         kind: r.get(9)?,
+                        source: r.get(10)?,
                     })
                 },
             )
@@ -1607,5 +1842,143 @@ mod tests {
 
         db.set_bookmark_note(marks[0].id, "the good bit").unwrap();
         assert_eq!(db.bookmarks(None).unwrap()[0].note, "the good bit");
+    }
+
+    /// The C1 requirement, stated as a test: removing a repository removes its sources
+    /// without touching the library entries that came from them.
+    #[test]
+    fn removing_a_repository_unlinks_its_entries_rather_than_deleting_them() {
+        let mut db = Db::open_memory().unwrap();
+        let repo = db
+            .add_repository("https://repo.test/index.json", "Repo")
+            .unwrap();
+        db.install_source(
+            Some(repo),
+            "example",
+            "Example",
+            "1.0.0",
+            "en",
+            "text",
+            false,
+            &["example.com".to_owned(), "cdn.example.com".to_owned()],
+            "export default {};",
+        )
+        .unwrap();
+
+        // A library entry that came from it, the way a remote add would leave one.
+        {
+            let tx = db.transaction().unwrap();
+            tx.execute_batch(
+                "INSERT INTO series (source, source_id, title, kind)
+                     VALUES ('example', 'abc', 'A Novel', 'text');
+                 INSERT INTO chapters (series_id, source_id, title, page_count)
+                     VALUES (1, 'example:abc:1', 'Chapter 1', 0);
+                 INSERT INTO positions (chapter_id, page) VALUES (1, 12);",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let listed = db.sources().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].hosts, ["example.com", "cdn.example.com"]);
+        assert_eq!(
+            listed[0].repo_url.as_deref(),
+            Some("https://repo.test/index.json")
+        );
+        assert_eq!(db.repositories().unwrap()[0].source_count, 1);
+        assert!(db.source_bundle("example").unwrap().is_some());
+
+        db.remove_repository(repo).unwrap();
+
+        assert!(db.sources().unwrap().is_empty(), "the source went with it");
+        let library = db.library().unwrap();
+        assert_eq!(library.len(), 1, "the entry stayed");
+        let chapters = db.chapters(library[0].id).unwrap();
+        assert_eq!(chapters[0].page, 12, "and so did the reading position");
+    }
+
+    /// Reinstalling keeps the id, which is what keeps the library entries attached.
+    #[test]
+    fn reinstalling_a_source_upgrades_it_in_place() {
+        let db = Db::open_memory().unwrap();
+        let hosts = ["example.com".to_owned()];
+        db.install_source(None, "x", "X", "1.0.0", "en", "text", false, &hosts, "old")
+            .unwrap();
+        db.install_source(None, "x", "X", "2.0.0", "en", "text", false, &hosts, "new")
+            .unwrap();
+
+        let listed = db.sources().unwrap();
+        assert_eq!(listed.len(), 1, "an upgrade is not a second row");
+        assert_eq!(listed[0].version, "2.0.0");
+        assert_eq!(db.source_bundle("x").unwrap().as_deref(), Some("new"));
+
+        // A disabled source is not startable, which is how the toggle works.
+        db.set_source_enabled("x", false).unwrap();
+        assert!(db.source_bundle("x").unwrap().is_none());
+        assert!(!db.sources().unwrap()[0].enabled);
+    }
+
+    /// A remote entry is an ordinary series row. Everything downstream -- positions,
+    /// history, bookmarks, categories, backup -- works on it without learning that
+    /// remote entries exist, which is the whole reason it is stored this way.
+    #[test]
+    fn a_remote_entry_becomes_an_ordinary_series_and_refreshing_keeps_progress() {
+        let mut db = Db::open_memory().unwrap();
+        let chapter = |id: &str, n: f64| RemoteChapter {
+            id: id.to_owned(),
+            title: format!("Chapter {n}"),
+            number: Some(n),
+        };
+
+        let series_id = db
+            .add_remote_series(
+                "example",
+                "abc",
+                "A Novel",
+                "Someone",
+                "text",
+                &[chapter("c1", 1.0), chapter("c2", 2.0)],
+            )
+            .unwrap();
+
+        let chapters = db.chapters(series_id).unwrap();
+        assert_eq!(chapters.len(), 2);
+        // No file, and the locator is what to ask the source for.
+        assert_eq!(chapters[0].path, "");
+        assert_eq!(chapters[0].locator, "c1");
+        assert_eq!(
+            chapters[0].source, "example",
+            "so opening it asks the plugin"
+        );
+        assert_eq!(chapters[0].kind, "text");
+
+        db.save_position(chapters[1].id, 40, 0.5, false).unwrap();
+
+        // The source published a third chapter and renamed the second.
+        let again = db
+            .add_remote_series(
+                "example",
+                "abc",
+                "A Novel",
+                "Someone",
+                "text",
+                &[
+                    chapter("c1", 1.0),
+                    RemoteChapter {
+                        id: "c2".into(),
+                        title: "Chapter Two, Revised".into(),
+                        number: Some(2.0),
+                    },
+                    chapter("c3", 3.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(again, series_id, "the same entry, not a second one");
+
+        let chapters = db.chapters(series_id).unwrap();
+        assert_eq!(chapters.len(), 3, "a refresh adds, it does not duplicate");
+        assert_eq!(chapters[1].title, "Chapter Two, Revised");
+        assert_eq!(chapters[1].page, 40, "and the position survived the rename");
     }
 }
