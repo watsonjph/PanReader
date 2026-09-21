@@ -15,7 +15,14 @@ export default {
 
 #[test]
 fn a_source_runs_on_its_own_thread_and_answers_over_the_channel() {
-    let source = Loaded::start("example", BUNDLE.to_owned(), Limits::default()).unwrap();
+    let source = Loaded::start(
+        "example",
+        BUNDLE.to_owned(),
+        Limits::default(),
+        Arc::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(source.manifest.id, "example");
     assert_eq!(source.manifest.kind, Kind::Novel);
 
@@ -46,7 +53,16 @@ fn a_loaded_source_can_be_shared_across_threads_even_though_its_isolate_cannot()
     fn assert_shareable<T: Send + Sync>() {}
     assert_shareable::<Loaded>();
 
-    let source = Arc::new(Loaded::start("example", BUNDLE.to_owned(), Limits::default()).unwrap());
+    let source = Arc::new(
+        Loaded::start(
+            "example",
+            BUNDLE.to_owned(),
+            Limits::default(),
+            Arc::default(),
+            None,
+        )
+        .unwrap(),
+    );
     let handles: Vec<_> = (0..4)
         .map(|n| {
             let source = source.clone();
@@ -66,7 +82,14 @@ fn a_loaded_source_can_be_shared_across_threads_even_though_its_isolate_cannot()
 /// it. Removing a source is a `drop`, not a shutdown message someone forgets to send.
 #[test]
 fn dropping_a_source_stops_its_thread() {
-    let source = Loaded::start("example", BUNDLE.to_owned(), Limits::default()).unwrap();
+    let source = Loaded::start(
+        "example",
+        BUNDLE.to_owned(),
+        Limits::default(),
+        Arc::default(),
+        None,
+    )
+    .unwrap();
     assert!(source.is_running());
     let alive = source.alive.clone();
     drop(source);
@@ -89,6 +112,8 @@ fn a_bundle_that_is_not_a_source_fails_at_load_rather_than_at_first_use() {
         "bad",
         "export default { id: 'bad' };".into(),
         Limits::default(),
+        Arc::default(),
+        None,
     )
     .unwrap_err()
     .to_string();
@@ -99,7 +124,7 @@ fn a_bundle_that_is_not_a_source_fails_at_load_rather_than_at_first_use() {
 /// itself and no way to be trusted with it.
 #[test]
 fn requests_from_one_source_are_spaced_out() {
-    let fetcher = HostFetcher::new("example").unwrap();
+    let fetcher = HostFetcher::new("example", Arc::default(), None).unwrap();
     let started = Instant::now();
     for _ in 0..3 {
         fetcher.wait_turn();

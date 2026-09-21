@@ -238,6 +238,10 @@ const FIXTURES = {
     };
   },
   warm: () => null,
+  cookie_jars: () => [
+    { host: "example.com", cookies: 2 },
+    { host: "another.test", cookies: 1 },
+  ],
   repositories: () => [
     { id: 1, url: "https://example.test/repo/index.json", name: "example.test", source_count: 1 },
   ],
@@ -373,6 +377,7 @@ const WRITES = new Set([
   "remove_repository",
   "download_chapter",
   "delete_download",
+  "clear_cookies",
 ]);
 
 /** Covers are served over pan:// in the app; in the browser they are data URIs. */

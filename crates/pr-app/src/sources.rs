@@ -7,6 +7,7 @@
 //! things a source host needs anyway: calls into one plugin are serialised, and there
 //! is exactly one place to put the rate limit.
 
+use crate::challenge::{self, Jars};
 use anyhow::{Context as _, bail};
 use pr_plugin::{Content, Entry, Fetcher, Kind, Limits, Listing, Manifest, Request};
 use std::sync::Arc;
@@ -35,6 +36,12 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 struct HostFetcher {
     client: reqwest::blocking::Client,
     id: String,
+    /// Shared across every source, because a cookie belongs to a host rather than to
+    /// whichever plugin happened to meet the challenge first.
+    jars: Arc<Jars>,
+    /// Needed to open a real webview at a challenged URL. Absent in tests, where there
+    /// is no app to open one in.
+    app: Option<tauri::AppHandle>,
     /// When the next request may go out. The rate limit lives here rather than in the
     /// plugin because a plugin cannot be trusted to rate-limit itself, and would have
     /// no reason to.
@@ -42,8 +49,10 @@ struct HostFetcher {
 }
 
 impl HostFetcher {
-    fn new(id: &str) -> anyhow::Result<Self> {
+    fn new(id: &str, jars: Arc<Jars>, app: Option<tauri::AppHandle>) -> anyhow::Result<Self> {
         Ok(Self {
+            jars,
+            app,
             client: reqwest::blocking::Client::builder()
                 // Our own name and version. Invariant 13: we identify as what we are
                 // rather than impersonating a browser.
@@ -72,27 +81,30 @@ impl HostFetcher {
     }
 }
 
-impl Fetcher for HostFetcher {
-    fn fetch(&self, request: Request) -> Result<String, String> {
+impl HostFetcher {
+    /// One attempt, with whatever cookies we already hold for the host.
+    fn attempt(&self, request: &Request) -> Result<(u16, String), String> {
         self.wait_turn();
 
         let mut outgoing = self.client.get(&request.url);
         for (name, value) in &request.headers {
             outgoing = outgoing.header(name.as_str(), value.as_str());
         }
+        // The jar is the host's, never the plugin's: an extension never sees a cookie,
+        // never sets one, and cannot read another host's.
+        if let Some(cookies) = url::Url::parse(&request.url)
+            .ok()
+            .and_then(|u| u.host_str().and_then(|h| self.jars.header_for(h)))
+        {
+            outgoing = outgoing.header(reqwest::header::COOKIE, cookies);
+        }
 
         let response = outgoing
             .send()
             .map_err(|e| format!("{}: {e}", request.url))?;
-        let status = response.status();
+        let status = response.status().as_u16();
 
-        // An interstitial is not a transport failure, and saying so plainly is the
-        // whole of our challenge story until the webview path in invariant 13 exists.
-        // A source that meets one is reported to the reader rather than worked around.
-        if matches!(status.as_u16(), 403 | 503) {
-            tracing::info!(source = %self.id, url = %request.url, %status, "challenged");
-        }
-        if status.as_u16() == 429 {
+        if status == 429 {
             // The one backoff a site explicitly asks for.
             let retry = response
                 .headers()
@@ -104,13 +116,62 @@ impl Fetcher for HostFetcher {
             *self.next.lock() = Instant::now() + Duration::from_secs(retry);
             return Err(format!("{} asked us to slow down", host_of(&request.url)));
         }
-        if !status.is_success() {
-            return Err(format!("{} returned {status}", host_of(&request.url)));
+
+        // The body is read even for a refusal, because whether a 403 is an interstitial
+        // or a dead link is a question only the body can answer.
+        let body = response
+            .text()
+            .map_err(|e| format!("{} sent something unreadable: {e}", request.url))?;
+        Ok((status, body))
+    }
+}
+
+impl Fetcher for HostFetcher {
+    fn fetch(&self, request: Request) -> Result<String, String> {
+        let (status, body) = self.attempt(&request)?;
+        if (200..300).contains(&status) {
+            return Ok(body);
         }
 
-        response
-            .text()
-            .map_err(|e| format!("{} sent something unreadable: {e}", request.url))
+        // Not an answer. If it is an interstitial, meet it the way a browser would:
+        // load the real page in the real engine, keep the cookie the site issues, and
+        // try once more. Invariant 13 -- nothing is forged, because at the moment the
+        // challenge runs this genuinely is a browser.
+        if !challenge::is_challenge(status, &body) {
+            return Err(format!("{} returned {status}", host_of(&request.url)));
+        }
+        let Some(app) = &self.app else {
+            return Err(format!(
+                "{} asked {} for a browser, and this is not a moment one can be opened",
+                host_of(&request.url),
+                self.id
+            ));
+        };
+
+        match challenge::solve(app, &self.jars, &request.url) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "{} would not let this reader through",
+                    host_of(&request.url)
+                ));
+            }
+            Err(e) => return Err(format!("{}: {e}", host_of(&request.url))),
+        }
+
+        // Exactly one retry. A second challenge after a cleared one means the cookie is
+        // not what that site wanted, and looping on it would be a window that keeps
+        // reappearing rather than a reader being told.
+        let (status, body) = self.attempt(&request)?;
+        if (200..300).contains(&status) {
+            return Ok(body);
+        }
+        Err(format!(
+            "{} still refused after the challenge was solved. \
+             Its check may be tied to the browser that solved it, which this reader \
+             does not imitate.",
+            host_of(&request.url)
+        ))
     }
 }
 
@@ -175,8 +236,14 @@ impl Loaded {
     /// Blocks until the bundle has loaded or failed, because a source that does not
     /// load is not a source and the caller should hear about it now rather than at the
     /// first browse.
-    pub fn start(id: &str, bundle: String, limits: Limits) -> anyhow::Result<Self> {
-        let fetcher = Arc::new(HostFetcher::new(id)?);
+    pub fn start(
+        id: &str,
+        bundle: String,
+        limits: Limits,
+        jars: Arc<Jars>,
+        app: Option<tauri::AppHandle>,
+    ) -> anyhow::Result<Self> {
+        let fetcher = Arc::new(HostFetcher::new(id, jars, app)?);
         let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
         let (ready, loaded) = sync_channel::<Result<Manifest, String>>(1);
         let name = id.to_owned();
@@ -297,7 +364,11 @@ impl Loaded {
 /// Loading before storing is the point: a bundle that is not a source, or that lies
 /// about its id, should be refused while it is still a download rather than becoming a
 /// row that fails every time the app starts.
-pub fn install(listed: &pr_plugin::repo::Listed) -> anyhow::Result<(Manifest, String)> {
+pub fn install(
+    listed: &pr_plugin::repo::Listed,
+    jars: Arc<Jars>,
+    app: Option<tauri::AppHandle>,
+) -> anyhow::Result<(Manifest, String)> {
     let bundle =
         get_text(&listed.bundle).with_context(|| format!("could not fetch {}", listed.bundle))?;
 
@@ -305,7 +376,7 @@ pub fn install(listed: &pr_plugin::repo::Listed) -> anyhow::Result<(Manifest, St
         pr_plugin::repo::verify(bundle.as_bytes(), expected)?;
     }
 
-    let loaded = Loaded::start(&listed.id, bundle.clone(), Limits::default())?;
+    let loaded = Loaded::start(&listed.id, bundle.clone(), Limits::default(), jars, app)?;
     pr_plugin::repo::agrees(listed, &loaded.manifest)?;
     Ok((loaded.manifest.clone(), bundle))
 }

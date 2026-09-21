@@ -145,6 +145,9 @@
   // Sources. Three screens in one section, because they are one task: where sources
   // come from, which are installed, and what one of them offers.
   let repos = $state([]);
+  /// Hosts that issued a cookie after a challenge. Shown because a cookie a site gave
+  /// this app on someone's behalf is theirs to see and to throw away.
+  let jars = $state([]);
   let installed = $state([]);
   /// What a repository offers, re-read on open rather than remembered: a repository is
   /// somebody else's file and it changes without telling us.
@@ -567,7 +570,11 @@
 
   async function refreshSources() {
     try {
-      [repos, installed] = await Promise.all([invoke("repositories"), invoke("sources")]);
+      [repos, installed, jars] = await Promise.all([
+        invoke("repositories"),
+        invoke("sources"),
+        invoke("cookie_jars"),
+      ]);
     } catch (e) {
       error = String(e);
     }
@@ -646,6 +653,15 @@
   }
 
   const isInstalled = (id) => installed.some((s) => s.id === id);
+
+  async function clearCookies(host) {
+    try {
+      await invoke("clear_cookies", { host: host ?? null });
+      jars = await invoke("cookie_jars");
+    } catch (e) {
+      error = String(e);
+    }
+  }
 
   function closeBrowse() {
     browsing = null;
@@ -2418,6 +2434,25 @@
             />
             <button class="chip accent" disabled={sourceBusy} onclick={addRepo}>Add</button>
           </div>
+
+          {#if jars.length}
+            <h2 class="section">Sites that checked you</h2>
+            <p class="meta lede">
+              These sites asked for a browser, so PanReader opened the page in one and
+              kept the cookie they issued. Nothing was faked and no extension can see
+              any of this. Clearing a site makes the next request a stranger again.
+            </p>
+            {#each jars as jar (jar.host)}
+              <div class="row">
+                <span class="name grow">{jar.host}</span>
+                <span class="meta">{jar.cookies} cookie{jar.cookies === 1 ? "" : "s"}</span>
+                <button class="chip danger" onclick={() => clearCookies(jar.host)}>Clear</button>
+              </div>
+            {/each}
+            <div class="row">
+              <button class="chip" onclick={() => clearCookies(null)}>Clear all</button>
+            </div>
+          {/if}
 
           {#if offered}
             <h2 class="section">{offered.url}</h2>

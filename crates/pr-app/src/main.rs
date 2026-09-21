@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod challenge;
 mod downloads;
 mod opds;
 mod sources;
@@ -29,6 +30,10 @@ struct App {
     /// Decoded covers, so a cold start paints the shelf without opening every archive
     /// in the library.
     covers: PathBuf,
+    /// Cookies a site issued to a real webview after a challenge, per host. Shared
+    /// across sources because a cookie belongs to a host, not to whichever plugin
+    /// happened to meet the challenge first.
+    jars: Arc<challenge::Jars>,
     /// Running source isolates, started on first use and dropped when removed.
     ///
     /// Lazy because starting one costs a thread and a JavaScript heap, and a reader
@@ -55,6 +60,7 @@ impl App {
             settings: Mutex::new(settings),
             covers,
             sources: Mutex::new(HashMap::new()),
+            jars: Arc::new(challenge::Jars::default()),
         })
     }
 }
@@ -64,7 +70,15 @@ impl App {
     ///
     /// A source that has been disabled or removed has no bundle to start, which is what
     /// makes the toggle in Settings actually stop a plugin rather than only hide it.
-    fn source(&self, id: &str) -> anyhow::Result<Arc<sources::Loaded>> {
+    /// `app` is what lets a challenged request open a real page in a real webview.
+    /// It is an Option because installing happens before there is anything to browse,
+    /// and a challenge during an install is a challenge the reader should just be told
+    /// about.
+    fn source(
+        &self,
+        id: &str,
+        app: Option<tauri::AppHandle>,
+    ) -> anyhow::Result<Arc<sources::Loaded>> {
         if let Some(running) = self.sources.lock().get(id)
             && running.is_running()
         {
@@ -79,6 +93,8 @@ impl App {
             id,
             bundle,
             pr_plugin::Limits::default(),
+            self.jars.clone(),
+            app,
         )?);
         self.sources.lock().insert(id.to_owned(), started.clone());
         Ok(started)
@@ -266,7 +282,7 @@ fn open_text(app: State<App>, chapter_id: i64) -> Result<TextChapter, String> {
             .map_err(|e| format!("{e:#}"))?
     } else {
         let content = app
-            .source(&row.source)
+            .source(&row.source, None)
             .and_then(|s| s.content(&row.locator))
             .map_err(|e| format!("{e:#}"))?;
         match content {
@@ -629,7 +645,8 @@ fn install_source(
     repo_url: Option<String>,
     listed: pr_plugin::repo::Listed,
 ) -> Result<pr_db::SourceRow, String> {
-    let (manifest, bundle) = sources::install(&listed).map_err(|e| format!("{e:#}"))?;
+    let (manifest, bundle) =
+        sources::install(&listed, app.jars.clone(), None).map_err(|e| format!("{e:#}"))?;
 
     let db = app.db.lock();
     let repo_id = match &repo_url {
@@ -694,7 +711,7 @@ fn source_browse(
     query: String,
     latest: bool,
 ) -> Result<pr_plugin::Listing, String> {
-    app.source(&id)
+    app.source(&id, None)
         .and_then(|s| s.browse(page.max(1), &query, latest))
         .map_err(|e| format!("{e:#}"))
 }
@@ -705,7 +722,7 @@ fn source_chapters(
     id: String,
     entry_id: String,
 ) -> Result<Vec<pr_plugin::SourceChapter>, String> {
-    app.source(&id)
+    app.source(&id, None)
         .and_then(|s| s.chapters(&entry_id))
         .map_err(|e| format!("{e:#}"))
 }
@@ -719,7 +736,7 @@ fn source_chapters(
 #[tauri::command]
 fn add_source_series(app: tauri::AppHandle, id: String, entry_id: String) -> Result<i64, String> {
     let app = app.state::<App>();
-    let source = app.source(&id).map_err(|e| format!("{e:#}"))?;
+    let source = app.source(&id, None).map_err(|e| format!("{e:#}"))?;
     let entry = source.details(&entry_id).map_err(|e| format!("{e:#}"))?;
     let chapters = source.chapters(&entry_id).map_err(|e| format!("{e:#}"))?;
     let kind = sources::kind_text(source.manifest.kind);
@@ -737,6 +754,25 @@ fn add_source_series(app: tauri::AppHandle, id: String, entry_id: String) -> Res
         .lock()
         .add_remote_series(&id, &entry_id, &entry.title, &entry.author, kind, &chapters)
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Which hosts issued us a cookie after a challenge.
+///
+/// Surfaced because a cookie a site gave this app is the reader's business: they should
+/// be able to see that one is held and throw it away without hunting for a file.
+#[tauri::command]
+fn cookie_jars(app: State<App>) -> Vec<challenge::Jar> {
+    app.jars.listed()
+}
+
+/// Forget one host's cookies, or all of them. The next request to that host is a
+/// stranger again, and meets whatever the site asks of strangers.
+#[tauri::command]
+fn clear_cookies(app: State<App>, host: Option<String>) {
+    match host {
+        Some(host) => app.jars.clear(&host),
+        None => app.jars.clear_all(),
+    }
 }
 
 /// Fetch a chapter so it can be read with the network off.
@@ -759,7 +795,11 @@ fn download_chapter(app: tauri::AppHandle, chapter_id: i64) -> Result<(), String
     if !row.path.is_empty() {
         return Ok(());
     }
-    let source = state.source(&row.source).map_err(|e| format!("{e:#}"))?;
+    // The one path that may raise a window: a download is a long background job, which
+    // is exactly when it is reasonable to stop and ask someone to clear a challenge.
+    let source = state
+        .source(&row.source, Some(app.clone()))
+        .map_err(|e| format!("{e:#}"))?;
     let series = state
         .db
         .lock()
@@ -1138,7 +1178,9 @@ fn main() {
             source_chapters,
             add_source_series,
             download_chapter,
-            delete_download
+            delete_download,
+            cookie_jars,
+            clear_cookies
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");
