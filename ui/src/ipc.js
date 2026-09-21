@@ -125,6 +125,8 @@ const FIXTURES = {
       page_frac: 0,
       completed: i < 3,
       locator: "",
+      path: i % 3 === 0 ? "" : "D:/manga/ch.cbz",
+      source: i % 2 === 0 ? "local" : "example",
       // The novel on the shelf, so both readers are reachable from the fixture.
       kind: SERIES.find((x) => x.id === seriesId)?.kind ?? "image",
     })),
@@ -366,6 +368,8 @@ const WRITES = new Set([
   "remove_source",
   "set_source_enabled",
   "remove_repository",
+  "download_chapter",
+  "delete_download",
 ]);
 
 /** Covers are served over pan:// in the app; in the browser they are data URIs. */

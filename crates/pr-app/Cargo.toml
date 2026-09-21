@@ -25,10 +25,10 @@ tokio = { version = "1.53.1", features = ["rt", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dev-dependencies]
 image = "0.25.10"
-zip = "8.6.0"

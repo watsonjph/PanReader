@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod downloads;
 mod opds;
 mod sources;
 mod tiles;
@@ -738,6 +739,78 @@ fn add_source_series(app: tauri::AppHandle, id: String, entry_id: String) -> Res
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Fetch a chapter so it can be read with the network off.
+///
+/// On a background thread: this is a network round trip per page and invariant 7 keeps
+/// a command from blocking. The reader is told through the ordinary library refresh,
+/// because a downloaded chapter is just a chapter with a path now.
+#[tauri::command]
+fn download_chapter(app: tauri::AppHandle, chapter_id: i64) -> Result<(), String> {
+    let state = app.state::<App>();
+    let row = state
+        .db
+        .lock()
+        .chapter(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or("no such chapter")?;
+    if row.source == "local" {
+        return Err("this chapter is already a file".into());
+    }
+    if !row.path.is_empty() {
+        return Ok(());
+    }
+    let source = state.source(&row.source).map_err(|e| format!("{e:#}"))?;
+    let series = state
+        .db
+        .lock()
+        .series_title_of(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .unwrap_or_else(|| row.source.clone());
+
+    std::thread::spawn(move || {
+        let state = app.state::<App>();
+        match downloads::fetch(&source, &series, &row.title, &row.locator) {
+            Ok(path) => {
+                if let Err(e) = state
+                    .db
+                    .lock()
+                    .set_chapter_path(chapter_id, &path.to_string_lossy())
+                {
+                    tracing::warn!("downloaded but could not record it: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!(chapter_id, "download failed: {e:#}"),
+        }
+    });
+    Ok(())
+}
+
+/// Delete a downloaded file and leave everything else alone.
+#[tauri::command]
+fn delete_download(app: State<App>, chapter_id: i64) -> Result<(), String> {
+    let row = app
+        .db
+        .lock()
+        .chapter(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or("no such chapter")?;
+    if row.source == "local" {
+        return Err("this is a file in your library, not a download".into());
+    }
+    if !row.path.is_empty() {
+        // A missing file is the state we wanted anyway.
+        let _ = std::fs::remove_file(&row.path);
+    }
+    // Progress, history and bookmarks are attached to the chapter and are untouched.
+    app.db
+        .lock()
+        .set_chapter_path(chapter_id, "")
+        .map_err(|e| format!("{e:#}"))?;
+    // The open chapter holds a PageSource onto the file that just went away.
+    app.chapters.lock().remove(&chapter_id);
+    Ok(())
+}
+
 /// Where the automatic backups live, and what is in there.
 #[tauri::command]
 fn backups() -> Result<Vec<pr_sync::Kept>, String> {
@@ -853,6 +926,12 @@ fn set_bookmark_note(app: State<App>, id: i64, note: String) -> Result<(), Strin
 fn open_chapter(app: State<App>, chapter_id: i64, display_w: u32) -> Result<Layout, String> {
     let chapter = app.chapter(chapter_id).map_err(|e| format!("{e:#}"))?;
     let layout = chapter.layout(display_w);
+    // A downloaded chapter arrives with a page count of zero, because until it was
+    // fetched nobody could know one. The archive is open now and it is simply a fact.
+    let _ = app
+        .db
+        .lock()
+        .set_page_count(chapter_id, layout.pages.len() as i64);
     // Start filling the chapter behind the reader straight away. The first page is
     // already on its way over pan:// by the time this returns.
     chapter.warm(0, display_w);
@@ -1057,7 +1136,9 @@ fn main() {
             set_source_enabled,
             source_browse,
             source_chapters,
-            add_source_series
+            add_source_series,
+            download_chapter,
+            delete_download
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

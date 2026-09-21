@@ -1134,6 +1134,39 @@
     }
   }
 
+  /// Fetch a chapter so it can be read with the network off.
+  ///
+  /// The backend answers immediately and works on a thread, so the list is re-read
+  /// rather than waited on: a downloaded chapter is just a chapter with a path now.
+  async function download(chapter) {
+    try {
+      await invoke("download_chapter", { chapterId: chapter.id });
+      setTimeout(refreshChapters, 1500);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Deletes the file and nothing else. Someone who freed disk space has not said they
+  /// want to forget what they read.
+  async function removeDownload(chapter) {
+    try {
+      await invoke("delete_download", { chapterId: chapter.id });
+      await refreshChapters();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function refreshChapters() {
+    if (!openSeries) return;
+    try {
+      seriesChapters = await invoke("chapters", { seriesId: openSeries.id });
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   async function showSeries(row) {
     openSeries = row;
     showLive(row.cover_chapter_id);
@@ -2674,13 +2707,35 @@
 
         <div class="chapters">
           {#each seriesChapters as c (c.id)}
-            <button class="chapter" class:read={c.completed} onclick={() => load(c)}>
-              <span class="name">{c.title}</span>
-              <span class="meta">
-                {c.page_count} pages
-                {#if c.completed}· read{:else if c.page > 0}· page {c.page + 1}{/if}
-              </span>
-            </button>
+            <div class="chapter-row">
+              <button class="chapter" class:read={c.completed} onclick={() => load(c)}>
+                <span class="name">{c.title}</span>
+                <span class="meta">
+                  {#if c.page_count > 0}{c.page_count}
+                    {c.kind === "text" ? "blocks" : "pages"}{:else}from {c.source}{/if}
+                  {#if c.completed}· read{:else if c.page > 0}· page {c.page + 1}{/if}
+                </span>
+              </button>
+              <!-- Only a chapter that lives somewhere else can be downloaded, and only
+                   one already here can be deleted. Deleting keeps the progress. -->
+              {#if c.source !== "local"}
+                {#if c.path}
+                  <button
+                    class="chip ghost"
+                    title="Delete the download, keep your progress"
+                    aria-label="Delete download of {c.title}"
+                    onclick={() => removeDownload(c)}>✓</button
+                  >
+                {:else}
+                  <button
+                    class="chip ghost"
+                    title="Download for offline"
+                    aria-label="Download {c.title}"
+                    onclick={() => download(c)}>↓</button
+                  >
+                {/if}
+              {/if}
+            </div>
           {/each}
         </div>
       </aside>
@@ -3075,6 +3130,16 @@
   .note {
     width: 12rem;
     flex: none;
+  }
+  /* A chapter and the one control that belongs to it. */
+  .chapter-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s-1);
+  }
+  .chapter-row .chapter {
+    flex: 1;
+    min-width: 0;
   }
   /* A thing and the button that removes it, so they wrap as one. */
   .pair {

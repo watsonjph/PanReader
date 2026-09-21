@@ -1022,6 +1022,32 @@ impl Db {
         Ok(())
     }
 
+    /// The series a chapter belongs to, for naming the folder a download lands in.
+    pub fn series_title_of(&self, chapter_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT s.title FROM chapters c JOIN series s ON s.id = c.series_id
+                 WHERE c.id = ?1",
+                params![chapter_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Point a chapter at a downloaded file, or back at its source.
+    ///
+    /// The same row either way. A download is not a new chapter, so it does not get a
+    /// new identity or a new position -- which is what makes deleting one keep the
+    /// progress, and what makes the reader open it without knowing the difference.
+    pub fn set_chapter_path(&self, chapter_id: i64, path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chapters SET path = ?2 WHERE id = ?1",
+            params![chapter_id, path],
+        )?;
+        Ok(())
+    }
+
     /// One row per chapter, rewritten on every page turn. This is precisely why
     /// position is not kept in the settings blob.
     pub fn save_position(
