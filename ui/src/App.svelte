@@ -136,10 +136,29 @@
   const NAV = [
     { id: "library", name: "Library", icon: "▤" },
     { id: "catalogs", name: "Catalogs", icon: "☁" },
+    { id: "sources", name: "Sources", icon: "⬡" },
     { id: "history", name: "History", icon: "◷" },
     { id: "settings", name: "Settings", icon: "⚙" },
   ];
   let error = $state(null);
+
+  // Sources. Three screens in one section, because they are one task: where sources
+  // come from, which are installed, and what one of them offers.
+  let repos = $state([]);
+  let installed = $state([]);
+  /// What a repository offers, re-read on open rather than remembered: a repository is
+  /// somebody else's file and it changes without telling us.
+  let offered = $state(null);
+  let repoInput = $state("");
+  let sourceBusy = $state(false);
+  /// The source being browsed, and the page of entries it returned.
+  let browsing = $state(null);
+  let found = $state(null);
+  let sourceQuery = $state("");
+  let sourcePage = $state(1);
+  let sourceLatest = $state(false);
+  /// The entry whose chapters are open, so adding it can say what it is adding.
+  let picked = $state(null);
 
   /// Stacks rather than bundled files. A reading face is a licence entry and a line in
   /// docs/FONTS.md; the system serif is good on every desktop and costs neither.
@@ -543,6 +562,152 @@
       ]);
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  async function refreshSources() {
+    try {
+      [repos, installed] = await Promise.all([invoke("repositories"), invoke("sources")]);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Add a repository by URL. The index is fetched and read before the URL is kept, so
+  /// a typo is refused while it is still a typo.
+  async function addRepo() {
+    const url = repoInput.trim();
+    if (!url) return;
+    sourceBusy = true;
+    error = null;
+    try {
+      offered = { url, sources: await invoke("add_repository", { url }) };
+      repoInput = "";
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  async function openRepo(url) {
+    sourceBusy = true;
+    error = null;
+    try {
+      offered = { url, sources: await invoke("repository_sources", { url }) };
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  async function dropRepo(id) {
+    try {
+      await invoke("remove_repository", { id });
+      offered = null;
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function installSource(listed, repoUrl) {
+    sourceBusy = true;
+    error = null;
+    try {
+      await invoke("install_source", { repoUrl, listed });
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  async function dropSource(id) {
+    try {
+      await invoke("remove_source", { id });
+      if (browsing?.id === id) closeBrowse();
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function toggleSource(row) {
+    try {
+      await invoke("set_source_enabled", { id: row.id, enabled: !row.enabled });
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  const isInstalled = (id) => installed.some((s) => s.id === id);
+
+  function closeBrowse() {
+    browsing = null;
+    found = null;
+    picked = null;
+    sourceQuery = "";
+    sourcePage = 1;
+  }
+
+  async function browseSource(row, page = 1) {
+    browsing = row;
+    picked = null;
+    sourcePage = page;
+    sourceBusy = true;
+    error = null;
+    try {
+      found = await invoke("source_browse", {
+        id: row.id,
+        page,
+        query: sourceQuery,
+        latest: sourceLatest,
+      });
+    } catch (e) {
+      error = String(e);
+      found = null;
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  /// Look inside an entry before committing to it. The chapter list is what tells a
+  /// reader whether this is the series they meant.
+  async function peek(entry) {
+    sourceBusy = true;
+    error = null;
+    try {
+      picked = {
+        entry,
+        chapters: await invoke("source_chapters", {
+          id: browsing.id,
+          entryId: entry.id,
+        }),
+      };
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  /// Put it in the library, where it becomes an ordinary series.
+  async function addFromSource(entry) {
+    sourceBusy = true;
+    error = null;
+    try {
+      await invoke("add_source_series", { id: browsing.id, entryId: entry.id });
+      await refreshLibrary();
+      picked = null;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
     }
   }
 
@@ -1748,6 +1913,7 @@
             section = item.id;
             if (item.id === "history") refreshHistory();
             if (item.id === "settings") refreshBackups();
+            if (item.id === "sources") refreshSources();
           }}
         >
           <span class="tick" aria-hidden="true"></span>
@@ -2068,6 +2234,181 @@
 
           {#if opds.feed.next}
             <button class="chip" onclick={() => openFeed(opds.feed.next)}>Next page</button>
+          {/if}
+        {/if}
+      {/if}
+
+      {#if section === "sources"}
+        <header class="bar">
+          <h1>{browsing ? browsing.name : "Sources"}</h1>
+          {#if browsing}
+            <div class="chips">
+              <button class="chip" onclick={closeBrowse}>Back</button>
+            </div>
+          {/if}
+        </header>
+
+        {#if browsing}
+          <!-- Browsing one source. Search, the two listings it offers, and a page of
+               entries; the same card the shelf uses, because they are the same thing. -->
+          <div class="row">
+            <input
+              placeholder="Search {browsing.name}"
+              bind:value={sourceQuery}
+              onkeydown={(e) => e.key === "Enter" && browseSource(browsing, 1)}
+            />
+            <button
+              class="chip"
+              class:on={!sourceLatest}
+              aria-pressed={!sourceLatest}
+              onclick={() => {
+                sourceLatest = false;
+                browseSource(browsing, 1);
+              }}>Popular</button
+            >
+            <button
+              class="chip"
+              class:on={sourceLatest}
+              aria-pressed={sourceLatest}
+              onclick={() => {
+                sourceLatest = true;
+                browseSource(browsing, 1);
+              }}>Latest</button
+            >
+            {#if sourceBusy}<span class="meta">working…</span>{/if}
+          </div>
+
+          {#if picked}
+            <div class="plan">
+              <b>{picked.entry.title}</b>
+              <p class="meta">
+                {picked.chapters.length} chapter{picked.chapters.length === 1 ? "" : "s"}
+                {#if picked.entry.author}· {picked.entry.author}{/if}
+              </p>
+              <div class="chips">
+                <button
+                  class="chip accent"
+                  disabled={sourceBusy}
+                  onclick={() => addFromSource(picked.entry)}>Add to library</button
+                >
+                <button class="chip" onclick={() => (picked = null)}>Cancel</button>
+              </div>
+            </div>
+          {/if}
+
+          {#if found}
+            <div class="shelf">
+              {#each found.entries as entry (entry.id)}
+                <button class="card" onclick={() => peek(entry)}>
+                  <div class="cover">
+                    {#if entry.cover}
+                      <img src={entry.cover} alt="" loading="lazy" decoding="async" />
+                    {/if}
+                  </div>
+                  <b>{entry.title}</b>
+                  <span class="meta">{entry.author || browsing.name}</span>
+                </button>
+              {/each}
+            </div>
+            <div class="row">
+              <button
+                class="chip"
+                disabled={sourcePage <= 1 || sourceBusy}
+                onclick={() => browseSource(browsing, sourcePage - 1)}>‹ Previous</button
+              >
+              <span class="meta">Page {sourcePage}</span>
+              <button
+                class="chip"
+                disabled={!found.has_next || sourceBusy}
+                onclick={() => browseSource(browsing, sourcePage + 1)}>Next ›</button
+              >
+            </div>
+            {#if !found.entries.length}
+              <p class="meta empty">Nothing here.</p>
+            {/if}
+          {/if}
+        {:else}
+          <h2 class="section">Installed</h2>
+          {#if installed.length}
+            {#each installed as row (row.id)}
+              <div class="row">
+                <span class="name grow">
+                  {row.name}
+                  <span class="meta">
+                    {row.lang} · {row.kind === "text" ? "novels" : "manga"} · v{row.version}
+                    {#if row.nsfw}· 18+{/if}
+                  </span>
+                </span>
+                <button class="chip" disabled={!row.enabled} onclick={() => browseSource(row)}>
+                  Browse
+                </button>
+                <button
+                  class="chip"
+                  class:on={row.enabled}
+                  aria-pressed={row.enabled}
+                  onclick={() => toggleSource(row)}>{row.enabled ? "On" : "Off"}</button
+                >
+                <button class="chip danger" onclick={() => dropSource(row.id)}>Remove</button>
+              </div>
+              <!-- What it may reach, shown without waking its isolate. An extension
+                   cannot reach anything not on this line. -->
+              <p class="meta hosts">{row.hosts.join(", ")}</p>
+            {/each}
+          {:else}
+            <p class="meta">
+              None yet. Add a repository below — PanReader ships with no sources and
+              hosts no repository.
+            </p>
+          {/if}
+
+          <h2 class="section">Repositories</h2>
+          {#each repos as repo (repo.id)}
+            <div class="row">
+              <span class="name grow">{repo.url}</span>
+              <span class="meta">
+                {repo.source_count} installed
+              </span>
+              <button class="chip" disabled={sourceBusy} onclick={() => openRepo(repo.url)}>
+                Browse
+              </button>
+              <button class="chip danger" onclick={() => dropRepo(repo.id)}>Remove</button>
+            </div>
+          {/each}
+          <div class="row">
+            <input
+              placeholder="Repository index URL"
+              bind:value={repoInput}
+              onkeydown={(e) => e.key === "Enter" && addRepo()}
+            />
+            <button class="chip accent" disabled={sourceBusy} onclick={addRepo}>Add</button>
+          </div>
+
+          {#if offered}
+            <h2 class="section">{offered.url}</h2>
+            {#each offered.sources as listed (listed.id)}
+              <div class="row">
+                <span class="name grow">
+                  {listed.name}
+                  <span class="meta">
+                    {listed.lang} · {listed.kind === "novel" ? "novels" : "manga"} · v{listed.version}
+                    {#if listed.foreign}· LNReader{/if}
+                    {#if !listed.sha256}· unverified{/if}
+                  </span>
+                </span>
+                {#if isInstalled(listed.id)}
+                  <span class="meta">installed</span>
+                {:else}
+                  <button
+                    class="chip accent"
+                    disabled={sourceBusy}
+                    onclick={() => installSource(listed, offered.url)}>Install</button
+                  >
+                {/if}
+              </div>
+            {/each}
+            {#if !offered.sources.length}
+              <p class="meta">This repository lists nothing this reader can use.</p>
+            {/if}
           {/if}
         {/if}
       {/if}
@@ -3269,6 +3610,12 @@
   }
   .row .grow {
     flex: 1;
+  }
+  /* The allowlist, under the source it belongs to. Quiet, because it is reassurance
+     rather than a control. */
+  .hosts {
+    margin: calc(-1 * var(--s-2)) 0 var(--s-3) var(--s-3);
+    font: var(--text-xs) / 1.4 var(--font-data);
   }
   .empty {
     padding: var(--s-7) 0;

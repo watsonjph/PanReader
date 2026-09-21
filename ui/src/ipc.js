@@ -236,6 +236,53 @@ const FIXTURES = {
     };
   },
   warm: () => null,
+  repositories: () => [
+    { id: 1, url: "https://example.test/repo/index.json", name: "example.test", source_count: 1 },
+  ],
+  sources: () => [
+    {
+      id: "example",
+      name: "Example Novels",
+      version: "1.2.0",
+      lang: "en",
+      kind: "text",
+      nsfw: false,
+      hosts: ["example.com", "cdn.example.com"],
+      enabled: true,
+      repo_url: "https://example.test/repo/index.json",
+    },
+  ],
+  repository_sources: ({ url }) => [
+    {
+      id: "example", name: "Example Novels", version: "1.2.0", lang: "en",
+      kind: "novel", nsfw: false, bundle: `${url}/example.js`,
+      sha256: "abc", foreign: false,
+    },
+    {
+      id: "another", name: "Another Site", version: "0.9.0", lang: "ja",
+      kind: "manga", nsfw: true, bundle: `${url}/another.js`,
+      sha256: null, foreign: true,
+    },
+  ],
+  add_repository: ({ url }) => FIXTURES.repository_sources({ url }),
+  source_browse: ({ page, query, latest }) => ({
+    entries: Array.from({ length: 8 }, (_, i) => ({
+      id: `e${page}-${i}`,
+      title: query ? `${query} ${i + 1}` : `${latest ? "Latest" : "Popular"} ${page}-${i + 1}`,
+      cover: mockCover(page * 10 + i),
+      author: "An Author",
+      description: "",
+    })),
+    has_next: page < 3,
+  }),
+  source_chapters: () =>
+    Array.from({ length: 12 }, (_, i) => ({
+      id: `c${i + 1}`,
+      title: `Chapter ${i + 1}`,
+      number: i + 1,
+    })),
+  add_source_series: () => 1,
+
   stats: () => ({}),
   open_text: () => {
     const para = (text) => ({ kind: "para", spans: [{ text }] });
@@ -315,6 +362,10 @@ const WRITES = new Set([
   "set_bookmark_note",
   "forget",
   "rescan",
+  "install_source",
+  "remove_source",
+  "set_source_enabled",
+  "remove_repository",
 ]);
 
 /** Covers are served over pan:// in the app; in the browser they are data URIs. */
