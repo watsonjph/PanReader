@@ -273,7 +273,10 @@ const FIXTURES = {
       title: query ? `${query} ${i + 1}` : `${latest ? "Latest" : "Popular"} ${page}-${i + 1}`,
       cover: mockCover(page * 10 + i),
       author: "An Author",
-      description: "",
+      description:
+        "A summary the source wrote, long enough to need clamping: " +
+        "the lamps came on one at a time along the length of the street, and each " +
+        "one made the dark between them a little more particular. ".repeat(3),
     })),
     has_next: page < 3,
   }),

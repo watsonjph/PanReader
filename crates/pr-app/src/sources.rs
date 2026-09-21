@@ -8,7 +8,7 @@
 //! is exactly one place to put the rate limit.
 
 use anyhow::{Context as _, bail};
-use pr_plugin::{Content, Entry, Fetcher, Kind, Limits, Listing, Manifest, Request, Response};
+use pr_plugin::{Content, Entry, Fetcher, Kind, Limits, Listing, Manifest, Request};
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
@@ -73,7 +73,7 @@ impl HostFetcher {
 }
 
 impl Fetcher for HostFetcher {
-    fn fetch(&self, request: Request) -> Result<Response, String> {
+    fn fetch(&self, request: Request) -> Result<String, String> {
         self.wait_turn();
 
         let mut outgoing = self.client.get(&request.url);
@@ -85,7 +85,6 @@ impl Fetcher for HostFetcher {
             .send()
             .map_err(|e| format!("{}: {e}", request.url))?;
         let status = response.status();
-        let final_url = response.url().to_string();
 
         // An interstitial is not a transport failure, and saying so plainly is the
         // whole of our challenge story until the webview path in invariant 13 exists.
@@ -109,14 +108,9 @@ impl Fetcher for HostFetcher {
             return Err(format!("{} returned {status}", host_of(&request.url)));
         }
 
-        let body = response
+        response
             .text()
-            .map_err(|e| format!("{} sent something unreadable: {e}", request.url))?;
-        Ok(Response {
-            status: status.as_u16(),
-            body,
-            final_url,
-        })
+            .map_err(|e| format!("{} sent something unreadable: {e}", request.url))
     }
 }
 

@@ -25,20 +25,16 @@ impl Stub {
 }
 
 impl Fetcher for Stub {
-    fn fetch(&self, request: Request) -> std::result::Result<Response, String> {
-        self.asked.lock().unwrap().push(request.url.clone());
-        Ok(Response {
-            status: 200,
-            body: self.body.clone(),
-            final_url: request.url,
-        })
+    fn fetch(&self, request: Request) -> std::result::Result<String, String> {
+        self.asked.lock().unwrap().push(request.url);
+        Ok(self.body.clone())
     }
 }
 
 /// A host that is always down, for the paths where a plugin has to cope.
 struct Dead;
 impl Fetcher for Dead {
-    fn fetch(&self, _: Request) -> std::result::Result<Response, String> {
+    fn fetch(&self, _: Request) -> std::result::Result<String, String> {
         Err("connection refused".into())
     }
 }
@@ -472,13 +468,9 @@ fn headers_the_plugin_sets_reach_the_host() {
     #[derive(Default)]
     struct Spy(Mutex<Vec<(String, String)>>);
     impl Fetcher for Spy {
-        fn fetch(&self, request: Request) -> std::result::Result<Response, String> {
+        fn fetch(&self, request: Request) -> std::result::Result<String, String> {
             *self.0.lock().unwrap() = request.headers;
-            Ok(Response {
-                status: 200,
-                body: String::new(),
-                final_url: request.url,
-            })
+            Ok(String::new())
         }
     }
     let spy = Arc::new(Spy::default());

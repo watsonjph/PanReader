@@ -33,8 +33,6 @@ pub enum Error {
     Js(String),
     #[error("this is not a source: {0}")]
     Manifest(String),
-    #[error("{id} tried to reach {host}, which is not in its manifest")]
-    Blocked { id: String, host: String },
     #[error("{0} took too long and was stopped")]
     Timeout(String),
     #[error("{method} returned something this reader cannot use: {why}")]
@@ -98,21 +96,17 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
-pub struct Response {
-    pub status: u16,
-    pub body: String,
-    /// After redirects, which is what a relative link in the body resolves against.
-    pub final_url: String,
-}
-
 /// The host's side of the one function a plugin can call outward.
 ///
 /// Synchronous on purpose. A plugin call already runs on a background job thread, so
 /// blocking there costs nothing the reader can feel, and it keeps the host out of the
 /// business of pumping a JavaScript microtask queue around its own I/O.
+///
+/// The body, or a message. A status code does not come back because the host already
+/// turns anything but success into an error, and a plugin that sees a body knows the
+/// request worked -- carrying a `200` alongside it would be a field nobody reads.
 pub trait Fetcher: Send + Sync {
-    fn fetch(&self, request: Request) -> std::result::Result<Response, String>;
+    fn fetch(&self, request: Request) -> std::result::Result<String, String>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -445,7 +439,7 @@ fn install_fetch(context: &Context, manifest: &Manifest, fetcher: Arc<dyn Fetche
                     .unwrap_or_default();
 
                 match fetcher.fetch(Request { url, headers }) {
-                    Ok(response) => Ok(response.body),
+                    Ok(body) => Ok(body),
                     Err(why) => Err(throw(&ctx, &why)),
                 }
             },

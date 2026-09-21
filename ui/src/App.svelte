@@ -2318,6 +2318,9 @@
                 {picked.chapters.length} chapter{picked.chapters.length === 1 ? "" : "s"}
                 {#if picked.entry.author}· {picked.entry.author}{/if}
               </p>
+              {#if picked.entry.description}
+                <p class="meta blurb">{picked.entry.description}</p>
+              {/if}
               <div class="chips">
                 <button
                   class="chip accent"
@@ -3130,6 +3133,15 @@
   .note {
     width: 12rem;
     flex: none;
+  }
+  /* A source's own summary. Clamped rather than truncated: some sites write two lines
+     and some write two pages, and neither should decide how tall this panel is. */
+  .blurb {
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
   /* A chapter and the one control that belongs to it. */
   .chapter-row {
