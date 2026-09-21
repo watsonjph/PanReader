@@ -387,6 +387,7 @@ const WRITES = new Set([
   "delete_download",
   "clear_cookies",
   "set_catalog_login",
+  "install_source_file",
 ]);
 
 /** Covers are served over pan:// in the app; in the browser they are data URIs. */

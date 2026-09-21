@@ -49,15 +49,35 @@ pub fn parse_index(json: &str, index_url: &str) -> Result<Index> {
         .map_err(|e| Error::Manifest(format!("this is not a repository index: {e}")))?;
 
     let sources = match &value {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| lnreader(item, &base))
-            .collect(),
+        serde_json::Value::Array(items) => {
+            // A Mihon or Aniyomi repository is also a bare JSON array, so it parses
+            // this far and then yields nothing -- which reads as "the repository is
+            // empty" when the truth is that its extensions are Android APKs. Saying so
+            // is the difference between a dead end and an answer.
+            if items
+                .iter()
+                .any(|item| item.get("apk").is_some() || item.get("pkg").is_some())
+            {
+                return Err(Error::Manifest(
+                    "this is a Mihon or Aniyomi repository. Those extensions are                      compiled Android apps and cannot run here. Run Suwayomi and add                      it as a catalog instead, or use an LNReader repository for novels"
+                        .into(),
+                ));
+            }
+            items
+                .iter()
+                .filter_map(|item| lnreader(item, &base))
+                .collect()
+        }
         serde_json::Value::Object(_) => {
             let listed = value
                 .get("sources")
                 .and_then(|s| s.as_array())
-                .ok_or_else(|| Error::Manifest("the index has no sources array".into()))?;
+                .ok_or_else(|| {
+                    Error::Manifest(
+                        "this JSON has no \"sources\" array. A PanReader repository is                          { \"schema\": 1, \"sources\": [ ... ] }"
+                            .into(),
+                    )
+                })?;
             listed.iter().filter_map(|item| ours(item, &base)).collect()
         }
         _ => {

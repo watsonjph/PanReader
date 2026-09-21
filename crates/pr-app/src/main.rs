@@ -742,6 +742,52 @@ fn install_source(
     Ok(row)
 }
 
+/// Install a source from a file on disk.
+///
+/// The authoring loop: edit the file, reinstall, browse. No repository, no server, no
+/// hash -- the reader picked this file themselves, which is a stronger provenance
+/// claim than any index could make.
+#[tauri::command]
+fn install_source_file(app: State<App>, path: String) -> Result<pr_db::SourceRow, String> {
+    let bundle = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+
+    // Loaded before it is stored, so a file that is not a source is refused while it is
+    // still a file rather than becoming a row that fails on every launch.
+    let loaded = sources::Loaded::start(
+        "file",
+        bundle.clone(),
+        pr_plugin::Limits::default(),
+        app.jars.clone(),
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let manifest = loaded.manifest.clone();
+    drop(loaded);
+
+    let db = app.db.lock();
+    db.install_source(
+        None,
+        &manifest.id,
+        &manifest.name,
+        &manifest.version,
+        &manifest.lang,
+        sources::kind_text(manifest.kind),
+        manifest.nsfw,
+        &manifest.hosts,
+        &bundle,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+
+    // A reinstall replaces the bundle; the running isolate is still the old one.
+    app.sources.lock().remove(&manifest.id);
+
+    db.sources()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|s| s.id == manifest.id)
+        .ok_or_else(|| "the source vanished between installing and listing it".to_owned())
+}
+
 #[tauri::command]
 fn remove_source(app: State<App>, id: String) -> Result<(), String> {
     // Dropping the handle ends its thread, so the isolate is gone before this returns.
@@ -1243,7 +1289,8 @@ fn main() {
             delete_download,
             cookie_jars,
             clear_cookies,
-            set_catalog_login
+            set_catalog_login,
+            install_source_file
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

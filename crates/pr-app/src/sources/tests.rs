@@ -1,4 +1,6 @@
 use super::*;
+use pr_plugin::Source;
+use std::sync::Mutex;
 
 const BUNDLE: &str = r#"
 export default {
@@ -230,4 +232,78 @@ fn an_index_cannot_claim_an_identity_the_bundle_does_not_have() {
     assert!(pr_plugin::repo::agrees(&listed("other", Kind::Novel), &manifest).is_err());
     // Filing a novel under the image reader.
     assert!(pr_plugin::repo::agrees(&listed("real", Kind::Manga), &manifest).is_err());
+}
+
+/// The example source in `docs/plugins` is handed to people as the reference for
+/// writing one, so it has to actually load and actually work. Run against canned
+/// Gutendex JSON rather than the live API: what is under test is the bundle, not
+/// whether gutendex.com is up.
+#[test]
+fn the_example_source_loads_and_answers() {
+    const GUTENDEX: &str = include_str!("../../../../docs/plugins/gutendex.js");
+
+    #[derive(Default)]
+    struct Api {
+        asked: Mutex<Vec<String>>,
+    }
+    impl Fetcher for Api {
+        fn fetch(&self, request: Request) -> std::result::Result<String, String> {
+            self.asked.lock().unwrap().push(request.url.clone());
+            if request.url.contains("gutenberg.org") {
+                return Ok(
+                    "<html><body><p>It is a truth universally acknowledged.</p></body></html>"
+                        .into(),
+                );
+            }
+            let book = r#"{"id":1342,"title":"Pride and Prejudice",
+                "authors":[{"name":"Austen, Jane"}],
+                "subjects":["England -- Fiction","Love stories"],
+                "formats":{"text/html":"https://www.gutenberg.org/ebooks/1342.html.images",
+                           "image/jpeg":"https://www.gutenberg.org/cache/epub/1342/pg1342.cover.medium.jpg"}}"#;
+            if request.url.contains("/books/") {
+                return Ok(book.to_owned());
+            }
+            Ok(format!(
+                r#"{{"count":1,"next":"https://gutendex.com/books?page=2","results":[{book}]}}"#
+            ))
+        }
+    }
+
+    let api = Arc::new(Api::default());
+    let source = Source::load(GUTENDEX, api.clone(), Limits::default())
+        .expect("the example source must load");
+
+    let m = source.manifest();
+    assert_eq!(m.id, "gutendex");
+    assert_eq!(m.kind, Kind::Novel);
+    assert_eq!(m.hosts, ["gutendex.com", "gutenberg.org"]);
+
+    let popular = source.popular(1).unwrap();
+    assert_eq!(popular.entries[0].id, "1342");
+    assert_eq!(popular.entries[0].title, "Pride and Prejudice");
+    assert_eq!(popular.entries[0].author, "Austen, Jane");
+    assert!(popular.entries[0].cover.is_some());
+    assert!(
+        popular.has_next,
+        "paging follows the API rather than a guess"
+    );
+
+    assert_eq!(source.search(1, "austen").unwrap().entries.len(), 1);
+    assert_eq!(source.details("1342").unwrap().title, "Pride and Prejudice");
+    assert_eq!(source.chapters("1342").unwrap().len(), 1);
+
+    assert_eq!(
+        source.content("1342").unwrap(),
+        Content::Html(
+            "<html><body><p>It is a truth universally acknowledged.</p></body></html>".into()
+        )
+    );
+
+    // And the cover URL it hands back is inside its own allowlist, or the host would
+    // refuse to fetch it.
+    assert!(m.allows(popular.entries[0].cover.as_ref().unwrap()));
+
+    // Every request went through the host; the bundle reached nothing on its own.
+    let asked = api.asked.lock().unwrap().clone();
+    assert!(asked.iter().all(|u| m.allows(u)), "{asked:?}");
 }

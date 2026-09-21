@@ -636,6 +636,26 @@
     }
   }
 
+  /// Install a source straight off disk. The loop while writing one: edit, reinstall,
+  /// browse -- with no repository and no server in the way.
+  async function installFromFile() {
+    error = null;
+    try {
+      const path = await openDialog({
+        multiple: false,
+        filters: [{ name: "Source", extensions: ["js", "mjs"] }],
+      });
+      if (!path) return;
+      sourceBusy = true;
+      await invoke("install_source_file", { path });
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
   async function dropSource(id) {
     try {
       await invoke("remove_source", { id });
@@ -2500,7 +2520,17 @@
               onkeydown={(e) => e.key === "Enter" && addRepo()}
             />
             <button class="chip accent" disabled={sourceBusy} onclick={addRepo}>Add</button>
+            <button class="chip" disabled={sourceBusy} onclick={installFromFile}>
+              Install from file…
+            </button>
           </div>
+          <p class="meta lede">
+            A direct link to a JSON index, not a web page. Mihon and Aniyomi
+            repositories are Android apps and cannot run here — run Suwayomi and add it
+            under Catalogs instead. See <code>docs/plugins/README.md</code>, and
+            <code>docs/plugins/gutendex.js</code> for a working source you can install
+            from file right now.
+          </p>
 
           {#if jars.length}
             <h2 class="section">Sites that checked you</h2>

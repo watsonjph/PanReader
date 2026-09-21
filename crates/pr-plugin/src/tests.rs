@@ -484,3 +484,28 @@ fn headers_the_plugin_sets_reach_the_host() {
         [("Referer".to_owned(), "https://example.com/".to_owned())]
     );
 }
+
+/// A Mihon repository parses as far as "a JSON array" and then yields nothing, which
+/// reads as an empty repository when the truth is that its extensions are Android apps.
+#[test]
+fn a_mihon_repository_is_named_rather_than_read_as_empty() {
+    let mihon = r#"[{"name":"Tachiyomi: Example","pkg":"eu.kanade.tachiyomi.extension.en.example",
+                     "apk":"example-v1.4.1.apk","lang":"en","code":123,"version":"1.4.1",
+                     "nsfw":0,"sources":[{"name":"Example","lang":"en","id":"1","baseUrl":"https://e.test"}]}]"#;
+    let err = crate::repo::parse_index(mihon, "https://repo.test/index.min.json")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Android"), "got {err}");
+    assert!(
+        err.contains("Suwayomi"),
+        "and says what to do instead: {err}"
+    );
+}
+
+#[test]
+fn json_that_is_not_an_index_says_what_one_looks_like() {
+    let err = crate::repo::parse_index(r#"{"hello":"world"}"#, "https://repo.test/x.json")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("sources"), "got {err}");
+}
