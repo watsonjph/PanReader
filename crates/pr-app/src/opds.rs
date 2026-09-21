@@ -20,6 +20,25 @@ pub struct Page {
     pub feed: pr_opds::Feed,
 }
 
+/// A username, and the password from the keychain that goes with it.
+///
+/// Passed in rather than looked up here so this module stays the one that knows OPDS
+/// and nothing that knows where secrets live.
+#[derive(Debug, Clone, Default)]
+pub struct Login {
+    pub username: String,
+    pub password: String,
+}
+
+impl Login {
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.username.is_empty() {
+            return request;
+        }
+        request.basic_auth(&self.username, Some(&self.password))
+    }
+}
+
 fn client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("PanReader/", env!("CARGO_PKG_VERSION")))
@@ -66,25 +85,28 @@ fn absolutise(feed: &mut pr_opds::Feed, base: &Url) {
 }
 
 /// Fetch and parse one feed.
-pub async fn browse(url: &str) -> anyhow::Result<Page> {
+pub async fn browse(url: &str, login: &Login) -> anyhow::Result<Page> {
     let base = Url::parse(url).with_context(|| format!("bad catalog url: {url}"))?;
     if !matches!(base.scheme(), "http" | "https") {
         bail!("a catalog must be an http or https address");
     }
 
-    let response = client()?
-        .get(base.clone())
-        .header(
-            reqwest::header::ACCEPT,
-            "application/atom+xml, application/opds+json, */*",
-        )
+    let request = client()?.get(base.clone()).header(
+        reqwest::header::ACCEPT,
+        "application/atom+xml, application/opds+json, */*",
+    );
+    let response = login
+        .apply(request)
         .send()
         .await
         .with_context(|| format!("could not reach {base}"))?;
 
-    // Invariant 13: a server that wants credentials is reported, never negotiated with.
+    // Their server, their account. Invariant 13 keeps us out of bot detection, not out
+    // of a login the reader has: Suwayomi, Komga and Kavita all sit behind one.
+    //
+    // The wording matters because the UI matches on it to offer a sign-in.
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("{base} requires a login, which PanReader does not do");
+        bail!("{base} needs a sign-in");
     }
     let response = response
         .error_for_status()
@@ -139,7 +161,13 @@ fn safe_name(title: &str, mime: &str) -> String {
 /// is renamed only once the body is complete, so a scan can never pick up a truncated
 /// archive and record it as a chapter. And a retry resumes with a range request rather
 /// than starting over, because these are tens of megabytes over connections that drop.
-pub async fn download(href: &str, title: &str, mime: &str, root: &Path) -> anyhow::Result<PathBuf> {
+pub async fn download(
+    href: &str,
+    title: &str,
+    mime: &str,
+    root: &Path,
+    login: &Login,
+) -> anyhow::Result<PathBuf> {
     let url = Url::parse(href).with_context(|| format!("bad download url: {href}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         bail!("refusing to download from a {} url", url.scheme());
@@ -157,7 +185,7 @@ pub async fn download(href: &str, title: &str, mime: &str, root: &Path) -> anyho
         attempt += 1;
         let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
 
-        let mut request = client.get(url.clone());
+        let mut request = login.apply(client.get(url.clone()));
         if have > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
         }
@@ -328,7 +356,7 @@ mod tests {
     #[test]
     fn browsing_a_real_server_resolves_relative_hrefs_against_the_feed() {
         let (base, _) = serve(vec![Reply::Full(FEED)]);
-        let page = block_on(browse(&format!("{base}/opds"))).unwrap();
+        let page = block_on(browse(&format!("{base}/opds"), &Login::default())).unwrap();
 
         assert_eq!(page.feed.title, "Local");
         let entry = &page.feed.entries[0];
@@ -347,12 +375,31 @@ mod tests {
 
     /// Invariant 13: a server that wants credentials is reported, never negotiated with.
     #[test]
-    fn a_catalog_that_demands_a_login_says_so_plainly() {
+    fn a_catalog_that_demands_a_login_says_so_and_a_login_gets_in() {
+        // Anonymous: the server says no, and we say so in the words the UI matches on
+        // to offer a sign-in.
         let (base, _) = serve(vec![Reply::Status(401)]);
-        let err = block_on(browse(&format!("{base}/opds"))).unwrap_err();
+        let err = block_on(browse(&format!("{base}/opds"), &Login::default())).unwrap_err();
         assert!(
-            format!("{err:#}").contains("requires a login"),
+            format!("{err:#}").contains("needs a sign-in"),
             "got: {err:#}"
+        );
+
+        // With one, the credentials actually go on the wire. Suwayomi, Komga and Kavita
+        // all sit behind exactly this.
+        let (base, seen) = serve(vec![Reply::Full(FEED)]);
+        let login = Login {
+            username: "reader".into(),
+            password: "hunter2".into(),
+        };
+        block_on(browse(&format!("{base}/opds"), &login)).unwrap();
+
+        let head = seen.lock().unwrap().first().cloned().unwrap_or_default();
+        // base64("reader:hunter2")
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("authorization: basic cmvhzgvyomh1bnrlcji="),
+            "no basic auth on the wire: {head}"
         );
     }
 
@@ -366,6 +413,7 @@ mod tests {
             "Book One",
             "application/vnd.comicbook+zip",
             &root,
+            &Login::default(),
         ))
         .unwrap();
 
@@ -391,6 +439,7 @@ mod tests {
             "Book Two",
             "application/vnd.comicbook+zip",
             &root,
+            &Login::default(),
         ))
         .unwrap();
 

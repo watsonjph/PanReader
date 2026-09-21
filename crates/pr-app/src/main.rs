@@ -2,7 +2,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod challenge;
+mod downloads;
 mod opds;
+mod secrets;
+mod sources;
 mod tiles;
 
 use anyhow::Context;
@@ -27,6 +31,15 @@ struct App {
     /// Decoded covers, so a cold start paints the shelf without opening every archive
     /// in the library.
     covers: PathBuf,
+    /// Cookies a site issued to a real webview after a challenge, per host. Shared
+    /// across sources because a cookie belongs to a host, not to whichever plugin
+    /// happened to meet the challenge first.
+    jars: Arc<challenge::Jars>,
+    /// Running source isolates, started on first use and dropped when removed.
+    ///
+    /// Lazy because starting one costs a thread and a JavaScript heap, and a reader
+    /// with thirty installed sources browses one of them at a time.
+    sources: Mutex<HashMap<String, Arc<sources::Loaded>>>,
 }
 
 impl App {
@@ -47,11 +60,62 @@ impl App {
             db: Mutex::new(db),
             settings: Mutex::new(settings),
             covers,
+            sources: Mutex::new(HashMap::new()),
+            jars: Arc::new(challenge::Jars::default()),
         })
     }
 }
 
 impl App {
+    /// Who to sign in as for a catalog URL, with the password from the keychain.
+    ///
+    /// Empty when there is no username, which is the normal case: most catalogs are a
+    /// folder behind a web server and want nothing.
+    fn login_for(&self, url: &str) -> opds::Login {
+        let Ok(Some(username)) = self.db.lock().catalog_username_for(url) else {
+            return opds::Login::default();
+        };
+        let password = secrets::origin(url)
+            .ok()
+            .and_then(|origin| secrets::get(&origin))
+            .unwrap_or_default();
+        opds::Login { username, password }
+    }
+
+    /// The running isolate for a source, starting it if this is its first use.
+    ///
+    /// A source that has been disabled or removed has no bundle to start, which is what
+    /// makes the toggle in Settings actually stop a plugin rather than only hide it.
+    /// `app` is what lets a challenged request open a real page in a real webview.
+    /// It is an Option because installing happens before there is anything to browse,
+    /// and a challenge during an install is a challenge the reader should just be told
+    /// about.
+    fn source(
+        &self,
+        id: &str,
+        app: Option<tauri::AppHandle>,
+    ) -> anyhow::Result<Arc<sources::Loaded>> {
+        if let Some(running) = self.sources.lock().get(id)
+            && running.is_running()
+        {
+            return Ok(running.clone());
+        }
+        let bundle = self
+            .db
+            .lock()
+            .source_bundle(id)?
+            .ok_or_else(|| anyhow::anyhow!("{id} is not installed, or is turned off"))?;
+        let started = Arc::new(sources::Loaded::start(
+            id,
+            bundle,
+            pr_plugin::Limits::default(),
+            self.jars.clone(),
+            app,
+        )?);
+        self.sources.lock().insert(id.to_owned(), started.clone());
+        Ok(started)
+    }
+
     /// Open a chapter by id, or hand back the one already open.
     fn chapter(&self, chapter_id: i64) -> anyhow::Result<Arc<Chapter>> {
         if let Some(open) = self.chapters.lock().get(&chapter_id) {
@@ -226,8 +290,24 @@ fn open_text(app: State<App>, chapter_id: i64) -> Result<TextChapter, String> {
         .map_err(|e| format!("{e:#}"))?
         .ok_or("no such chapter")?;
 
-    let document = pr_text::scan::read(std::path::Path::new(&row.path), &row.locator)
-        .map_err(|e| format!("{e:#}"))?;
+    // A file on this disk, or a request to the source it came from. The normalization
+    // is the same either way, which is the point of doing it in `pr-text`: an extension
+    // never returns markup we render as it arrives.
+    let document = if row.source == "local" {
+        pr_text::scan::read(std::path::Path::new(&row.path), &row.locator)
+            .map_err(|e| format!("{e:#}"))?
+    } else {
+        let content = app
+            .source(&row.source, None)
+            .and_then(|s| s.content(&row.locator))
+            .map_err(|e| format!("{e:#}"))?;
+        match content {
+            pr_plugin::Content::Html(html) => pr_text::from_html(&html),
+            pr_plugin::Content::Pages(_) => {
+                return Err("this chapter is pages, not prose".into());
+            }
+        }
+    };
     let blocks = document.blocks.len() as i64;
 
     // The scan left this at zero because counting blocks means parsing, and now it has
@@ -258,7 +338,8 @@ fn catalogs(app: State<App>) -> Result<Vec<pr_db::CatalogRow>, String> {
 /// finding that out at add time is much clearer than an empty browse later.
 #[tauri::command]
 async fn add_catalog(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let page = opds::browse(url.trim())
+    let login = app.state::<App>().login_for(url.trim());
+    let page = opds::browse(url.trim(), &login)
         .await
         .map_err(|e| format!("{e:#}"))?;
     let name = if page.feed.title.is_empty() {
@@ -273,8 +354,49 @@ async fn add_catalog(app: tauri::AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Sign in to a catalog: Suwayomi, Komga, Kavita, or anything else the reader runs.
+///
+/// Their server and their account, which invariant 13 puts on a different axis from bot
+/// detection entirely. The username goes in the database so the UI can show it; the
+/// password goes in the OS keychain and nowhere else -- not the settings blob, not the
+/// database, and never a backup.
+///
+/// An empty username is how signing out is spelled, and it forgets the password too.
+#[tauri::command]
+fn set_catalog_login(
+    app: State<App>,
+    url: String,
+    username: String,
+    password: String,
+) -> Result<(), String> {
+    let origin = secrets::origin(&url).map_err(|e| format!("{e:#}"))?;
+    if username.trim().is_empty() {
+        secrets::forget(&origin).map_err(|e| format!("{e:#}"))?;
+    } else {
+        secrets::set(&origin, &password).map_err(|e| format!("{e:#}"))?;
+    }
+    app.db
+        .lock()
+        .set_catalog_username(&url, username.trim())
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command]
 fn remove_catalog(app: State<App>, id: i64) -> Result<(), String> {
+    // Forget the password with it. A credential left behind for a server the reader
+    // removed is one nobody knows is still there.
+    let gone = app
+        .db
+        .lock()
+        .catalogs()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|c| c.id == id);
+    if let Some(catalog) = gone
+        && let Ok(origin) = secrets::origin(&catalog.url)
+    {
+        let _ = secrets::forget(&origin);
+    }
     app.db
         .lock()
         .remove_catalog(id)
@@ -282,8 +404,11 @@ fn remove_catalog(app: State<App>, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn opds_browse(url: String) -> Result<opds::Page, String> {
-    opds::browse(&url).await.map_err(|e| format!("{e:#}"))
+async fn opds_browse(app: tauri::AppHandle, url: String) -> Result<opds::Page, String> {
+    let login = app.state::<App>().login_for(&url);
+    opds::browse(&url, &login)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Download a publication into a library root, then fold it into the library.
@@ -324,7 +449,8 @@ async fn opds_download(
             .ok_or("add a library folder first, so there is somewhere to download to")?,
     };
 
-    let path = opds::download(&href, &title, &mime, &root)
+    let login = app.state::<App>().login_for(&href);
+    let path = opds::download(&href, &title, &mime, &root, &login)
         .await
         .map_err(|e| format!("{e:#}"))?;
 
@@ -522,6 +648,317 @@ fn save_position(
         .map_err(|e| format!("{e:#}"))
 }
 
+// ---------------------------------------------------------------------- sources
+
+#[tauri::command]
+fn repositories(app: State<App>) -> Result<Vec<pr_db::RepoRow>, String> {
+    app.db.lock().repositories().map_err(|e| format!("{e:#}"))
+}
+
+/// Read a repository index and remember the URL.
+///
+/// Fetching before storing, so a URL that is not a repository is refused while it is
+/// still a typo rather than becoming a row that fails on every launch.
+#[tauri::command]
+fn add_repository(app: State<App>, url: String) -> Result<Vec<pr_plugin::repo::Listed>, String> {
+    let json = sources::get_text(&url).map_err(|e| format!("{e:#}"))?;
+    let index = pr_plugin::repo::parse_index(&json, &url).map_err(|e| format!("{e:#}"))?;
+    if index.sources.is_empty() {
+        return Err(format!("{url} lists no sources this reader can use"));
+    }
+    let name = url::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.clone());
+    app.db
+        .lock()
+        .add_repository(&url, &name)
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(index.sources)
+}
+
+/// What a repository offers right now, re-read rather than remembered: a repository is
+/// somebody else's file and it changes without telling us.
+#[tauri::command]
+fn repository_sources(url: String) -> Result<Vec<pr_plugin::repo::Listed>, String> {
+    let json = sources::get_text(&url).map_err(|e| format!("{e:#}"))?;
+    Ok(pr_plugin::repo::parse_index(&json, &url)
+        .map_err(|e| format!("{e:#}"))?
+        .sources)
+}
+
+#[tauri::command]
+fn remove_repository(app: State<App>, id: i64) -> Result<(), String> {
+    app.db
+        .lock()
+        .remove_repository(id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn sources(app: State<App>) -> Result<Vec<pr_db::SourceRow>, String> {
+    app.db.lock().sources().map_err(|e| format!("{e:#}"))
+}
+
+/// Fetch a bundle, check it, run it once, and only then keep it.
+#[tauri::command]
+fn install_source(
+    app: State<App>,
+    repo_url: Option<String>,
+    listed: pr_plugin::repo::Listed,
+) -> Result<pr_db::SourceRow, String> {
+    let (manifest, bundle) =
+        sources::install(&listed, app.jars.clone(), None).map_err(|e| format!("{e:#}"))?;
+
+    let db = app.db.lock();
+    let repo_id = match &repo_url {
+        Some(url) => db
+            .repositories()
+            .map_err(|e| format!("{e:#}"))?
+            .into_iter()
+            .find(|r| &r.url == url)
+            .map(|r| r.id),
+        None => None,
+    };
+    db.install_source(
+        repo_id,
+        &manifest.id,
+        &manifest.name,
+        &manifest.version,
+        &manifest.lang,
+        sources::kind_text(manifest.kind),
+        manifest.nsfw,
+        &manifest.hosts,
+        &bundle,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+
+    let row = db
+        .sources()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|s| s.id == manifest.id)
+        .ok_or("the source vanished between installing and listing it")?;
+    Ok(row)
+}
+
+/// Install a source from a file on disk.
+///
+/// The authoring loop: edit the file, reinstall, browse. No repository, no server, no
+/// hash -- the reader picked this file themselves, which is a stronger provenance
+/// claim than any index could make.
+#[tauri::command]
+fn install_source_file(app: State<App>, path: String) -> Result<pr_db::SourceRow, String> {
+    let bundle = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+
+    // Loaded before it is stored, so a file that is not a source is refused while it is
+    // still a file rather than becoming a row that fails on every launch.
+    let loaded = sources::Loaded::start(
+        "file",
+        bundle.clone(),
+        pr_plugin::Limits::default(),
+        app.jars.clone(),
+        None,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let manifest = loaded.manifest.clone();
+    drop(loaded);
+
+    let db = app.db.lock();
+    db.install_source(
+        None,
+        &manifest.id,
+        &manifest.name,
+        &manifest.version,
+        &manifest.lang,
+        sources::kind_text(manifest.kind),
+        manifest.nsfw,
+        &manifest.hosts,
+        &bundle,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+
+    // A reinstall replaces the bundle; the running isolate is still the old one.
+    app.sources.lock().remove(&manifest.id);
+
+    db.sources()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|s| s.id == manifest.id)
+        .ok_or_else(|| "the source vanished between installing and listing it".to_owned())
+}
+
+#[tauri::command]
+fn remove_source(app: State<App>, id: String) -> Result<(), String> {
+    // Dropping the handle ends its thread, so the isolate is gone before this returns.
+    app.sources.lock().remove(&id);
+    app.db
+        .lock()
+        .remove_source(&id)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn set_source_enabled(app: State<App>, id: String, enabled: bool) -> Result<(), String> {
+    if !enabled {
+        app.sources.lock().remove(&id);
+    }
+    app.db
+        .lock()
+        .set_source_enabled(&id, enabled)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Browse or search one source. An empty query is a browse, which is the distinction
+/// the UI has rather than two commands that differ by one argument.
+#[tauri::command]
+fn source_browse(
+    app: State<App>,
+    id: String,
+    page: u32,
+    query: String,
+    latest: bool,
+) -> Result<pr_plugin::Listing, String> {
+    app.source(&id, None)
+        .and_then(|s| s.browse(page.max(1), &query, latest))
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn source_chapters(
+    app: State<App>,
+    id: String,
+    entry_id: String,
+) -> Result<Vec<pr_plugin::SourceChapter>, String> {
+    app.source(&id, None)
+        .and_then(|s| s.chapters(&entry_id))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Put a remote entry in the library.
+///
+/// It becomes an ordinary series row with `source` set to the plugin id, so positions,
+/// history, bookmarks, categories and backup all work on it without learning that
+/// remote entries exist. Chapters land with no path: they are readable through the
+/// source, and downloading one later gives it a file the same way a scan would.
+#[tauri::command]
+fn add_source_series(app: tauri::AppHandle, id: String, entry_id: String) -> Result<i64, String> {
+    let app = app.state::<App>();
+    let source = app.source(&id, None).map_err(|e| format!("{e:#}"))?;
+    let entry = source.details(&entry_id).map_err(|e| format!("{e:#}"))?;
+    let chapters = source.chapters(&entry_id).map_err(|e| format!("{e:#}"))?;
+    let kind = sources::kind_text(source.manifest.kind);
+
+    let chapters: Vec<pr_db::RemoteChapter> = chapters
+        .into_iter()
+        .map(|c| pr_db::RemoteChapter {
+            id: c.id,
+            title: c.title,
+            number: c.number,
+        })
+        .collect();
+
+    app.db
+        .lock()
+        .add_remote_series(&id, &entry_id, &entry.title, &entry.author, kind, &chapters)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Which hosts issued us a cookie after a challenge.
+///
+/// Surfaced because a cookie a site gave this app is the reader's business: they should
+/// be able to see that one is held and throw it away without hunting for a file.
+#[tauri::command]
+fn cookie_jars(app: State<App>) -> Vec<challenge::Jar> {
+    app.jars.listed()
+}
+
+/// Forget one host's cookies, or all of them. The next request to that host is a
+/// stranger again, and meets whatever the site asks of strangers.
+#[tauri::command]
+fn clear_cookies(app: State<App>, host: Option<String>) {
+    match host {
+        Some(host) => app.jars.clear(&host),
+        None => app.jars.clear_all(),
+    }
+}
+
+/// Fetch a chapter so it can be read with the network off.
+///
+/// On a background thread: this is a network round trip per page and invariant 7 keeps
+/// a command from blocking. The reader is told through the ordinary library refresh,
+/// because a downloaded chapter is just a chapter with a path now.
+#[tauri::command]
+fn download_chapter(app: tauri::AppHandle, chapter_id: i64) -> Result<(), String> {
+    let state = app.state::<App>();
+    let row = state
+        .db
+        .lock()
+        .chapter(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or("no such chapter")?;
+    if row.source == "local" {
+        return Err("this chapter is already a file".into());
+    }
+    if !row.path.is_empty() {
+        return Ok(());
+    }
+    // The one path that may raise a window: a download is a long background job, which
+    // is exactly when it is reasonable to stop and ask someone to clear a challenge.
+    let source = state
+        .source(&row.source, Some(app.clone()))
+        .map_err(|e| format!("{e:#}"))?;
+    let series = state
+        .db
+        .lock()
+        .series_title_of(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .unwrap_or_else(|| row.source.clone());
+
+    std::thread::spawn(move || {
+        let state = app.state::<App>();
+        match downloads::fetch(&source, &series, &row.title, &row.locator) {
+            Ok(path) => {
+                if let Err(e) = state
+                    .db
+                    .lock()
+                    .set_chapter_path(chapter_id, &path.to_string_lossy())
+                {
+                    tracing::warn!("downloaded but could not record it: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!(chapter_id, "download failed: {e:#}"),
+        }
+    });
+    Ok(())
+}
+
+/// Delete a downloaded file and leave everything else alone.
+#[tauri::command]
+fn delete_download(app: State<App>, chapter_id: i64) -> Result<(), String> {
+    let row = app
+        .db
+        .lock()
+        .chapter(chapter_id)
+        .map_err(|e| format!("{e:#}"))?
+        .ok_or("no such chapter")?;
+    if row.source == "local" {
+        return Err("this is a file in your library, not a download".into());
+    }
+    if !row.path.is_empty() {
+        // A missing file is the state we wanted anyway.
+        let _ = std::fs::remove_file(&row.path);
+    }
+    // Progress, history and bookmarks are attached to the chapter and are untouched.
+    app.db
+        .lock()
+        .set_chapter_path(chapter_id, "")
+        .map_err(|e| format!("{e:#}"))?;
+    // The open chapter holds a PageSource onto the file that just went away.
+    app.chapters.lock().remove(&chapter_id);
+    Ok(())
+}
+
 /// Where the automatic backups live, and what is in there.
 #[tauri::command]
 fn backups() -> Result<Vec<pr_sync::Kept>, String> {
@@ -637,6 +1074,12 @@ fn set_bookmark_note(app: State<App>, id: i64, note: String) -> Result<(), Strin
 fn open_chapter(app: State<App>, chapter_id: i64, display_w: u32) -> Result<Layout, String> {
     let chapter = app.chapter(chapter_id).map_err(|e| format!("{e:#}"))?;
     let layout = chapter.layout(display_w);
+    // A downloaded chapter arrives with a page count of zero, because until it was
+    // fetched nobody could know one. The archive is open now and it is simply a fact.
+    let _ = app
+        .db
+        .lock()
+        .set_page_count(chapter_id, layout.pages.len() as i64);
     // Start filling the chapter behind the reader straight away. The first page is
     // already on its way over pan:// by the time this returns.
     chapter.warm(0, display_w);
@@ -830,7 +1273,24 @@ fn main() {
             export_backup,
             preview_backup,
             import_backup,
-            open_text
+            open_text,
+            repositories,
+            add_repository,
+            repository_sources,
+            remove_repository,
+            sources,
+            install_source,
+            remove_source,
+            set_source_enabled,
+            source_browse,
+            source_chapters,
+            add_source_series,
+            download_chapter,
+            delete_download,
+            cookie_jars,
+            clear_cookies,
+            set_catalog_login,
+            install_source_file
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

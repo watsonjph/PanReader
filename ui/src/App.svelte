@@ -136,10 +136,35 @@
   const NAV = [
     { id: "library", name: "Library", icon: "▤" },
     { id: "catalogs", name: "Catalogs", icon: "☁" },
+    { id: "sources", name: "Sources", icon: "⬡" },
     { id: "history", name: "History", icon: "◷" },
     { id: "settings", name: "Settings", icon: "⚙" },
   ];
   let error = $state(null);
+
+  // Sources. Three screens in one section, because they are one task: where sources
+  // come from, which are installed, and what one of them offers.
+  let repos = $state([]);
+  /// The catalog being signed in to, if any.
+  let signingIn = $state(null);
+
+  /// Hosts that issued a cookie after a challenge. Shown because a cookie a site gave
+  /// this app on someone's behalf is theirs to see and to throw away.
+  let jars = $state([]);
+  let installed = $state([]);
+  /// What a repository offers, re-read on open rather than remembered: a repository is
+  /// somebody else's file and it changes without telling us.
+  let offered = $state(null);
+  let repoInput = $state("");
+  let sourceBusy = $state(false);
+  /// The source being browsed, and the page of entries it returned.
+  let browsing = $state(null);
+  let found = $state(null);
+  let sourceQuery = $state("");
+  let sourcePage = $state(1);
+  let sourceLatest = $state(false);
+  /// The entry whose chapters are open, so adding it can say what it is adding.
+  let picked = $state(null);
 
   /// Stacks rather than bundled files. A reading face is a licence entry and a line in
   /// docs/FONTS.md; the system serif is good on every desktop and costs neither.
@@ -546,6 +571,185 @@
     }
   }
 
+  async function refreshSources() {
+    try {
+      [repos, installed, jars] = await Promise.all([
+        invoke("repositories"),
+        invoke("sources"),
+        invoke("cookie_jars"),
+      ]);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Add a repository by URL. The index is fetched and read before the URL is kept, so
+  /// a typo is refused while it is still a typo.
+  async function addRepo() {
+    const url = repoInput.trim();
+    if (!url) return;
+    sourceBusy = true;
+    error = null;
+    try {
+      offered = { url, sources: await invoke("add_repository", { url }) };
+      repoInput = "";
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  async function openRepo(url) {
+    sourceBusy = true;
+    error = null;
+    try {
+      offered = { url, sources: await invoke("repository_sources", { url }) };
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  async function dropRepo(id) {
+    try {
+      await invoke("remove_repository", { id });
+      offered = null;
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function installSource(listed, repoUrl) {
+    sourceBusy = true;
+    error = null;
+    try {
+      await invoke("install_source", { repoUrl, listed });
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  /// Install a source straight off disk. The loop while writing one: edit, reinstall,
+  /// browse -- with no repository and no server in the way.
+  async function installFromFile() {
+    error = null;
+    try {
+      const path = await openDialog({
+        multiple: false,
+        filters: [{ name: "Source", extensions: ["js", "mjs"] }],
+      });
+      if (!path) return;
+      sourceBusy = true;
+      await invoke("install_source_file", { path });
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  async function dropSource(id) {
+    try {
+      await invoke("remove_source", { id });
+      if (browsing?.id === id) closeBrowse();
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function toggleSource(row) {
+    try {
+      await invoke("set_source_enabled", { id: row.id, enabled: !row.enabled });
+      await refreshSources();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  const isInstalled = (id) => installed.some((s) => s.id === id);
+
+  async function clearCookies(host) {
+    try {
+      await invoke("clear_cookies", { host: host ?? null });
+      jars = await invoke("cookie_jars");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function closeBrowse() {
+    browsing = null;
+    found = null;
+    picked = null;
+    sourceQuery = "";
+    sourcePage = 1;
+  }
+
+  async function browseSource(row, page = 1) {
+    browsing = row;
+    picked = null;
+    sourcePage = page;
+    sourceBusy = true;
+    error = null;
+    try {
+      found = await invoke("source_browse", {
+        id: row.id,
+        page,
+        query: sourceQuery,
+        latest: sourceLatest,
+      });
+    } catch (e) {
+      error = String(e);
+      found = null;
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  /// Look inside an entry before committing to it. The chapter list is what tells a
+  /// reader whether this is the series they meant.
+  async function peek(entry) {
+    sourceBusy = true;
+    error = null;
+    try {
+      picked = {
+        entry,
+        chapters: await invoke("source_chapters", {
+          id: browsing.id,
+          entryId: entry.id,
+        }),
+      };
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
+  /// Put it in the library, where it becomes an ordinary series.
+  async function addFromSource(entry) {
+    sourceBusy = true;
+    error = null;
+    try {
+      await invoke("add_source_series", { id: browsing.id, entryId: entry.id });
+      await refreshLibrary();
+      picked = null;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      sourceBusy = false;
+    }
+  }
+
   /// Automatic backups on disk, and the pending import if one is being looked at.
   let saves = $state([]);
   let plan = $state(null);
@@ -739,6 +943,25 @@
     }
   }
 
+  async function saveLogin() {
+    if (!signingIn) return;
+    error = null;
+    try {
+      await invoke("set_catalog_login", {
+        url: signingIn.url,
+        username: signingIn.username ?? "",
+        password: signingIn.password ?? "",
+      });
+      const url = signingIn.url;
+      signingIn = null;
+      catalogs = await invoke("catalogs");
+      // Straight back to what they were trying to open.
+      openFeed(url, false);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /// A catalog could be added and never removed, which left the list a one-way door.
   async function dropCatalog(id) {
     try {
@@ -758,7 +981,19 @@
       if (push && opds) opdsTrail = [...opdsTrail, opds.url];
       opds = page;
     } catch (e) {
-      error = String(e);
+      // A server asking who you are is not an error to read and shrug at; it is a
+      // form. Suwayomi, Komga and Kavita all land here on the first visit.
+      if (String(e).includes("needs a sign-in")) {
+        const known = catalogs.find((c) => url.startsWith(c.url));
+        signingIn = {
+          url: known?.url ?? url,
+          name: known?.name ?? url,
+          username: known?.username ?? "",
+          password: "",
+        };
+      } else {
+        error = String(e);
+      }
     } finally {
       opdsBusy = false;
     }
@@ -966,6 +1201,39 @@
         top: direction * prose.clientHeight * 0.9,
         behavior: reduceMotion ? "auto" : "smooth",
       });
+    }
+  }
+
+  /// Fetch a chapter so it can be read with the network off.
+  ///
+  /// The backend answers immediately and works on a thread, so the list is re-read
+  /// rather than waited on: a downloaded chapter is just a chapter with a path now.
+  async function download(chapter) {
+    try {
+      await invoke("download_chapter", { chapterId: chapter.id });
+      setTimeout(refreshChapters, 1500);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /// Deletes the file and nothing else. Someone who freed disk space has not said they
+  /// want to forget what they read.
+  async function removeDownload(chapter) {
+    try {
+      await invoke("delete_download", { chapterId: chapter.id });
+      await refreshChapters();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function refreshChapters() {
+    if (!openSeries) return;
+    try {
+      seriesChapters = await invoke("chapters", { seriesId: openSeries.id });
+    } catch (e) {
+      error = String(e);
     }
   }
 
@@ -1748,6 +2016,7 @@
             section = item.id;
             if (item.id === "history") refreshHistory();
             if (item.id === "settings") refreshBackups();
+            if (item.id === "sources") refreshSources();
           }}
         >
           <span class="tick" aria-hidden="true"></span>
@@ -2023,6 +2292,14 @@
                   }}>{cat.name}</button
                 >
                 <button
+                  class="chip"
+                  class:on={!!cat.username}
+                  title={cat.username ? `Signed in as ${cat.username}` : "Sign in"}
+                  aria-label="Sign in to {cat.name}"
+                  onclick={() => (signingIn = { url: cat.url, name: cat.name, username: cat.username, password: "" })}
+                  >{cat.username || "Sign in"}</button
+                >
+                <button
                   class="chip danger"
                   title="Remove {cat.name}"
                   aria-label="Remove {cat.name}"
@@ -2030,6 +2307,31 @@
                 >
               </span>
             {/each}
+
+            {#if signingIn}
+              <!-- Their server and their account. The password goes to the OS keychain
+                   and never to the database, the settings blob or a backup. -->
+              <div class="plan">
+                <b>Sign in to {signingIn.name}</b>
+                <p class="meta">
+                  Stored in your system keychain, not in PanReader's files. Leave the
+                  name empty to sign out and forget the password.
+                </p>
+                <div class="row">
+                  <input placeholder="Username" bind:value={signingIn.username} />
+                  <input
+                    type="password"
+                    placeholder="Password"
+                    bind:value={signingIn.password}
+                    onkeydown={(e) => e.key === "Enter" && saveLogin()}
+                  />
+                </div>
+                <div class="chips">
+                  <button class="chip accent" onclick={saveLogin}>Save</button>
+                  <button class="chip" onclick={() => (signingIn = null)}>Cancel</button>
+                </div>
+              </div>
+            {/if}
           </div>
         {:else}
           {#if libraryRoots.length > 1}
@@ -2068,6 +2370,213 @@
 
           {#if opds.feed.next}
             <button class="chip" onclick={() => openFeed(opds.feed.next)}>Next page</button>
+          {/if}
+        {/if}
+      {/if}
+
+      {#if section === "sources"}
+        <header class="bar">
+          <h1>{browsing ? browsing.name : "Sources"}</h1>
+          {#if browsing}
+            <div class="chips">
+              <button class="chip" onclick={closeBrowse}>Back</button>
+            </div>
+          {/if}
+        </header>
+
+        {#if browsing}
+          <!-- Browsing one source. Search, the two listings it offers, and a page of
+               entries; the same card the shelf uses, because they are the same thing. -->
+          <div class="row">
+            <input
+              placeholder="Search {browsing.name}"
+              bind:value={sourceQuery}
+              onkeydown={(e) => e.key === "Enter" && browseSource(browsing, 1)}
+            />
+            <button
+              class="chip"
+              class:on={!sourceLatest}
+              aria-pressed={!sourceLatest}
+              onclick={() => {
+                sourceLatest = false;
+                browseSource(browsing, 1);
+              }}>Popular</button
+            >
+            <button
+              class="chip"
+              class:on={sourceLatest}
+              aria-pressed={sourceLatest}
+              onclick={() => {
+                sourceLatest = true;
+                browseSource(browsing, 1);
+              }}>Latest</button
+            >
+            {#if sourceBusy}<span class="meta">working…</span>{/if}
+          </div>
+
+          {#if picked}
+            <div class="plan">
+              <b>{picked.entry.title}</b>
+              <p class="meta">
+                {picked.chapters.length} chapter{picked.chapters.length === 1 ? "" : "s"}
+                {#if picked.entry.author}· {picked.entry.author}{/if}
+              </p>
+              {#if picked.entry.description}
+                <p class="meta blurb">{picked.entry.description}</p>
+              {/if}
+              <div class="chips">
+                <button
+                  class="chip accent"
+                  disabled={sourceBusy}
+                  onclick={() => addFromSource(picked.entry)}>Add to library</button
+                >
+                <button class="chip" onclick={() => (picked = null)}>Cancel</button>
+              </div>
+            </div>
+          {/if}
+
+          {#if found}
+            <div class="shelf">
+              {#each found.entries as entry (entry.id)}
+                <button class="card" onclick={() => peek(entry)}>
+                  <div class="cover">
+                    {#if entry.cover}
+                      <img src={entry.cover} alt="" loading="lazy" decoding="async" />
+                    {/if}
+                  </div>
+                  <b>{entry.title}</b>
+                  <span class="meta">{entry.author || browsing.name}</span>
+                </button>
+              {/each}
+            </div>
+            <div class="row">
+              <button
+                class="chip"
+                disabled={sourcePage <= 1 || sourceBusy}
+                onclick={() => browseSource(browsing, sourcePage - 1)}>‹ Previous</button
+              >
+              <span class="meta">Page {sourcePage}</span>
+              <button
+                class="chip"
+                disabled={!found.has_next || sourceBusy}
+                onclick={() => browseSource(browsing, sourcePage + 1)}>Next ›</button
+              >
+            </div>
+            {#if !found.entries.length}
+              <p class="meta empty">Nothing here.</p>
+            {/if}
+          {/if}
+        {:else}
+          <h2 class="section">Installed</h2>
+          {#if installed.length}
+            {#each installed as row (row.id)}
+              <div class="row">
+                <span class="name grow">
+                  {row.name}
+                  <span class="meta">
+                    {row.lang} · {row.kind === "text" ? "novels" : "manga"} · v{row.version}
+                    {#if row.nsfw}· 18+{/if}
+                  </span>
+                </span>
+                <button class="chip" disabled={!row.enabled} onclick={() => browseSource(row)}>
+                  Browse
+                </button>
+                <button
+                  class="chip"
+                  class:on={row.enabled}
+                  aria-pressed={row.enabled}
+                  onclick={() => toggleSource(row)}>{row.enabled ? "On" : "Off"}</button
+                >
+                <button class="chip danger" onclick={() => dropSource(row.id)}>Remove</button>
+              </div>
+              <!-- What it may reach, shown without waking its isolate. An extension
+                   cannot reach anything not on this line. -->
+              <p class="meta hosts">{row.hosts.join(", ")}</p>
+            {/each}
+          {:else}
+            <p class="meta">
+              None yet. Add a repository below — PanReader ships with no sources and
+              hosts no repository.
+            </p>
+          {/if}
+
+          <h2 class="section">Repositories</h2>
+          {#each repos as repo (repo.id)}
+            <div class="row">
+              <span class="name grow">{repo.url}</span>
+              <span class="meta">
+                {repo.source_count} installed
+              </span>
+              <button class="chip" disabled={sourceBusy} onclick={() => openRepo(repo.url)}>
+                Browse
+              </button>
+              <button class="chip danger" onclick={() => dropRepo(repo.id)}>Remove</button>
+            </div>
+          {/each}
+          <div class="row">
+            <input
+              placeholder="Repository index URL"
+              bind:value={repoInput}
+              onkeydown={(e) => e.key === "Enter" && addRepo()}
+            />
+            <button class="chip accent" disabled={sourceBusy} onclick={addRepo}>Add</button>
+            <button class="chip" disabled={sourceBusy} onclick={installFromFile}>
+              Install from file…
+            </button>
+          </div>
+          <p class="meta lede">
+            A direct link to a JSON index, not a web page. Mihon and Aniyomi
+            repositories are Android apps and cannot run here — run Suwayomi and add it
+            under Catalogs instead. See <code>docs/plugins/README.md</code>, and
+            <code>docs/plugins/gutendex.js</code> for a working source you can install
+            from file right now.
+          </p>
+
+          {#if jars.length}
+            <h2 class="section">Sites that checked you</h2>
+            <p class="meta lede">
+              These sites asked for a browser, so PanReader opened the page in one and
+              kept the cookie they issued. Nothing was faked and no extension can see
+              any of this. Clearing a site makes the next request a stranger again.
+            </p>
+            {#each jars as jar (jar.host)}
+              <div class="row">
+                <span class="name grow">{jar.host}</span>
+                <span class="meta">{jar.cookies} cookie{jar.cookies === 1 ? "" : "s"}</span>
+                <button class="chip danger" onclick={() => clearCookies(jar.host)}>Clear</button>
+              </div>
+            {/each}
+            <div class="row">
+              <button class="chip" onclick={() => clearCookies(null)}>Clear all</button>
+            </div>
+          {/if}
+
+          {#if offered}
+            <h2 class="section">{offered.url}</h2>
+            {#each offered.sources as listed (listed.id)}
+              <div class="row">
+                <span class="name grow">
+                  {listed.name}
+                  <span class="meta">
+                    {listed.lang} · {listed.kind === "novel" ? "novels" : "manga"} · v{listed.version}
+                    {#if listed.foreign}· LNReader{/if}
+                    {#if !listed.sha256}· unverified{/if}
+                  </span>
+                </span>
+                {#if isInstalled(listed.id)}
+                  <span class="meta">installed</span>
+                {:else}
+                  <button
+                    class="chip accent"
+                    disabled={sourceBusy}
+                    onclick={() => installSource(listed, offered.url)}>Install</button
+                  >
+                {/if}
+              </div>
+            {/each}
+            {#if !offered.sources.length}
+              <p class="meta">This repository lists nothing this reader can use.</p>
+            {/if}
           {/if}
         {/if}
       {/if}
@@ -2333,13 +2842,35 @@
 
         <div class="chapters">
           {#each seriesChapters as c (c.id)}
-            <button class="chapter" class:read={c.completed} onclick={() => load(c)}>
-              <span class="name">{c.title}</span>
-              <span class="meta">
-                {c.page_count} pages
-                {#if c.completed}· read{:else if c.page > 0}· page {c.page + 1}{/if}
-              </span>
-            </button>
+            <div class="chapter-row">
+              <button class="chapter" class:read={c.completed} onclick={() => load(c)}>
+                <span class="name">{c.title}</span>
+                <span class="meta">
+                  {#if c.page_count > 0}{c.page_count}
+                    {c.kind === "text" ? "blocks" : "pages"}{:else}from {c.source}{/if}
+                  {#if c.completed}· read{:else if c.page > 0}· page {c.page + 1}{/if}
+                </span>
+              </button>
+              <!-- Only a chapter that lives somewhere else can be downloaded, and only
+                   one already here can be deleted. Deleting keeps the progress. -->
+              {#if c.source !== "local"}
+                {#if c.path}
+                  <button
+                    class="chip ghost"
+                    title="Delete the download, keep your progress"
+                    aria-label="Delete download of {c.title}"
+                    onclick={() => removeDownload(c)}>✓</button
+                  >
+                {:else}
+                  <button
+                    class="chip ghost"
+                    title="Download for offline"
+                    aria-label="Download {c.title}"
+                    onclick={() => download(c)}>↓</button
+                  >
+                {/if}
+              {/if}
+            </div>
           {/each}
         </div>
       </aside>
@@ -2734,6 +3265,25 @@
   .note {
     width: 12rem;
     flex: none;
+  }
+  /* A source's own summary. Clamped rather than truncated: some sites write two lines
+     and some write two pages, and neither should decide how tall this panel is. */
+  .blurb {
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  /* A chapter and the one control that belongs to it. */
+  .chapter-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s-1);
+  }
+  .chapter-row .chapter {
+    flex: 1;
+    min-width: 0;
   }
   /* A thing and the button that removes it, so they wrap as one. */
   .pair {
@@ -3269,6 +3819,12 @@
   }
   .row .grow {
     flex: 1;
+  }
+  /* The allowlist, under the source it belongs to. Quiet, because it is reassurance
+     rather than a control. */
+  .hosts {
+    margin: calc(-1 * var(--s-2)) 0 var(--s-3) var(--s-3);
+    font: var(--text-xs) / 1.4 var(--font-data);
   }
   .empty {
     padding: var(--s-7) 0;

@@ -89,7 +89,15 @@ const FIXTURES = {
   save_settings: () => null,
   roots: () => ["D:/manga"],
   scanning: () => false,
-  catalogs: () => [{ id: 1, url: "https://demo.komga.org/opds/v1.2", name: "Komga demo" }],
+  catalogs: () => [
+    { id: 1, url: "https://demo.komga.org/opds/v1.2", name: "Komga demo", username: "" },
+    {
+      id: 2,
+      url: "http://127.0.0.1:4567/api/opds/v1.2",
+      name: "Suwayomi",
+      username: "reader",
+    },
+  ],
   categories: () => [
     { id: 1, name: "Reading", reading_mode: null, series_count: 4 },
     { id: 2, name: "Webtoons", reading_mode: "webtoon", series_count: 2 },
@@ -125,6 +133,8 @@ const FIXTURES = {
       page_frac: 0,
       completed: i < 3,
       locator: "",
+      path: i % 3 === 0 ? "" : "D:/manga/ch.cbz",
+      source: i % 2 === 0 ? "local" : "example",
       // The novel on the shelf, so both readers are reachable from the fixture.
       kind: SERIES.find((x) => x.id === seriesId)?.kind ?? "image",
     })),
@@ -236,6 +246,60 @@ const FIXTURES = {
     };
   },
   warm: () => null,
+  cookie_jars: () => [
+    { host: "example.com", cookies: 2 },
+    { host: "another.test", cookies: 1 },
+  ],
+  repositories: () => [
+    { id: 1, url: "https://example.test/repo/index.json", name: "example.test", source_count: 1 },
+  ],
+  sources: () => [
+    {
+      id: "example",
+      name: "Example Novels",
+      version: "1.2.0",
+      lang: "en",
+      kind: "text",
+      nsfw: false,
+      hosts: ["example.com", "cdn.example.com"],
+      enabled: true,
+      repo_url: "https://example.test/repo/index.json",
+    },
+  ],
+  repository_sources: ({ url }) => [
+    {
+      id: "example", name: "Example Novels", version: "1.2.0", lang: "en",
+      kind: "novel", nsfw: false, bundle: `${url}/example.js`,
+      sha256: "abc", foreign: false,
+    },
+    {
+      id: "another", name: "Another Site", version: "0.9.0", lang: "ja",
+      kind: "manga", nsfw: true, bundle: `${url}/another.js`,
+      sha256: null, foreign: true,
+    },
+  ],
+  add_repository: ({ url }) => FIXTURES.repository_sources({ url }),
+  source_browse: ({ page, query, latest }) => ({
+    entries: Array.from({ length: 8 }, (_, i) => ({
+      id: `e${page}-${i}`,
+      title: query ? `${query} ${i + 1}` : `${latest ? "Latest" : "Popular"} ${page}-${i + 1}`,
+      cover: mockCover(page * 10 + i),
+      author: "An Author",
+      description:
+        "A summary the source wrote, long enough to need clamping: " +
+        "the lamps came on one at a time along the length of the street, and each " +
+        "one made the dark between them a little more particular. ".repeat(3),
+    })),
+    has_next: page < 3,
+  }),
+  source_chapters: () =>
+    Array.from({ length: 12 }, (_, i) => ({
+      id: `c${i + 1}`,
+      title: `Chapter ${i + 1}`,
+      number: i + 1,
+    })),
+  add_source_series: () => 1,
+
   stats: () => ({}),
   open_text: () => {
     const para = (text) => ({ kind: "para", spans: [{ text }] });
@@ -315,6 +379,15 @@ const WRITES = new Set([
   "set_bookmark_note",
   "forget",
   "rescan",
+  "install_source",
+  "remove_source",
+  "set_source_enabled",
+  "remove_repository",
+  "download_chapter",
+  "delete_download",
+  "clear_cookies",
+  "set_catalog_login",
+  "install_source_file",
 ]);
 
 /** Covers are served over pan:// in the app; in the browser they are data URIs. */

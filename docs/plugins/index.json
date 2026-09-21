@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "id": "gutendex",
+      "name": "Project Gutenberg",
+      "version": "1.0.0",
+      "lang": "en",
+      "kind": "novel",
+      "nsfw": false,
+      "bundle": "gutendex.js"
+    }
+  ]
+}

@@ -25,20 +25,16 @@ impl Stub {
 }
 
 impl Fetcher for Stub {
-    fn fetch(&self, request: Request) -> std::result::Result<Response, String> {
-        self.asked.lock().unwrap().push(request.url.clone());
-        Ok(Response {
-            status: 200,
-            body: self.body.clone(),
-            final_url: request.url,
-        })
+    fn fetch(&self, request: Request) -> std::result::Result<String, String> {
+        self.asked.lock().unwrap().push(request.url);
+        Ok(self.body.clone())
     }
 }
 
 /// A host that is always down, for the paths where a plugin has to cope.
 struct Dead;
 impl Fetcher for Dead {
-    fn fetch(&self, _: Request) -> std::result::Result<Response, String> {
+    fn fetch(&self, _: Request) -> std::result::Result<String, String> {
         Err("connection refused".into())
     }
 }
@@ -472,13 +468,9 @@ fn headers_the_plugin_sets_reach_the_host() {
     #[derive(Default)]
     struct Spy(Mutex<Vec<(String, String)>>);
     impl Fetcher for Spy {
-        fn fetch(&self, request: Request) -> std::result::Result<Response, String> {
+        fn fetch(&self, request: Request) -> std::result::Result<String, String> {
             *self.0.lock().unwrap() = request.headers;
-            Ok(Response {
-                status: 200,
-                body: String::new(),
-                final_url: request.url,
-            })
+            Ok(String::new())
         }
     }
     let spy = Arc::new(Spy::default());
@@ -491,4 +483,29 @@ fn headers_the_plugin_sets_reach_the_host() {
         spy.0.lock().unwrap().clone(),
         [("Referer".to_owned(), "https://example.com/".to_owned())]
     );
+}
+
+/// A Mihon repository parses as far as "a JSON array" and then yields nothing, which
+/// reads as an empty repository when the truth is that its extensions are Android apps.
+#[test]
+fn a_mihon_repository_is_named_rather_than_read_as_empty() {
+    let mihon = r#"[{"name":"Tachiyomi: Example","pkg":"eu.kanade.tachiyomi.extension.en.example",
+                     "apk":"example-v1.4.1.apk","lang":"en","code":123,"version":"1.4.1",
+                     "nsfw":0,"sources":[{"name":"Example","lang":"en","id":"1","baseUrl":"https://e.test"}]}]"#;
+    let err = crate::repo::parse_index(mihon, "https://repo.test/index.min.json")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Android"), "got {err}");
+    assert!(
+        err.contains("Suwayomi"),
+        "and says what to do instead: {err}"
+    );
+}
+
+#[test]
+fn json_that_is_not_an_index_says_what_one_looks_like() {
+    let err = crate::repo::parse_index(r#"{"hello":"world"}"#, "https://repo.test/x.json")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("sources"), "got {err}");
 }

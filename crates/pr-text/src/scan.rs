@@ -54,6 +54,14 @@ pub fn is_prose(path: &Path) -> bool {
     matches!(extension(path).as_str(), "txt" | "md" | "markdown")
 }
 
+/// Markup on disk: what a downloaded chapter from a source looks like.
+///
+/// Not scanned for -- a library root full of saved web pages is not a novel -- but
+/// read when something already knows the path, which is what a downloaded chapter is.
+fn is_markup(path: &Path) -> bool {
+    matches!(extension(path).as_str(), "html" | "xhtml" | "htm")
+}
+
 /// Every book under a root.
 ///
 /// ponytail: no stamp cache, unlike the image scanner. An EPUB is opened and its spine
@@ -170,5 +178,8 @@ pub fn read(path: &Path, locator: &str) -> crate::Result<crate::Document> {
     }
     let raw = std::fs::read(path)?;
     let text = String::from_utf8_lossy(&raw);
+    if is_markup(path) {
+        return Ok(crate::from_html(&text));
+    }
     Ok(crate::from_plain(&text, extension(path) != "txt"))
 }
