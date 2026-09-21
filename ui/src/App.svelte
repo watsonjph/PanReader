@@ -145,6 +145,9 @@
   // Sources. Three screens in one section, because they are one task: where sources
   // come from, which are installed, and what one of them offers.
   let repos = $state([]);
+  /// The catalog being signed in to, if any.
+  let signingIn = $state(null);
+
   /// Hosts that issued a cookie after a challenge. Shown because a cookie a site gave
   /// this app on someone's behalf is theirs to see and to throw away.
   let jars = $state([]);
@@ -920,6 +923,25 @@
     }
   }
 
+  async function saveLogin() {
+    if (!signingIn) return;
+    error = null;
+    try {
+      await invoke("set_catalog_login", {
+        url: signingIn.url,
+        username: signingIn.username ?? "",
+        password: signingIn.password ?? "",
+      });
+      const url = signingIn.url;
+      signingIn = null;
+      catalogs = await invoke("catalogs");
+      // Straight back to what they were trying to open.
+      openFeed(url, false);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   /// A catalog could be added and never removed, which left the list a one-way door.
   async function dropCatalog(id) {
     try {
@@ -939,7 +961,19 @@
       if (push && opds) opdsTrail = [...opdsTrail, opds.url];
       opds = page;
     } catch (e) {
-      error = String(e);
+      // A server asking who you are is not an error to read and shrug at; it is a
+      // form. Suwayomi, Komga and Kavita all land here on the first visit.
+      if (String(e).includes("needs a sign-in")) {
+        const known = catalogs.find((c) => url.startsWith(c.url));
+        signingIn = {
+          url: known?.url ?? url,
+          name: known?.name ?? url,
+          username: known?.username ?? "",
+          password: "",
+        };
+      } else {
+        error = String(e);
+      }
     } finally {
       opdsBusy = false;
     }
@@ -2238,6 +2272,14 @@
                   }}>{cat.name}</button
                 >
                 <button
+                  class="chip"
+                  class:on={!!cat.username}
+                  title={cat.username ? `Signed in as ${cat.username}` : "Sign in"}
+                  aria-label="Sign in to {cat.name}"
+                  onclick={() => (signingIn = { url: cat.url, name: cat.name, username: cat.username, password: "" })}
+                  >{cat.username || "Sign in"}</button
+                >
+                <button
                   class="chip danger"
                   title="Remove {cat.name}"
                   aria-label="Remove {cat.name}"
@@ -2245,6 +2287,31 @@
                 >
               </span>
             {/each}
+
+            {#if signingIn}
+              <!-- Their server and their account. The password goes to the OS keychain
+                   and never to the database, the settings blob or a backup. -->
+              <div class="plan">
+                <b>Sign in to {signingIn.name}</b>
+                <p class="meta">
+                  Stored in your system keychain, not in PanReader's files. Leave the
+                  name empty to sign out and forget the password.
+                </p>
+                <div class="row">
+                  <input placeholder="Username" bind:value={signingIn.username} />
+                  <input
+                    type="password"
+                    placeholder="Password"
+                    bind:value={signingIn.password}
+                    onkeydown={(e) => e.key === "Enter" && saveLogin()}
+                  />
+                </div>
+                <div class="chips">
+                  <button class="chip accent" onclick={saveLogin}>Save</button>
+                  <button class="chip" onclick={() => (signingIn = null)}>Cancel</button>
+                </div>
+              </div>
+            {/if}
           </div>
         {:else}
           {#if libraryRoots.length > 1}

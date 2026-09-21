@@ -5,6 +5,7 @@
 mod challenge;
 mod downloads;
 mod opds;
+mod secrets;
 mod sources;
 mod tiles;
 
@@ -66,6 +67,21 @@ impl App {
 }
 
 impl App {
+    /// Who to sign in as for a catalog URL, with the password from the keychain.
+    ///
+    /// Empty when there is no username, which is the normal case: most catalogs are a
+    /// folder behind a web server and want nothing.
+    fn login_for(&self, url: &str) -> opds::Login {
+        let Ok(Some(username)) = self.db.lock().catalog_username_for(url) else {
+            return opds::Login::default();
+        };
+        let password = secrets::origin(url)
+            .ok()
+            .and_then(|origin| secrets::get(&origin))
+            .unwrap_or_default();
+        opds::Login { username, password }
+    }
+
     /// The running isolate for a source, starting it if this is its first use.
     ///
     /// A source that has been disabled or removed has no bundle to start, which is what
@@ -322,7 +338,8 @@ fn catalogs(app: State<App>) -> Result<Vec<pr_db::CatalogRow>, String> {
 /// finding that out at add time is much clearer than an empty browse later.
 #[tauri::command]
 async fn add_catalog(app: tauri::AppHandle, url: String) -> Result<(), String> {
-    let page = opds::browse(url.trim())
+    let login = app.state::<App>().login_for(url.trim());
+    let page = opds::browse(url.trim(), &login)
         .await
         .map_err(|e| format!("{e:#}"))?;
     let name = if page.feed.title.is_empty() {
@@ -337,8 +354,49 @@ async fn add_catalog(app: tauri::AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Sign in to a catalog: Suwayomi, Komga, Kavita, or anything else the reader runs.
+///
+/// Their server and their account, which invariant 13 puts on a different axis from bot
+/// detection entirely. The username goes in the database so the UI can show it; the
+/// password goes in the OS keychain and nowhere else -- not the settings blob, not the
+/// database, and never a backup.
+///
+/// An empty username is how signing out is spelled, and it forgets the password too.
+#[tauri::command]
+fn set_catalog_login(
+    app: State<App>,
+    url: String,
+    username: String,
+    password: String,
+) -> Result<(), String> {
+    let origin = secrets::origin(&url).map_err(|e| format!("{e:#}"))?;
+    if username.trim().is_empty() {
+        secrets::forget(&origin).map_err(|e| format!("{e:#}"))?;
+    } else {
+        secrets::set(&origin, &password).map_err(|e| format!("{e:#}"))?;
+    }
+    app.db
+        .lock()
+        .set_catalog_username(&url, username.trim())
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command]
 fn remove_catalog(app: State<App>, id: i64) -> Result<(), String> {
+    // Forget the password with it. A credential left behind for a server the reader
+    // removed is one nobody knows is still there.
+    let gone = app
+        .db
+        .lock()
+        .catalogs()
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|c| c.id == id);
+    if let Some(catalog) = gone
+        && let Ok(origin) = secrets::origin(&catalog.url)
+    {
+        let _ = secrets::forget(&origin);
+    }
     app.db
         .lock()
         .remove_catalog(id)
@@ -346,8 +404,11 @@ fn remove_catalog(app: State<App>, id: i64) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn opds_browse(url: String) -> Result<opds::Page, String> {
-    opds::browse(&url).await.map_err(|e| format!("{e:#}"))
+async fn opds_browse(app: tauri::AppHandle, url: String) -> Result<opds::Page, String> {
+    let login = app.state::<App>().login_for(&url);
+    opds::browse(&url, &login)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Download a publication into a library root, then fold it into the library.
@@ -388,7 +449,8 @@ async fn opds_download(
             .ok_or("add a library folder first, so there is somewhere to download to")?,
     };
 
-    let path = opds::download(&href, &title, &mime, &root)
+    let login = app.state::<App>().login_for(&href);
+    let path = opds::download(&href, &title, &mime, &root, &login)
         .await
         .map_err(|e| format!("{e:#}"))?;
 
@@ -1180,7 +1242,8 @@ fn main() {
             download_chapter,
             delete_download,
             cookie_jars,
-            clear_cookies
+            clear_cookies,
+            set_catalog_login
         ])
         .run(tauri::generate_context!())
         .expect("tauri failed to start");

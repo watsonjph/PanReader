@@ -89,7 +89,15 @@ const FIXTURES = {
   save_settings: () => null,
   roots: () => ["D:/manga"],
   scanning: () => false,
-  catalogs: () => [{ id: 1, url: "https://demo.komga.org/opds/v1.2", name: "Komga demo" }],
+  catalogs: () => [
+    { id: 1, url: "https://demo.komga.org/opds/v1.2", name: "Komga demo", username: "" },
+    {
+      id: 2,
+      url: "http://127.0.0.1:4567/api/opds/v1.2",
+      name: "Suwayomi",
+      username: "reader",
+    },
+  ],
   categories: () => [
     { id: 1, name: "Reading", reading_mode: null, series_count: 4 },
     { id: 2, name: "Webtoons", reading_mode: "webtoon", series_count: 2 },
@@ -378,6 +386,7 @@ const WRITES = new Set([
   "download_chapter",
   "delete_download",
   "clear_cookies",
+  "set_catalog_login",
 ]);
 
 /** Covers are served over pan:// in the app; in the browser they are data URIs. */

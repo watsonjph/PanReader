@@ -68,6 +68,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0010_sources",
         include_str!("../migrations/0010_sources.sql"),
     ),
+    (
+        "0011_catalog_login",
+        include_str!("../migrations/0011_catalog_login.sql"),
+    ),
 ];
 
 /// Cheap, stable, and only ever compared against itself, so a real hash would be
@@ -267,6 +271,9 @@ pub struct CatalogRow {
     pub id: i64,
     pub url: String,
     pub name: String,
+    /// Who we sign in as, when the server asks. The password is in the OS keychain,
+    /// keyed by origin, and never here.
+    pub username: String,
 }
 
 /// Somewhere the reader left off, for the shelf to offer back.
@@ -699,12 +706,13 @@ impl Db {
     pub fn catalogs(&self) -> Result<Vec<CatalogRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, url, name FROM opds_catalogs ORDER BY name")?;
+            .prepare("SELECT id, url, name, username FROM opds_catalogs ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
             Ok(CatalogRow {
                 id: r.get(0)?,
                 url: r.get(1)?,
                 name: r.get(2)?,
+                username: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -717,6 +725,34 @@ impl Db {
             params![url, name],
         )?;
         Ok(())
+    }
+
+    /// Remember who to sign in as. An empty name means "no login", which is how
+    /// signing out is spelled.
+    pub fn set_catalog_username(&self, url: &str, username: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE opds_catalogs SET username = ?2 WHERE url = ?1",
+            params![url, username],
+        )?;
+        Ok(())
+    }
+
+    /// The username for whichever catalog covers this URL.
+    ///
+    /// Matched by prefix because a catalog is a tree: the reader adds its root and then
+    /// follows links deeper into it, and every one of those is the same server and the
+    /// same account.
+    pub fn catalog_username_for(&self, url: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT username FROM opds_catalogs
+                 WHERE username <> '' AND ?1 LIKE url || '%'
+                 ORDER BY length(url) DESC LIMIT 1",
+                params![url],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn remove_catalog(&self, id: i64) -> Result<()> {
